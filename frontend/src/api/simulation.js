@@ -10,7 +10,17 @@ export const createSimulation = (data) => {
 
 /**
  * 准备模拟环境（异步任务）
- * @param {Object} data - { simulation_id, entity_types?, use_llm_for_profiles?, parallel_profile_count?, force_regenerate? }
+ * @param {Object} data - {
+ *   simulation_id,
+ *   entity_types?,
+ *   use_llm_for_profiles?,
+ *   parallel_profile_count?,
+ *   force_regenerate?,
+ *   config_mode?, // 'social' | 'deepresearch' | 'web_research'
+ *   max_agents?,
+ *   professional_mode?,
+ *   user_query?
+ * }
  */
 export const prepareSimulation = (data) => {
   return requestWithRetry(() => service.post('/api/simulation/prepare', data), 3, 1000)
@@ -30,6 +40,41 @@ export const getPrepareStatus = (data) => {
  */
 export const getSimulation = (simulationId) => {
   return service.get(`/api/simulation/${simulationId}`)
+}
+
+/**
+ * Continue an existing simulation with a follow-up query.
+ * @param {string} simulationId
+ * @param {string} query
+ */
+export const continueSimulation = (simulationId, query) => {
+  return requestWithRetry(() => service.post(`/api/simulation/${simulationId}/continue`, { query }), 2, 500)
+}
+
+/**
+ * Get checkpoint history for a simulation.
+ * @param {string} simulationId
+ */
+export const getSimulationCheckpoints = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/checkpoints`)
+}
+
+/**
+ * Get exact provider token usage for a single simulation.
+ * @param {string} simulationId
+ */
+export const getSimulationTokenUsage = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/token-usage`, {
+    skipSessionTokenTracking: true,
+  })
+}
+
+/**
+ * Delete a simulation and all its data. Irreversible.
+ * @param {string} simulationId
+ */
+export const deleteSimulation = (simulationId) => {
+  return service.delete(`/api/simulation/${simulationId}`)
 }
 
 /**
@@ -184,4 +229,3 @@ export const interviewAgents = (data) => {
 export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
 }
-

@@ -19,6 +19,7 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
+from .simulation_csi_local import SimulationCSILocalStore
 
 logger = get_logger('mirofish.zep_tools')
 
@@ -400,13 +401,13 @@ class InterviewResult:
 class ZepToolsService:
     """
     Zep检索工具服务
-    
+
     【核心检索工具 - 优化后】
     1. insight_forge - 深度洞察检索（最强大，自动生成子问题，多维度检索）
     2. panorama_search - 广度搜索（获取全貌，包括过期内容）
     3. quick_search - 简单搜索（快速检索）
     4. interview_agents - 深度采访（采访模拟Agent，获取多视角观点）
-    
+
     【基础工具】
     - search_graph - 图谱语义搜索
     - get_all_nodes - 获取图谱所有节点
@@ -415,21 +416,49 @@ class ZepToolsService:
     - get_node_edges - 获取节点相关的边
     - get_entities_by_type - 按类型获取实体
     - get_entity_summary - 获取实体的关系摘要
+
+    When Zep is disabled (USE_ZEP=false or no ZEP_API_KEY), every public
+    method returns empty/default results immediately — no retries, no
+    warnings.  The report agent can still function using local graph data
+    served by GraphBuilderService (hivemind or local JSON).
     """
-    
+
     # 重试配置
     MAX_RETRIES = 3
     RETRY_DELAY = 2.0
-    
+
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
+        self._zep_enabled = Config.zep_enabled()
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.client = None
+
+        if self._zep_enabled:
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = Zep(api_key=self.api_key)
+            logger.info("ZepToolsService 初始化完成 (Zep Cloud enabled)")
+        else:
+            logger.info("ZepToolsService 初始化完成 (Zep Cloud disabled — local-only mode)")
+
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
-        logger.info("ZepToolsService 初始化完成")
+
+    @staticmethod
+    def _is_unauthorized_error(exc: Exception) -> bool:
+        """Best-effort check for auth failures from Zep client wrappers."""
+        text = str(exc).lower()
+        return "status_code: 401" in text or "unauthorized" in text
+
+    def _disable_zep_at_runtime(self) -> None:
+        """Flip Zep off for this service instance after an unrecoverable auth error.
+
+        Subsequent calls within the same instance will skip Zep entirely and
+        fall back to local data, avoiding a cascade of 401 retries.
+        """
+        if self._zep_enabled:
+            logger.warning("Disabling Zep Cloud for this ZepToolsService instance (401 detected)")
+            self._zep_enabled = False
+            self.client = None
     
     @property
     def llm(self) -> LLMClient:
@@ -439,16 +468,27 @@ class ZepToolsService:
         return self._llm_client
     
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
-        """带重试机制的API调用"""
+        """带重试机制的API调用。When Zep is disabled, raises immediately.
+
+        On 401 Unauthorized the method disables Zep for this instance and
+        raises immediately (no retries) so callers fall through to local data.
+        """
+        if not self._zep_enabled:
+            raise RuntimeError("Zep Cloud is disabled")
+
         max_retries = max_retries or self.MAX_RETRIES
         last_exception = None
         delay = self.RETRY_DELAY
-        
+
         for attempt in range(max_retries):
             try:
                 return func()
             except Exception as e:
                 last_exception = e
+                # 401 is unrecoverable — don't waste time retrying
+                if self._is_unauthorized_error(e):
+                    self._disable_zep_at_runtime()
+                    raise
                 if attempt < max_retries - 1:
                     logger.warning(
                         f"Zep {operation_name} 第 {attempt + 1} 次尝试失败: {str(e)[:100]}, "
@@ -458,7 +498,7 @@ class ZepToolsService:
                     delay *= 2
                 else:
                     logger.error(f"Zep {operation_name} 在 {max_retries} 次尝试后仍失败: {str(e)}")
-        
+
         raise last_exception
     
     def search_graph(
@@ -484,7 +524,11 @@ class ZepToolsService:
             SearchResult: 搜索结果
         """
         logger.info(f"图谱搜索: graph_id={graph_id}, query={query[:50]}...")
-        
+
+        # When Zep is disabled, go straight to local keyword search
+        if not self._zep_enabled:
+            return self._local_search(graph_id, query, limit, scope)
+
         # 尝试使用Zep Cloud Search API
         try:
             search_results = self._call_with_retry(
@@ -540,6 +584,10 @@ class ZepToolsService:
             
         except Exception as e:
             logger.warning(f"Zep Search API失败，降级为本地搜索: {str(e)}")
+            # 401 means API key is invalid/expired; disable Zep for this
+            # instance so every subsequent call goes straight to local data.
+            if self._is_unauthorized_error(e):
+                self._disable_zep_at_runtime()
             # 降级：使用本地关键词匹配搜索
             return self._local_search(graph_id, query, limit, scope)
     
@@ -647,6 +695,16 @@ class ZepToolsService:
             total_count=len(facts)
         )
     
+    def _get_local_graph_data(self, graph_id: str) -> Dict[str, Any]:
+        """Load graph nodes/edges from local JSON (written by GraphBuilderService)."""
+        from .graph_builder import GraphBuilderService
+        try:
+            builder = GraphBuilderService()
+            return builder.get_graph_data(graph_id)
+        except Exception as e:
+            logger.debug(f"Failed to load local graph {graph_id}: {e}")
+            return {"nodes": [], "edges": []}
+
     def get_all_nodes(self, graph_id: str) -> List[NodeInfo]:
         """
         获取图谱的所有节点（分页获取）
@@ -659,7 +717,30 @@ class ZepToolsService:
         """
         logger.info(f"获取图谱 {graph_id} 的所有节点...")
 
-        nodes = fetch_all_nodes(self.client, graph_id)
+        # When Zep is disabled, read from local graph JSON
+        if not self._zep_enabled:
+            graph_data = self._get_local_graph_data(graph_id)
+            result = []
+            for n in graph_data.get("nodes", []):
+                result.append(NodeInfo(
+                    uuid=n.get("uuid", n.get("id", "")),
+                    name=n.get("name", ""),
+                    labels=n.get("labels", []),
+                    summary=n.get("summary", ""),
+                    attributes=n.get("attributes", {})
+                ))
+            logger.info(f"获取到 {len(result)} 个节点 (local)")
+            return result
+
+        try:
+            nodes = fetch_all_nodes(self.client, graph_id)
+        except Exception as e:
+            if self._is_unauthorized_error(e):
+                logger.error(f"获取节点失败(401 unauthorized): graph_id={graph_id}")
+                self._disable_zep_at_runtime()
+                # Retry via local path now that Zep is disabled
+                return self.get_all_nodes(graph_id)
+            raise
 
         result = []
         for node in nodes:
@@ -688,7 +769,36 @@ class ZepToolsService:
         """
         logger.info(f"获取图谱 {graph_id} 的所有边...")
 
-        edges = fetch_all_edges(self.client, graph_id)
+        # When Zep is disabled, read from local graph JSON
+        if not self._zep_enabled:
+            graph_data = self._get_local_graph_data(graph_id)
+            result = []
+            for e in graph_data.get("edges", []):
+                edge_info = EdgeInfo(
+                    uuid=e.get("uuid", e.get("id", "")),
+                    name=e.get("name", ""),
+                    fact=e.get("fact", ""),
+                    source_node_uuid=e.get("source_node_uuid", ""),
+                    target_node_uuid=e.get("target_node_uuid", "")
+                )
+                if include_temporal:
+                    edge_info.created_at = e.get("created_at")
+                    edge_info.valid_at = e.get("valid_at")
+                    edge_info.invalid_at = e.get("invalid_at")
+                    edge_info.expired_at = e.get("expired_at")
+                result.append(edge_info)
+            logger.info(f"获取到 {len(result)} 条边 (local)")
+            return result
+
+        try:
+            edges = fetch_all_edges(self.client, graph_id)
+        except Exception as e:
+            if self._is_unauthorized_error(e):
+                logger.error(f"获取边失败(401 unauthorized): graph_id={graph_id}")
+                self._disable_zep_at_runtime()
+                # Retry via local path now that Zep is disabled
+                return self.get_all_edges(graph_id, include_temporal=include_temporal)
+            raise
 
         result = []
         for edge in edges:
@@ -716,24 +826,27 @@ class ZepToolsService:
     def get_node_detail(self, node_uuid: str) -> Optional[NodeInfo]:
         """
         获取单个节点的详细信息
-        
+
         Args:
             node_uuid: 节点UUID
-            
+
         Returns:
             节点信息或None
         """
+        if not self._zep_enabled:
+            return None
+
         logger.info(f"获取节点详情: {node_uuid[:8]}...")
-        
+
         try:
             node = self._call_with_retry(
                 func=lambda: self.client.graph.node.get(uuid_=node_uuid),
                 operation_name=f"获取节点详情(uuid={node_uuid[:8]}...)"
             )
-            
+
             if not node:
                 return None
-            
+
             return NodeInfo(
                 uuid=getattr(node, 'uuid_', None) or getattr(node, 'uuid', ''),
                 name=node.name or "",
@@ -742,9 +855,11 @@ class ZepToolsService:
                 attributes=node.attributes or {}
             )
         except Exception as e:
+            if self._is_unauthorized_error(e):
+                self._disable_zep_at_runtime()
             logger.error(f"获取节点详情失败: {str(e)}")
             return None
-    
+
     def get_node_edges(self, graph_id: str, node_uuid: str) -> List[EdgeInfo]:
         """
         获取节点相关的所有边
@@ -1733,3 +1848,317 @@ class ZepToolsService:
             logger.warning(f"生成采访摘要失败: {e}")
             # 降级：简单拼接
             return f"共采访了{len(interviews)}位受访者，包括：" + "、".join([i.agent_name for i in interviews])
+
+    # ── CSI local store query helpers ────────────────────────────
+
+    def _get_csi_store(self) -> SimulationCSILocalStore:
+        """Return a shared CSI local store instance."""
+        if not hasattr(self, "_csi_store"):
+            self._csi_store = SimulationCSILocalStore()
+        return self._csi_store
+
+    def query_csi_claims(
+        self,
+        simulation_id: str,
+        status: Optional[str] = None,
+        min_confidence: float = 0.0,
+        agent_name: Optional[str] = None,
+        limit: int = 20,
+    ) -> str:
+        """Query claims from CSI store, optionally filtered by status/confidence/agent."""
+        try:
+            store = self._get_csi_store()
+            claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+            if not claims:
+                return "No CSI claims found for this simulation."
+
+            filtered: List[Dict[str, Any]] = []
+            for c in claims:
+                if status and c.get("status") != status:
+                    continue
+                if float(c.get("confidence", 0)) < min_confidence:
+                    continue
+                if agent_name and (c.get("agent_name") or "").lower() != agent_name.lower():
+                    continue
+                filtered.append(c)
+
+            filtered.sort(key=lambda c: float(c.get("confidence", 0)), reverse=True)
+            filtered = filtered[:limit]
+
+            if not filtered:
+                return f"No claims matched the filters (status={status}, min_confidence={min_confidence}, agent={agent_name})."
+
+            parts: List[str] = [f"## CSI Claims ({len(filtered)} of {len(claims)} total)"]
+            for i, c in enumerate(filtered, 1):
+                parts.append(
+                    f"{i}. [{c.get('status', 'unknown')}] (confidence={c.get('confidence', '?')}) "
+                    f"Agent: {c.get('agent_name', 'unknown')} | ID: {c.get('claim_id', '?')}\n"
+                    f"   \"{c.get('text', '')}\""
+                )
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.error("query_csi_claims failed: %s", exc)
+            return f"Error querying CSI claims: {exc}"
+
+    def query_csi_trials(
+        self,
+        simulation_id: str,
+        verdict: Optional[str] = None,
+        claim_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> str:
+        """Query trials, optionally filtered by verdict or linked claim."""
+        try:
+            store = self._get_csi_store()
+            trials = store._read_jsonl(store._path(simulation_id, "trials.jsonl"))
+            if not trials:
+                return "No CSI trials found for this simulation."
+
+            filtered: List[Dict[str, Any]] = []
+            for t in trials:
+                if verdict and t.get("verdict") != verdict:
+                    continue
+                if claim_id and t.get("claim_id") != claim_id:
+                    continue
+                filtered.append(t)
+
+            filtered = filtered[:limit]
+
+            if not filtered:
+                return f"No trials matched the filters (verdict={verdict}, claim_id={claim_id})."
+
+            parts: List[str] = [f"## CSI Trials ({len(filtered)} of {len(trials)} total)"]
+            for i, t in enumerate(filtered, 1):
+                parts.append(
+                    f"{i}. [{t.get('verdict', '?')}] Trial: {t.get('trial_id', '?')}\n"
+                    f"   Reviewer: {t.get('query_agent_name', '?')} → Target: {t.get('target_agent_name', '?')}\n"
+                    f"   Claim: {t.get('claim_id', 'N/A')}\n"
+                    f"   Response: \"{(t.get('response', '') or '')[:300]}\""
+                )
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.error("query_csi_trials failed: %s", exc)
+            return f"Error querying CSI trials: {exc}"
+
+    def query_csi_consensus(
+        self,
+        simulation_id: str,
+        min_supporting_trials: int = 2,
+    ) -> str:
+        """Find claims with N+ supporting trials (high-consensus findings)."""
+        try:
+            store = self._get_csi_store()
+            claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+            trials = store._read_jsonl(store._path(simulation_id, "trials.jsonl"))
+            if not claims:
+                return "No CSI claims found for this simulation."
+
+            # Build claim_id → supporting trial count
+            support_counts: Dict[str, int] = {}
+            for t in trials:
+                if t.get("verdict") == "supports":
+                    cid = t.get("claim_id")
+                    if cid:
+                        support_counts[cid] = support_counts.get(cid, 0) + 1
+
+            claim_map = {c.get("claim_id"): c for c in claims}
+            consensus_ids = [
+                cid for cid, count in support_counts.items()
+                if count >= min_supporting_trials and cid in claim_map
+            ]
+            consensus_ids.sort(key=lambda cid: support_counts[cid], reverse=True)
+
+            if not consensus_ids:
+                return (
+                    f"No claims have {min_supporting_trials}+ supporting trials. "
+                    f"Total claims: {len(claims)}, total trials: {len(trials)}."
+                )
+
+            parts: List[str] = [
+                f"## High-Consensus Claims ({len(consensus_ids)} claims with {min_supporting_trials}+ supporting trials)"
+            ]
+            for i, cid in enumerate(consensus_ids, 1):
+                c = claim_map[cid]
+                parts.append(
+                    f"{i}. [{support_counts[cid]} supporting trials] "
+                    f"(confidence={c.get('confidence', '?')}) "
+                    f"Agent: {c.get('agent_name', '?')}\n"
+                    f"   \"{c.get('text', '')}\""
+                )
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.error("query_csi_consensus failed: %s", exc)
+            return f"Error querying CSI consensus: {exc}"
+
+    def query_csi_contradictions(self, simulation_id: str) -> str:
+        """Find claim pairs that have opposing trial verdicts."""
+        try:
+            store = self._get_csi_store()
+            claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+            trials = store._read_jsonl(store._path(simulation_id, "trials.jsonl"))
+            if not claims or not trials:
+                return "Insufficient CSI data to detect contradictions."
+
+            # Find claims that received both 'supports' and 'contradicts' verdicts
+            claim_verdicts: Dict[str, List[str]] = {}
+            for t in trials:
+                cid = t.get("claim_id")
+                if cid:
+                    claim_verdicts.setdefault(cid, []).append(t.get("verdict", ""))
+
+            claim_map = {c.get("claim_id"): c for c in claims}
+            contested: List[str] = []
+            for cid, verdicts in claim_verdicts.items():
+                has_support = any(v == "supports" for v in verdicts)
+                has_contradict = any(v == "contradicts" for v in verdicts)
+                if has_support and has_contradict and cid in claim_map:
+                    contested.append(cid)
+
+            if not contested:
+                return "No contested claims found (no claim has both supporting and contradicting trials)."
+
+            parts: List[str] = [f"## Contested Claims ({len(contested)} claims with conflicting verdicts)"]
+            for i, cid in enumerate(contested, 1):
+                c = claim_map[cid]
+                verdicts = claim_verdicts[cid]
+                support_n = sum(1 for v in verdicts if v == "supports")
+                contra_n = sum(1 for v in verdicts if v == "contradicts")
+                parts.append(
+                    f"{i}. Claim: {cid} | {support_n} supports vs {contra_n} contradicts\n"
+                    f"   Agent: {c.get('agent_name', '?')} | Status: {c.get('status', '?')}\n"
+                    f"   \"{c.get('text', '')}\""
+                )
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.error("query_csi_contradictions failed: %s", exc)
+            return f"Error querying CSI contradictions: {exc}"
+
+    def trace_csi_provenance(self, simulation_id: str, claim_id: str) -> str:
+        """Trace a claim back through its sources, trials, and revisions."""
+        try:
+            store = self._get_csi_store()
+            claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+            trials = store._read_jsonl(store._path(simulation_id, "trials.jsonl"))
+            relations = store._read_jsonl(store._path(simulation_id, "relations.jsonl"))
+            sources_index = store._load_sources_index(simulation_id)
+
+            claim_map = {c.get("claim_id"): c for c in claims}
+            target_claim = claim_map.get(claim_id)
+            if not target_claim:
+                return f"Claim {claim_id} not found."
+
+            parts: List[str] = [
+                f"## Provenance Trace for Claim {claim_id}",
+                f"Text: \"{target_claim.get('text', '')}\"",
+                f"Status: {target_claim.get('status', '?')} | Confidence: {target_claim.get('confidence', '?')}",
+                f"Agent: {target_claim.get('agent_name', '?')} (round {target_claim.get('round_num', '?')})",
+            ]
+
+            # Revision chain
+            revision_of = target_claim.get("revision_of")
+            if revision_of and revision_of in claim_map:
+                parts.append(f"\n### Revision History")
+                chain_id: Optional[str] = revision_of
+                depth = 0
+                while chain_id and chain_id in claim_map and depth < 10:
+                    prev = claim_map[chain_id]
+                    parts.append(
+                        f"  ← Revised from {chain_id}: \"{(prev.get('text', ''))[:200]}\" "
+                        f"(confidence={prev.get('confidence', '?')})"
+                    )
+                    chain_id = prev.get("revision_of")
+                    depth += 1
+
+            # Source references
+            source_ids = target_claim.get("source_ids") or []
+            if source_ids:
+                source_map = {
+                    s.get("source_id"): s
+                    for s in sources_index.get("sources", [])
+                }
+                parts.append(f"\n### Source References ({len(source_ids)})")
+                for sid in source_ids[:10]:
+                    src = source_map.get(sid)
+                    if src:
+                        parts.append(f"  - [{src.get('source_type', '?')}] {src.get('title', '?')}: {(src.get('summary', ''))[:150]}")
+                    else:
+                        parts.append(f"  - {sid} (source record not found)")
+
+            # Related trials
+            related_trials = [t for t in trials if t.get("claim_id") == claim_id]
+            if related_trials:
+                parts.append(f"\n### Peer Review Trials ({len(related_trials)})")
+                for t in related_trials:
+                    parts.append(
+                        f"  - [{t.get('verdict', '?')}] by {t.get('query_agent_name', '?')}: "
+                        f"\"{(t.get('response', '') or '')[:200]}\""
+                    )
+
+            # Related relations
+            related_rels = [r for r in relations if r.get("from_id") == claim_id or r.get("to_id") == claim_id]
+            if related_rels:
+                parts.append(f"\n### Relations ({len(related_rels)})")
+                for r in related_rels:
+                    parts.append(
+                        f"  - {r.get('from_id')} --[{r.get('relation_type', '?')}]--> {r.get('to_id')}"
+                    )
+
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.error("trace_csi_provenance failed: %s", exc)
+            return f"Error tracing CSI provenance: {exc}"
+
+    def get_csi_summary(self, simulation_id: str) -> str:
+        """Get a statistical overview of CSI artifacts for report planning."""
+        try:
+            store = self._get_csi_store()
+            state = store._load_state(simulation_id)
+            claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+            trials = store._read_jsonl(store._path(simulation_id, "trials.jsonl"))
+
+            if not claims and not trials:
+                return "No CSI artifacts found for this simulation. The report should rely on knowledge graph tools instead."
+
+            # Claim statistics
+            status_counts: Dict[str, int] = {}
+            agent_counts: Dict[str, int] = {}
+            confidence_values: List[float] = []
+            for c in claims:
+                s = c.get("status", "unknown")
+                status_counts[s] = status_counts.get(s, 0) + 1
+                a = c.get("agent_name", "unknown")
+                agent_counts[a] = agent_counts.get(a, 0) + 1
+                try:
+                    confidence_values.append(float(c.get("confidence", 0)))
+                except (ValueError, TypeError):
+                    pass
+
+            # Trial statistics
+            verdict_counts: Dict[str, int] = {}
+            for t in trials:
+                v = t.get("verdict", "unknown")
+                verdict_counts[v] = verdict_counts.get(v, 0) + 1
+
+            avg_confidence = (
+                round(sum(confidence_values) / len(confidence_values), 3)
+                if confidence_values else 0
+            )
+
+            parts: List[str] = [
+                f"## CSI Simulation Summary",
+                f"Rounds completed: {state.get('round_count', 0)}",
+                f"\n### Claims: {len(claims)} total",
+                f"  Status breakdown: {json.dumps(status_counts, ensure_ascii=False)}",
+                f"  Average confidence: {avg_confidence}",
+                f"  Claims by agent: {json.dumps(agent_counts, ensure_ascii=False)}",
+                f"\n### Trials: {len(trials)} total",
+                f"  Verdict breakdown: {json.dumps(verdict_counts, ensure_ascii=False)}",
+                f"\n### Other artifacts",
+                f"  Agent actions: {state.get('agent_action_count', 0)}",
+                f"  Recalls: {state.get('recall_count', 0)}",
+                f"  Relations: {state.get('relation_count', 0)}",
+            ]
+            return "\n".join(parts)
+        except Exception as exc:
+            logger.error("get_csi_summary failed: %s", exc)
+            return f"Error getting CSI summary: {exc}"

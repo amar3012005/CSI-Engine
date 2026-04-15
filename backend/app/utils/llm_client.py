@@ -9,6 +9,10 @@ from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
 from ..config import Config
+from .logger import get_logger
+from .token_usage_tracker import TokenUsageTracker
+
+logger = get_logger("mirofish.llm_client")
 
 
 class LLMClient:
@@ -18,11 +22,13 @@ class LLMClient:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        usage_scope: Optional[str] = None,
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
+        self.usage_scope = usage_scope
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
@@ -54,15 +60,97 @@ class LLMClient:
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
         }
+        
+        # Groq reasoning models are stricter on token params.
+        if "gpt-oss" in (self.model or ""):
+            kwargs["max_completion_tokens"] = max_tokens
+            kwargs["extra_body"] = {"include_reasoning": False}
+            kwargs["temperature"] = max(0.0, min(temperature, 0.7))
+        else:
+            kwargs["temperature"] = temperature
+            kwargs["max_tokens"] = max_tokens
         
         if response_format:
             kwargs["response_format"] = response_format
-        
-        response = self.client.chat.completions.create(**kwargs)
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            error_str = str(e)
+            # Some providers/models reject response_format=json_object.
+            if response_format:
+                logger.warning(f"LLM JSON模式失败，回退普通文本解析: {e}")
+                kwargs.pop("response_format", None)
+                response = self.client.chat.completions.create(**kwargs)
+            elif any(sig in error_str for sig in ("tool_use_failed", "output_parse_failed", "failed_generation")) or "tool_choice" in error_str.lower():
+                # Groq / some providers reject when model generates a native tool
+                # call but no tools are registered in the request.  The error body
+                # contains the generation the model *wanted* to produce in
+                # ``failed_generation``.  Extract it and return it as the response
+                # so the report agent's text-based tool parser can handle it.
+                logger.warning(
+                    "Model attempted native tool call without tools registered — "
+                    "extracting failed_generation as response: %s", e,
+                )
+                import json as _json
+                failed_gen = ""
+                try:
+                    # OpenAI SDK wraps the body; try to get the raw dict
+                    err_body = getattr(e, "body", None) or {}
+                    if isinstance(err_body, str):
+                        err_body = _json.loads(err_body)
+                    if isinstance(err_body, dict):
+                        failed_gen = err_body.get("failed_generation", "") or ""
+                        if not failed_gen:
+                            err_inner = err_body.get("error", {})
+                            if isinstance(err_inner, dict):
+                                failed_gen = err_inner.get("failed_generation", "") or ""
+                except Exception:
+                    pass
+                if not failed_gen:
+                    # Try regex on the string representation
+                    fg_match = re.search(r"'failed_generation':\s*'(.*?)'", error_str)
+                    if fg_match:
+                        failed_gen = fg_match.group(1)
+                if failed_gen:
+                    # Groq wraps tool calls as:
+                    #   {"name":"tool_call","arguments":{"name":"query_claims","parameters":{...}}}
+                    # Unwrap to get the real tool name and parameters.
+                    try:
+                        parsed = _json.loads(failed_gen)
+                        if isinstance(parsed, dict):
+                            inner_args = parsed.get("arguments", {})
+                            if isinstance(inner_args, dict) and "name" in inner_args:
+                                real_name = inner_args["name"]
+                                real_params = inner_args.get("parameters", {})
+                                failed_gen = _json.dumps({
+                                    "name": real_name,
+                                    "parameters": real_params,
+                                }, ensure_ascii=False)
+                    except (_json.JSONDecodeError, TypeError):
+                        pass
+                    # Wrap as XML tool_call so the report agent parser can pick it up
+                    return f"<execute_tool>\n{failed_gen}\n</execute_tool>"
+                raise
+            else:
+                raise
+
+        usage = getattr(response, "usage", None)
+        if usage and self.usage_scope:
+            TokenUsageTracker.record_usage(
+                self.usage_scope,
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+                model=self.model,
+                source="llm_client",
+            )
+
         content = response.choices[0].message.content
+        if not content and response.choices and getattr(response.choices[0], "message", None):
+            # Defensive fallback for providers that return empty content with reasoning traces.
+            content = getattr(response.choices[0].message, "reasoning", "") or ""
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content
@@ -99,5 +187,11 @@ class LLMClient:
         try:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
+            # 兜底：尝试提取首个JSON对象
+            match = re.search(r'\{[\s\S]*\}', cleaned_response)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
             raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
-

@@ -231,18 +231,20 @@ class ZepGraphMemoryUpdater:
     def __init__(self, graph_id: str, api_key: Optional[str] = None):
         """
         初始化更新器
-        
+
         Args:
             graph_id: Zep图谱ID
             api_key: Zep API Key（可选，默认从配置读取）
         """
         self.graph_id = graph_id
+        self._zep_enabled = Config.zep_enabled()
         self.api_key = api_key or Config.ZEP_API_KEY
-        
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.client = None
+
+        if self._zep_enabled:
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY未配置")
+            self.client = Zep(api_key=self.api_key)
         
         # 活动队列
         self._activity_queue: Queue = Queue()
@@ -273,9 +275,12 @@ class ZepGraphMemoryUpdater:
     
     def start(self):
         """启动后台工作线程"""
+        if not self._zep_enabled:
+            logger.info(f"ZepGraphMemoryUpdater skipped (Zep disabled): graph_id={self.graph_id}")
+            return
         if self._running:
             return
-        
+
         self._running = True
         self._worker_thread = threading.Thread(
             target=self._worker_loop,
@@ -323,11 +328,16 @@ class ZepGraphMemoryUpdater:
         Args:
             activity: Agent活动记录
         """
+        # Skip everything when Zep is disabled
+        if not self._zep_enabled:
+            self._skipped_count += 1
+            return
+
         # 跳过DO_NOTHING类型的活动
         if activity.action_type == "DO_NOTHING":
             self._skipped_count += 1
             return
-        
+
         self._activity_queue.put(activity)
         self._total_activities += 1
         logger.debug(f"添加活动到Zep队列: {activity.agent_name} - {activity.action_type}")
@@ -395,9 +405,9 @@ class ZepGraphMemoryUpdater:
             activities: Agent活动列表
             platform: 平台名称
         """
-        if not activities:
+        if not activities or not self._zep_enabled:
             return
-        
+
         # 将多条活动合并为一条文本，用换行分隔
         episode_texts = [activity.to_episode_text() for activity in activities]
         combined_text = "\n".join(episode_texts)
@@ -419,6 +429,13 @@ class ZepGraphMemoryUpdater:
                 return
                 
             except Exception as e:
+                err_text = str(e).lower()
+                # 401 is unrecoverable — stop retrying and disable Zep
+                if "status_code: 401" in err_text or "unauthorized" in err_text:
+                    logger.error(f"Zep鉴权失败(401)，禁用本实例的Zep更新: {e}")
+                    self._zep_enabled = False
+                    self._failed_count += 1
+                    return
                 if attempt < self.MAX_RETRIES - 1:
                     logger.warning(f"批量发送到Zep失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
                     time.sleep(self.RETRY_DELAY * (attempt + 1))

@@ -270,6 +270,28 @@ class ProjectManager:
             "path": file_path,
             "size": file_size
         }
+
+    @classmethod
+    def save_bytes_to_project(cls, project_id: str, content: bytes, original_filename: str) -> Dict[str, str]:
+        """保存二进制内容到项目目录。"""
+        files_dir = cls._get_project_files_dir(project_id)
+        os.makedirs(files_dir, exist_ok=True)
+
+        ext = os.path.splitext(original_filename)[1].lower()
+        safe_filename = f"{uuid.uuid4().hex[:8]}{ext}"
+        file_path = os.path.join(files_dir, safe_filename)
+
+        with open(file_path, 'wb') as f:
+            f.write(content)
+
+        file_size = os.path.getsize(file_path)
+
+        return {
+            "original_filename": original_filename,
+            "saved_filename": safe_filename,
+            "path": file_path,
+            "size": file_size
+        }
     
     @classmethod
     def save_extracted_text(cls, project_id: str, text: str) -> None:

@@ -2,7 +2,6 @@ import { createRouter, createWebHistory } from 'vue-router'
 import Home from '../views/Home.vue'
 import Process from '../views/MainView.vue'
 import SimulationView from '../views/SimulationView.vue'
-import SimulationRunView from '../views/SimulationRunView.vue'
 import ReportView from '../views/ReportView.vue'
 import InteractionView from '../views/InteractionView.vue'
 
@@ -27,14 +26,26 @@ const routes = [
   {
     path: '/simulation/:simulationId/start',
     name: 'SimulationRun',
-    component: SimulationRunView,
-    props: true
+    redirect: to => ({
+      name: 'Simulation',
+      params: { simulationId: to.params.simulationId },
+      query: { ...to.query, stage: 'simulation' }
+    })
   },
   {
     path: '/report/:reportId',
     name: 'Report',
     component: ReportView,
     props: true
+  },
+  {
+    path: '/paper-report/:simulationId',
+    name: 'PaperReport',
+    redirect: to => ({
+      name: 'Simulation',
+      params: { simulationId: to.params.simulationId },
+      query: { ...to.query, stage: 'report' }
+    })
   },
   {
     path: '/interaction/:reportId',

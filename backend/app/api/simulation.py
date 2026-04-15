@@ -3,6 +3,7 @@
 Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化）
 """
 
+import json
 import os
 import traceback
 from flask import request, jsonify, send_file
@@ -13,7 +14,9 @@ from ..services.zep_entity_reader import ZepEntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
+from ..services.simulation_csi_local import SimulationCSILocalStore
 from ..utils.logger import get_logger
+from ..utils.token_usage_tracker import TokenUsageTracker
 from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.api.simulation')
@@ -40,6 +43,159 @@ def optimize_interview_prompt(prompt: str) -> str:
     if prompt.startswith(INTERVIEW_PROMPT_PREFIX):
         return prompt
     return f"{INTERVIEW_PROMPT_PREFIX}{prompt}"
+
+
+def _get_csi_store() -> SimulationCSILocalStore:
+    return SimulationCSILocalStore()
+
+
+def _to_csi_graph_shape(snapshot: dict) -> dict:
+    nodes = []
+    edges = []
+
+    for profile in snapshot.get("profiles", []):
+        agent_id = profile.get("agent_id") or str(profile.get("id"))
+        if not agent_id:
+            continue
+        # prefix int agent_id with 'Agent '
+        name = profile.get("agent_name") or profile.get("entity_name") or f"Agent {agent_id}"
+        if name == agent_id and isinstance(agent_id, int):
+            name = f"Agent {agent_id}"
+        nodes.append({
+            "uuid": str(agent_id),
+            "name": str(name),
+            "labels": ["Entity", "CSI", "Agent"],
+            "summary": profile.get("research_role") or "",
+            "attributes": profile,
+        })
+
+    for source in snapshot.get("sources_index", {}).get("sources", []):
+        source_id = source.get("source_id")
+        if not source_id:
+            continue
+        nodes.append({
+            "uuid": source_id,
+            "name": source.get("title") or source_id,
+            "labels": ["Entity", "CSI", "Source"],
+            "summary": source.get("summary") or source.get("content", "")[:240],
+            "attributes": source,
+        })
+
+    for claim in snapshot.get("claims", []):
+        claim_id = claim.get("claim_id")
+        if not claim_id:
+            continue
+        nodes.append({
+            "uuid": claim_id,
+            "name": claim.get("text", "")[:80] or claim_id,
+            "labels": ["Entity", "CSI", "Claim"],
+            "summary": claim.get("text", ""),
+            "attributes": claim,
+        })
+
+    for trial in snapshot.get("trials", []):
+        trial_id = trial.get("trial_id")
+        if not trial_id:
+            continue
+        nodes.append({
+            "uuid": trial_id,
+            "name": trial.get("verdict") or trial_id,
+            "labels": ["Entity", "CSI", "Trial"],
+            "summary": trial.get("response") or trial.get("query") or "",
+            "attributes": trial,
+        })
+
+    for action in snapshot.get("agent_actions", []):
+        action_id = action.get("action_id")
+        if not action_id:
+            continue
+        nodes.append({
+            "uuid": action_id,
+            "name": action.get("action_type") or action_id,
+            "labels": ["Entity", "CSI", "AgentAction"],
+            "summary": json.dumps(action.get("detail", {}), ensure_ascii=False)[:200],
+            "attributes": action,
+        })
+
+    for recall in snapshot.get("recalls", []):
+        recall_id = recall.get("recall_id")
+        if not recall_id:
+            continue
+        recall_summary = "; ".join(
+            [snippet.get("snippet", "") for snippet in recall.get("snippets", [])[:2] if isinstance(snippet, dict)]
+        )
+        nodes.append({
+            "uuid": recall_id,
+            "name": recall.get("query", "")[:80] or recall_id,
+            "labels": ["Entity", "CSI", "Recall"],
+            "summary": recall_summary,
+            "attributes": recall,
+        })
+
+    for relation in snapshot.get("relations", []):
+        relation_id = relation.get("relation_id")
+        source_id = relation.get("from_id")
+        target_id = relation.get("to_id")
+        if not relation_id or not source_id or not target_id:
+            continue
+        edges.append({
+            "uuid": relation_id,
+            "name": relation.get("relation_type") or "related_to",
+            "fact": relation.get("relation_type") or "related_to",
+            "fact_type": relation.get("relation_type") or "related_to",
+            "source_node_uuid": source_id,
+            "target_node_uuid": target_id,
+            "episodes": [snapshot.get("state", {}).get("simulation_id")] if snapshot.get("state", {}).get("simulation_id") else [],
+            "metadata": relation.get("metadata", {}),
+        })
+
+    # Implicit dynamically generated edges to connect Agents to their actions/claims/trials
+    for claim in snapshot.get("claims", []):
+        gen_id = claim.get("generator_agent_id")
+        if gen_id:
+            edges.append({
+                "uuid": f"impl_edge_{claim.get('claim_id')}_agent_{gen_id}",
+                "name": "GENERATED",
+                "fact": "GENERATED",
+                "fact_type": "GENERATED",
+                "source_node_uuid": str(gen_id),
+                "target_node_uuid": claim.get("claim_id"),
+                "metadata": {"implicit": True},
+                "episodes": []
+            })
+    for trial in snapshot.get("trials", []):
+        eval_id = trial.get("evaluator_agent_id")
+        if eval_id:
+            edges.append({
+                "uuid": f"impl_edge_{trial.get('trial_id')}_agent_{eval_id}",
+                "name": "EVALUATED",
+                "fact": "EVALUATED",
+                "fact_type": "EVALUATED",
+                "source_node_uuid": str(eval_id),
+                "target_node_uuid": trial.get("trial_id"),
+                "metadata": {"implicit": True},
+                "episodes": []
+            })
+    for action in snapshot.get("agent_actions", []):
+        act_ag_id = action.get("agent_id")
+        if act_ag_id:
+            edges.append({
+                "uuid": f"impl_edge_{action.get('action_id')}_agent_{act_ag_id}",
+                "name": "PERFORMED",
+                "fact": "PERFORMED",
+                "fact_type": "PERFORMED",
+                "source_node_uuid": str(act_ag_id),
+                "target_node_uuid": action.get("action_id"),
+                "metadata": {"implicit": True},
+                "episodes": []
+            })
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
 
 
 # ============== 实体读取接口 ==============
@@ -193,33 +349,49 @@ def create_simulation():
     try:
         data = request.get_json() or {}
         
-        project_id = data.get('project_id')
-        if not project_id:
-            return jsonify({
-                "success": False,
-                "error": "请提供 project_id"
-            }), 400
-        
-        project = ProjectManager.get_project(project_id)
-        if not project:
-            return jsonify({
-                "success": False,
-                "error": f"项目不存在: {project_id}"
-            }), 404
-        
-        graph_id = data.get('graph_id') or project.graph_id
-        if not graph_id:
+        config_mode = data.get('config_mode', 'social')
+        project_id = data.get('project_id', '')
+        simulation_requirement = data.get('simulation_requirement', '')
+
+        # Web research mode: create a lightweight project if none provided
+        if config_mode == 'web_research' and not project_id:
+            project = ProjectManager.create_project(
+                name=simulation_requirement[:80] or "Web Research"
+            )
+            project.simulation_requirement = simulation_requirement
+            from ..models.project import ProjectStatus
+            project.status = ProjectStatus.GRAPH_COMPLETED
+            ProjectManager.save_project(project)
+            project_id = project.project_id
+            logger.info(f"Created lightweight project for web research: {project_id}")
+        else:
+            if not project_id:
+                return jsonify({
+                    "success": False,
+                    "error": "请提供 project_id"
+                }), 400
+            project = ProjectManager.get_project(project_id)
+            if not project:
+                return jsonify({
+                    "success": False,
+                    "error": f"项目不存在: {project_id}"
+                }), 404
+
+        graph_id = data.get('graph_id') or getattr(project, 'graph_id', '') or ''
+        # web_research mode does not require a graph
+        if not graph_id and config_mode != 'web_research':
             return jsonify({
                 "success": False,
                 "error": "项目尚未构建图谱，请先调用 /api/graph/build"
             }), 400
-        
+
         manager = SimulationManager()
         state = manager.create_simulation(
             project_id=project_id,
-            graph_id=graph_id,
+            graph_id=graph_id or "",
             enable_twitter=data.get('enable_twitter', True),
             enable_reddit=data.get('enable_reddit', True),
+            config_mode=config_mode,
         )
         
         return jsonify({
@@ -332,12 +504,25 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
                 except Exception as e:
                     logger.warning(f"自动更新状态失败: {e}")
             
+            config_mode = state_data.get("config_mode", "social")
+            config_mode_label = state_data.get("config_mode_label", "Dual-Platform Social Simulation")
+            config_data = None
+            try:
+                with open(config_file, 'r', encoding='utf-8') as cf:
+                    config_data = json.load(cf)
+                config_mode = config_data.get("config_mode", config_mode)
+                config_mode_label = config_data.get("mode_label", config_mode_label)
+            except Exception:
+                pass
+
             logger.info(f"模拟 {simulation_id} 检测结果: 已准备完成 (status={status}, config_generated={config_generated})")
             return True, {
                 "status": status,
                 "entities_count": state_data.get("entities_count", 0),
                 "profiles_count": profiles_count,
                 "entity_types": state_data.get("entity_types", []),
+                "config_mode": config_mode,
+                "config_mode_label": config_mode_label,
                 "config_generated": config_generated,
                 "created_at": state_data.get("created_at"),
                 "updated_at": state_data.get("updated_at"),
@@ -466,25 +651,48 @@ def prepare_simulation():
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
         parallel_profile_count = data.get('parallel_profile_count', 5)
+        config_mode = str(data.get('config_mode', 'social')).strip().lower()
+        if config_mode in {'deepresearch', 'csi'}:
+            config_mode = 'deepresearch'
+        if config_mode not in {'social', 'deepresearch', 'web_research'}:
+            return jsonify({
+                "success": False,
+                "error": "config_mode 仅支持 social, deepresearch 或 web_research"
+            }), 400
+
+        max_agents = int(data.get('max_agents', 25))
+        professional_mode = bool(data.get('professional_mode', True))
+        min_qualification_score = float(data.get('min_qualification_score', 0.75))
+        user_query = data.get('user_query') or simulation_requirement
+        naming_mode = str(data.get('naming_mode', 'hybrid'))
+        allow_famous_personas = bool(data.get('allow_famous_personas', True))
+        famous_persona_ratio = float(data.get('famous_persona_ratio', 0.2))
+        source_first_mode = bool(data.get('source_first_mode', True))
+        source_first_ratio = float(data.get('source_first_ratio', 0.8))
         
         # ========== 同步获取实体数量（在后台任务启动前） ==========
         # 这样前端在调用prepare后立即就能获取到预期Agent总数
-        try:
-            logger.info(f"同步获取实体数量: graph_id={state.graph_id}")
-            reader = ZepEntityReader()
-            # 快速读取实体（不需要边信息，只统计数量）
-            filtered_preview = reader.filter_defined_entities(
-                graph_id=state.graph_id,
-                defined_entity_types=entity_types_list,
-                enrich_with_edges=False  # 不获取边信息，加快速度
-            )
-            # 保存实体数量到状态（供前端立即获取）
-            state.entities_count = filtered_preview.filtered_count
-            state.entity_types = list(filtered_preview.entity_types)
-            logger.info(f"预期实体数量: {filtered_preview.filtered_count}, 类型: {filtered_preview.entity_types}")
-        except Exception as e:
-            logger.warning(f"同步获取实体数量失败（将在后台任务中重试）: {e}")
-            # 失败不影响后续流程，后台任务会重新获取
+        # web_research mode skips graph entity reads entirely
+        if config_mode != 'web_research':
+            try:
+                logger.info(f"同步获取实体数量: graph_id={state.graph_id}")
+                reader = ZepEntityReader()
+                # 快速读取实体（不需要边信息，只统计数量）
+                filtered_preview = reader.filter_defined_entities(
+                    graph_id=state.graph_id,
+                    defined_entity_types=entity_types_list,
+                    enrich_with_edges=False  # 不获取边信息，加快速度
+                )
+                expected_count = filtered_preview.filtered_count
+                if professional_mode:
+                    expected_count = min(expected_count, max(1, min(max_agents, 200)))
+                # 保存实体数量到状态（供前端立即获取）
+                state.entities_count = expected_count
+                state.entity_types = list(filtered_preview.entity_types)
+                logger.info(f"预期实体数量: {state.entities_count}, 类型: {filtered_preview.entity_types}")
+            except Exception as e:
+                logger.warning(f"同步获取实体数量失败（将在后台任务中重试）: {e}")
+                # 失败不影响后续流程，后台任务会重新获取
         
         # 创建异步任务
         task_manager = TaskManager()
@@ -498,6 +706,13 @@ def prepare_simulation():
         
         # 更新模拟状态（包含预先获取的实体数量）
         state.status = SimulationStatus.PREPARING
+        state.config_mode = config_mode
+        _mode_labels = {
+            "deepresearch": "DeepResearch / CSI Workflow",
+            "web_research": "Web Research (query-only)",
+            "social": "Dual-Platform Social Simulation",
+        }
+        state.config_mode_label = _mode_labels.get(config_mode, "Dual-Platform Social Simulation")
         manager._save_simulation_state(state)
         
         # 定义后台任务
@@ -515,22 +730,37 @@ def prepare_simulation():
                 stage_details = {}
                 
                 def progress_callback(stage, progress, message, **kwargs):
-                    # 计算总进度
-                    stage_weights = {
-                        "reading": (0, 20),           # 0-20%
-                        "generating_profiles": (20, 70),  # 20-70%
-                        "generating_config": (70, 90),    # 70-90%
-                        "copying_scripts": (90, 100)       # 90-100%
-                    }
+                    # 计算总进度（web_research 与其他模式阶段不同）
+                    if config_mode == "web_research":
+                        stage_weights = {
+                            "generating_profiles": (0, 45),   # 0-45%
+                            "generating_config": (45, 55),    # 45-55%
+                            "collecting_sources": (55, 95),   # 55-95%
+                            "building_csi": (95, 100),        # 95-100%
+                        }
+                    else:
+                        stage_weights = {
+                            "reading": (0, 20),           # 0-20%
+                            "generating_profiles": (20, 70),  # 20-70%
+                            "generating_config": (70, 90),    # 70-90%
+                            "building_csi": (90, 98),        # 90-98%
+                            "copying_scripts": (98, 100)       # 98-100%
+                        }
                     
                     start, end = stage_weights.get(stage, (0, 100))
                     current_progress = int(start + (end - start) * progress / 100)
                     
                     # 构建详细进度信息
+                    _config_stage_label = {
+                        "deepresearch": "生成DeepResearch/CSI配置",
+                        "web_research": "生成Web Research团队与配置",
+                    }.get(config_mode, "生成模拟配置")
                     stage_names = {
                         "reading": "读取图谱实体",
                         "generating_profiles": "生成Agent人设",
-                        "generating_config": "生成模拟配置",
+                        "generating_config": _config_stage_label,
+                        "collecting_sources": "采集来源",
+                        "building_csi": "初始化本地CSI工作状态",
                         "copying_scripts": "准备模拟脚本"
                     }
                     
@@ -582,7 +812,17 @@ def prepare_simulation():
                     defined_entity_types=entity_types_list,
                     use_llm_for_profiles=use_llm_for_profiles,
                     progress_callback=progress_callback,
-                    parallel_profile_count=parallel_profile_count
+                    parallel_profile_count=parallel_profile_count,
+                    config_mode=config_mode,
+                    max_agents=max_agents,
+                    professional_mode=professional_mode,
+                    user_query=user_query,
+                    min_qualification_score=min_qualification_score,
+                    naming_mode=naming_mode,
+                    allow_famous_personas=allow_famous_personas,
+                    famous_persona_ratio=famous_persona_ratio,
+                    source_first_mode=source_first_mode,
+                    source_first_ratio=source_first_ratio
                 )
                 
                 # 任务完成
@@ -614,6 +854,8 @@ def prepare_simulation():
                 "status": "preparing",
                 "message": "准备任务已启动，请通过 /api/simulation/prepare/status 查询进度",
                 "already_prepared": False,
+                "config_mode": config_mode,
+                "config_mode_label": state.config_mode_label,
                 "expected_entities_count": state.entities_count,  # 预期的Agent总数
                 "entity_types": state.entity_types  # 实体类型列表
             }
@@ -677,14 +919,16 @@ def get_prepare_status():
                 return jsonify({
                     "success": True,
                     "data": {
-                        "simulation_id": simulation_id,
-                        "status": "ready",
-                        "progress": 100,
-                        "message": "已有完成的准备工作",
-                        "already_prepared": True,
-                        "prepare_info": prepare_info
-                    }
-                })
+                    "simulation_id": simulation_id,
+                    "status": "ready",
+                    "progress": 100,
+                    "message": "已有完成的准备工作",
+                    "already_prepared": True,
+                    "config_mode": prepare_info.get("config_mode", "social"),
+                    "config_mode_label": prepare_info.get("config_mode_label", "Dual-Platform Social Simulation"),
+                    "prepare_info": prepare_info
+                }
+            })
         
         # 如果没有task_id，返回错误
         if not task_id:
@@ -718,13 +962,15 @@ def get_prepare_status():
                         "data": {
                             "simulation_id": simulation_id,
                             "task_id": task_id,
-                            "status": "ready",
-                            "progress": 100,
-                            "message": "任务已完成（准备工作已存在）",
-                            "already_prepared": True,
-                            "prepare_info": prepare_info
-                        }
-                    })
+                        "status": "ready",
+                        "progress": 100,
+                        "message": "任务已完成（准备工作已存在）",
+                        "already_prepared": True,
+                        "config_mode": prepare_info.get("config_mode", "social"),
+                        "config_mode_label": prepare_info.get("config_mode_label", "Dual-Platform Social Simulation"),
+                        "prepare_info": prepare_info
+                    }
+                })
             
             return jsonify({
                 "success": False,
@@ -732,6 +978,12 @@ def get_prepare_status():
             }), 404
         
         task_dict = task.to_dict()
+        if simulation_id:
+            manager = SimulationManager()
+            state = manager.get_simulation(simulation_id)
+            if state:
+                task_dict["config_mode"] = state.config_mode
+                task_dict["config_mode_label"] = state.config_mode_label
         task_dict["already_prepared"] = False
         
         return jsonify({
@@ -777,6 +1029,155 @@ def get_simulation(simulation_id: str):
             "success": False,
             "error": str(e),
             "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/continue', methods=['POST'])
+def continue_simulation(simulation_id: str):
+    """Continue an existing simulation with a follow-up query."""
+    try:
+        data = request.get_json() or {}
+        query = str(data.get('query') or '').strip()
+
+        if not query:
+            return jsonify({
+                "success": False,
+                "error": "query is required"
+            }), 400
+
+        manager = SimulationManager()
+        result = manager.continue_simulation(simulation_id, query)
+
+        return jsonify({
+            "success": True,
+            "data": result
+        })
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+    except Exception as e:
+        logger.error("继续模拟失败: %s", str(e))
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": f"Failed to continue simulation: {str(e)}"
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/checkpoints', methods=['GET'])
+def get_simulation_checkpoints(simulation_id: str):
+    """Return checkpoint history for a simulation."""
+    try:
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+
+        if not state:
+            return jsonify({
+                "success": False,
+                "error": f"模拟不存在: {simulation_id}"
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "current_query": state.simulation_requirement,
+                "checkpoints": state.checkpoints,
+            }
+        })
+    except Exception as e:
+        logger.error("获取检查点失败: %s", str(e))
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/token-usage', methods=['GET'])
+def get_simulation_token_usage(simulation_id: str):
+    """Return exact provider token usage for a single simulation."""
+    try:
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+
+        if not state:
+            return jsonify({
+                "success": False,
+                "error": f"模拟不存在: {simulation_id}"
+            }), 404
+
+        usage = TokenUsageTracker.get_usage(simulation_id)
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+                "entries": usage.get("entries", []),
+                "calls": usage.get("calls", 0),
+                "models": usage.get("models", {}),
+                "sources": usage.get("sources", {}),
+                "updated_at": usage.get("updated_at"),
+            }
+        })
+    except Exception as e:
+        logger.error("获取 token usage 失败: %s", str(e))
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>', methods=['DELETE'])
+def delete_simulation(simulation_id: str):
+    """
+    Delete a simulation and all its data (profiles, config, CSI artifacts, reports).
+    This is irreversible.
+    """
+    try:
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+
+        if not state:
+            return jsonify({
+                "success": False,
+                "error": f"Simulation not found: {simulation_id}"
+            }), 404
+
+        # Stop if running
+        if state.status in ('running', 'preparing'):
+            try:
+                runner = SimulationRunner()
+                runner.stop_simulation(simulation_id)
+            except Exception:
+                pass
+
+        # Delete the simulation directory
+        sim_dir = os.path.join(manager.SIMULATION_DATA_DIR, simulation_id)
+        if os.path.exists(sim_dir):
+            import shutil
+            shutil.rmtree(sim_dir)
+            logger.info("Deleted simulation directory: %s", sim_dir)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "deleted": True
+            }
+        })
+
+    except Exception as e:
+        logger.error("Delete simulation failed: %s", str(e))
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "success": False,
+            "error": f"Failed to delete simulation: {str(e)}"
         }), 500
 
 
@@ -1203,10 +1604,10 @@ def get_simulation_config_realtime(simulation_id: str):
                     
                     # 判断当前阶段
                     if is_generating:
-                        if state_data.get("profiles_generated", False):
-                            generation_stage = "generating_config"
-                        else:
+                        if file_exists or state_data.get("config_generated", False):
                             generation_stage = "generating_profiles"
+                        else:
+                            generation_stage = "generating_config"
                     elif status == "ready":
                         generation_stage = "completed"
             except Exception:
@@ -1226,15 +1627,39 @@ def get_simulation_config_realtime(simulation_id: str):
         # 如果配置存在，提取一些关键统计信息
         if config:
             response_data["summary"] = {
+                "config_mode": config.get("config_mode", "social"),
+                "mode_label": config.get("mode_label", "Dual-Platform Social Simulation"),
                 "total_agents": len(config.get("agent_configs", [])),
                 "simulation_hours": config.get("time_config", {}).get("total_simulation_hours"),
                 "initial_posts_count": len(config.get("event_config", {}).get("initial_posts", [])),
                 "hot_topics_count": len(config.get("event_config", {}).get("hot_topics", [])),
-                "has_twitter_config": "twitter_config" in config,
-                "has_reddit_config": "reddit_config" in config,
+                "has_twitter_config": bool(config.get("twitter_config")),
+                "has_reddit_config": bool(config.get("reddit_config")),
+                "has_research_workflow_config": bool(config.get("research_workflow_config")),
+                "agent_assignments_count": len(
+                    (config.get("research_workflow_config") or {}).get("agent_assignments", [])
+                ),
+                "research_rounds_count": len(
+                    (config.get("research_workflow_config") or {}).get("research_rounds", [])
+                ),
                 "generated_at": config.get("generated_at"),
                 "llm_model": config.get("llm_model")
             }
+
+            csi_state_path = os.path.join(sim_dir, "csi", "state.json")
+            if os.path.exists(csi_state_path):
+                try:
+                    with open(csi_state_path, "r", encoding="utf-8") as f:
+                        csi_state = json.load(f)
+                    response_data["summary"]["csi_initialized"] = bool(csi_state.get("initialized"))
+                    response_data["summary"]["csi_rounds"] = csi_state.get("round_count", 0)
+                    response_data["summary"]["csi_claim_count"] = csi_state.get("claim_count", 0)
+                    response_data["summary"]["csi_trial_count"] = csi_state.get("trial_count", 0)
+                    response_data["summary"]["csi_action_count"] = csi_state.get("agent_action_count", 0)
+                    response_data["summary"]["csi_recall_count"] = csi_state.get("recall_count", 0)
+                    response_data["summary"]["csi_relation_count"] = csi_state.get("relation_count", 0)
+                except Exception:
+                    pass
         
         return jsonify({
             "success": True,
@@ -1308,6 +1733,298 @@ def download_simulation_config(simulation_id: str):
         
     except Exception as e:
         logger.error(f"下载配置失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/state', methods=['GET'])
+def get_local_csi_state(simulation_id: str):
+    """Get local CSI state stored inside the simulation folder."""
+    try:
+        store = _get_csi_store()
+        if not store.has_artifacts(simulation_id):
+            return jsonify({
+                "success": False,
+                "error": f"CSI state not found for simulation: {simulation_id}",
+            }), 404
+        state = store.get_state(simulation_id)
+        snapshot = store.get_snapshot(simulation_id)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "summary": {
+                    "claim_count": snapshot.get("counts", {}).get("claims", 0),
+                    "trial_count": snapshot.get("counts", {}).get("trials", 0),
+                    "relation_count": snapshot.get("counts", {}).get("relations", 0),
+                    "source_count": snapshot.get("counts", {}).get("sources", 0),
+                    "recall_count": snapshot.get("counts", {}).get("recalls", 0),
+                    "agent_action_count": snapshot.get("counts", {}).get("agent_actions", 0),
+                    "config_mode": state.get("config_mode", "social"),
+                    "round_count": state.get("round_count", 0),
+                    "initialized": bool(state.get("initialized")),
+                    "updated_at": state.get("updated_at"),
+                },
+                "state": state,
+                "manifest": snapshot.get("manifest", {}),
+                "claims": snapshot.get("claims", []),
+                "trials": snapshot.get("trials", []),
+                "relations": snapshot.get("relations", []),
+                "sources": snapshot.get("sources_index", {}).get("sources", []),
+                "recalls": snapshot.get("recalls", []),
+                "agent_actions": snapshot.get("agent_actions", []),
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"获取本地CSI状态失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/graph', methods=['GET'])
+def get_local_csi_graph(simulation_id: str):
+    """Get graph-shaped nodes/edges for the local CSI working state."""
+    try:
+        store = _get_csi_store()
+        if not store.has_artifacts(simulation_id):
+            return jsonify({
+                "success": False,
+                "error": f"CSI graph not found for simulation: {simulation_id}",
+            }), 404
+        snapshot = store.get_snapshot(simulation_id)
+        graph_payload = _to_csi_graph_shape(snapshot)
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                **graph_payload,
+                "counts": snapshot.get("counts", {}),
+                "state": snapshot.get("state", {}),
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"获取本地CSI图失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/artifacts', methods=['GET'])
+def get_local_csi_artifacts(simulation_id: str):
+    """Get one artifact collection from the simulation-scoped local CSI store."""
+    try:
+        store = _get_csi_store()
+        if not store.has_artifacts(simulation_id):
+            return jsonify({
+                "success": False,
+                "error": f"CSI artifacts not found for simulation: {simulation_id}",
+            }), 404
+
+        artifact_type = (request.args.get("type") or "claims").strip().lower()
+        snapshot = store.get_snapshot(simulation_id)
+        mapping = {
+            "claims": snapshot.get("claims", []),
+            "trials": snapshot.get("trials", []),
+            "relations": snapshot.get("relations", []),
+            "sources": snapshot.get("sources_index", {}).get("sources", []),
+            "recalls": snapshot.get("recalls", []),
+            "agent_actions": snapshot.get("agent_actions", []),
+        }
+        if artifact_type not in mapping:
+            return jsonify({
+                "success": False,
+                "error": f"不支持的 artifact type: {artifact_type}",
+            }), 400
+
+        items = mapping[artifact_type]
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "type": artifact_type,
+                "count": len(items),
+                "items": items,
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"获取本地CSI工件失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/initialize', methods=['POST'])
+def initialize_local_csi(simulation_id: str):
+    """Seed local CSI artifacts from simulation config and profile outputs."""
+    try:
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": f"模拟不存在: {simulation_id}"}), 404
+
+        config = manager.get_simulation_config(simulation_id)
+        if not config:
+            return jsonify({"success": False, "error": "simulation_config.json 不存在，请先 prepare"}), 404
+
+        store = _get_csi_store()
+        profiles = store._load_profiles(simulation_id)  # local bootstrap helper; deduped and file-aware
+        project = ProjectManager.get_project(state.project_id)
+        simulation_requirement = project.simulation_requirement if project else ""
+
+        result = store.initialize_from_prepare(
+            simulation_id=simulation_id,
+            project_id=state.project_id,
+            graph_id=state.graph_id,
+            simulation_requirement=simulation_requirement,
+            document_text=ProjectManager.get_extracted_text(state.project_id) or "",
+            simulation_config=config,
+            profiles=profiles,
+            bootstrap_rounds=0,  # bootstrap skipped — CSI research engine handles all rounds
+        )
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"初始化本地CSI失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/run', methods=['POST'])
+def run_local_csi_rounds(simulation_id: str):
+    """Run additional local CSI working rounds."""
+    try:
+        data = request.get_json(silent=True) or {}
+        rounds = int(data.get("rounds", 1) or 1)
+        preferred_target_agent_id = data.get("preferred_target_agent_id")
+        if preferred_target_agent_id is not None:
+            try:
+                preferred_target_agent_id = int(preferred_target_agent_id)
+            except (TypeError, ValueError):
+                preferred_target_agent_id = None
+        simulation_requirement = data.get("simulation_requirement")
+
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": f"模拟不存在: {simulation_id}"}), 404
+
+        if not simulation_requirement:
+            project = ProjectManager.get_project(state.project_id)
+            simulation_requirement = (project.simulation_requirement if project else "") or ""
+
+        store = _get_csi_store()
+        result = store.run_local_rounds(
+            simulation_id=simulation_id,
+            simulation_requirement=simulation_requirement,
+            rounds=rounds,
+            preferred_target_agent_id=preferred_target_agent_id,
+        )
+        state.csi_initialized = True
+        state.csi_artifacts_ready = True
+        state.csi_rounds = result.get("state", {}).get("round_count", state.csi_rounds)
+        manager._save_simulation_state(state)
+
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"运行本地CSI轮次失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/claim', methods=['POST'])
+def create_local_csi_claim(simulation_id: str):
+    """Persist a claim in the local CSI store."""
+    data = request.get_json(silent=True) or {}
+    try:
+        store = _get_csi_store()
+        result = store.record_claim(simulation_id, data)
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"保存本地CSI claim失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/trial', methods=['POST'])
+def create_local_csi_trial(simulation_id: str):
+    """Persist a trial in the local CSI store."""
+    data = request.get_json(silent=True) or {}
+    try:
+        store = _get_csi_store()
+        result = store.record_trial(simulation_id, data)
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"保存本地CSI trial失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/action', methods=['POST'])
+def create_local_csi_action(simulation_id: str):
+    """Persist an agent action in the local CSI store."""
+    data = request.get_json(silent=True) or {}
+    try:
+        store = _get_csi_store()
+        result = store.record_agent_action(simulation_id, data)
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"保存本地CSI action失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/recall', methods=['POST'])
+def create_local_csi_recall(simulation_id: str):
+    """Persist a recall result in the local CSI store."""
+    data = request.get_json(silent=True) or {}
+    try:
+        store = _get_csi_store()
+        result = store.record_recall(simulation_id, data)
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"保存本地CSI recall失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/csi/relation', methods=['POST'])
+def create_local_csi_relation(simulation_id: str):
+    """Persist a relation in the local CSI store."""
+    data = request.get_json(silent=True) or {}
+    try:
+        store = _get_csi_store()
+        result = store.record_relation(simulation_id, data)
+        return jsonify({"success": True, "data": result}), 200
+    except Exception as e:
+        logger.error(f"保存本地CSI relation失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),
@@ -1578,20 +2295,24 @@ def start_simulation():
         
         # 获取图谱ID（用于图谱记忆更新）
         graph_id = None
+        config_mode = getattr(state, 'config_mode', '') or ''
         if enable_graph_memory_update:
-            # 从模拟状态或项目中获取 graph_id
-            graph_id = state.graph_id
-            if not graph_id:
-                # 尝试从项目中获取
-                project = ProjectManager.get_project(state.project_id)
-                if project:
-                    graph_id = project.graph_id
-            
-            if not graph_id:
-                return jsonify({
-                    "success": False,
-                    "error": "启用图谱记忆更新需要有效的 graph_id，请确保项目已构建图谱"
-                }), 400
+            if config_mode in ('web_research',):
+                # Web research has no graph — silently disable graph memory update
+                enable_graph_memory_update = False
+                logger.info(f"Graph memory update disabled for web_research mode: {simulation_id}")
+            else:
+                # 从模拟状态或项目中获取 graph_id
+                graph_id = state.graph_id
+                if not graph_id:
+                    project = ProjectManager.get_project(state.project_id)
+                    if project:
+                        graph_id = project.graph_id
+                if not graph_id:
+                    return jsonify({
+                        "success": False,
+                        "error": "启用图谱记忆更新需要有效的 graph_id，请确保项目已构建图谱"
+                    }), 400
             
             logger.info(f"启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}")
         
@@ -1613,6 +2334,8 @@ def start_simulation():
             response_data['max_rounds_applied'] = max_rounds
         response_data['graph_memory_update_enabled'] = enable_graph_memory_update
         response_data['force_restarted'] = force_restarted
+        response_data['config_mode'] = state.config_mode
+        response_data['config_mode_label'] = state.config_mode_label
         if enable_graph_memory_update:
             response_data['graph_id'] = graph_id
         

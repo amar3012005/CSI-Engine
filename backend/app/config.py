@@ -34,6 +34,20 @@ class Config:
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+    # Master kill-switch for all Zep Cloud API calls.
+    # Defaults to True only when a ZEP_API_KEY is actually present.
+    USE_ZEP = os.environ.get('USE_ZEP', '').strip().lower()
+    # Resolved later after class body – see _resolve_use_zep()
+
+    # 图谱后端提供方: zep | hivemind
+    GRAPH_PROVIDER = os.environ.get('GRAPH_PROVIDER', 'zep').strip().lower()
+    
+    # HIVEMIND配置（当 GRAPH_PROVIDER=hivemind 时使用）
+    HIVEMIND_API_URL = os.environ.get('HIVEMIND_API_URL', '').rstrip('/')
+    HIVEMIND_API_KEY = os.environ.get('HIVEMIND_API_KEY')
+    # HIVEMIND 图谱构建期是否同步每个chunk到 /api/memories
+    # 关闭可避免构建任务被网络延迟拖慢
+    HIVEMIND_SYNC_EPISODES = os.environ.get('HIVEMIND_SYNC_EPISODES', 'false').lower() == 'true'
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -58,18 +72,43 @@ class Config:
         'TREND', 'REFRESH', 'DO_NOTHING', 'FOLLOW', 'MUTE'
     ]
     
+    # Tavily Web Search配置（可选 — CSI Research Engine web exploration）
+    TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
+
     # Report Agent配置
     REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
     REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
     
     @classmethod
+    def zep_enabled(cls) -> bool:
+        """Return True only when Zep Cloud calls should be made."""
+        # Explicit env var takes precedence
+        raw = os.environ.get('USE_ZEP', '').strip().lower()
+        if raw in ('true', '1', 'yes'):
+            return True
+        if raw in ('false', '0', 'no'):
+            return False
+        # Auto-detect: enabled only when an API key is actually set
+        return bool(cls.ZEP_API_KEY)
+
+    @classmethod
     def validate(cls):
         """验证必要配置"""
         errors = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
-        return errors
 
+        if cls.GRAPH_PROVIDER not in {'zep', 'hivemind'}:
+            errors.append("GRAPH_PROVIDER 只能是 zep 或 hivemind")
+
+        # Only require ZEP_API_KEY when Zep is actually enabled
+        if cls.GRAPH_PROVIDER == 'zep' and cls.zep_enabled() and not cls.ZEP_API_KEY:
+            errors.append("ZEP_API_KEY 未配置 (GRAPH_PROVIDER=zep)")
+
+        if cls.GRAPH_PROVIDER == 'hivemind':
+            if not cls.HIVEMIND_API_URL:
+                errors.append("HIVEMIND_API_URL 未配置 (GRAPH_PROVIDER=hivemind)")
+            if not cls.HIVEMIND_API_KEY:
+                errors.append("HIVEMIND_API_KEY 未配置 (GRAPH_PROVIDER=hivemind)")
+        return errors

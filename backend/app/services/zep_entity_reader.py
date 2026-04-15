@@ -12,6 +12,7 @@ from zep_cloud.client import Zep
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
+from .graph_builder import GraphBuilderService
 
 logger = get_logger('mirofish.zep_entity_reader')
 
@@ -79,39 +80,51 @@ class ZepEntityReader:
     """
     
     def __init__(self, api_key: Optional[str] = None):
+        self.provider = Config.GRAPH_PROVIDER
+        self._zep_enabled = Config.zep_enabled()
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.client = None
+        if self.provider == 'zep' and self._zep_enabled:
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = Zep(api_key=self.api_key)
     
     def _call_with_retry(
-        self, 
-        func: Callable[[], T], 
+        self,
+        func: Callable[[], T],
         operation_name: str,
         max_retries: int = 3,
         initial_delay: float = 2.0
     ) -> T:
         """
         带重试机制的Zep API调用
-        
+
         Args:
             func: 要执行的函数（无参数的lambda或callable）
             operation_name: 操作名称，用于日志
             max_retries: 最大重试次数（默认3次，即最多尝试3次）
             initial_delay: 初始延迟秒数
-            
+
         Returns:
             API调用结果
         """
+        if not self._zep_enabled:
+            raise RuntimeError("Zep Cloud is disabled")
+
         last_exception = None
         delay = initial_delay
-        
+
         for attempt in range(max_retries):
             try:
                 return func()
             except Exception as e:
                 last_exception = e
+                # 401 is unrecoverable — disable Zep and stop retrying
+                if "status_code: 401" in str(e).lower() or "unauthorized" in str(e).lower():
+                    logger.warning("Disabling Zep Cloud for this ZepEntityReader instance (401 detected)")
+                    self._zep_enabled = False
+                    self.client = None
+                    raise
                 if attempt < max_retries - 1:
                     logger.warning(
                         f"Zep {operation_name} 第 {attempt + 1} 次尝试失败: {str(e)[:100]}, "
@@ -121,7 +134,7 @@ class ZepEntityReader:
                     delay *= 2  # 指数退避
                 else:
                     logger.error(f"Zep {operation_name} 在 {max_retries} 次尝试后仍失败: {str(e)}")
-        
+
         raise last_exception
     
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
@@ -135,6 +148,10 @@ class ZepEntityReader:
             节点列表
         """
         logger.info(f"获取图谱 {graph_id} 的所有节点...")
+        if self.provider == 'hivemind' or not self._zep_enabled:
+            builder = GraphBuilderService()
+            graph_data = builder.get_graph_data(graph_id)
+            return graph_data.get("nodes", [])
 
         nodes = fetch_all_nodes(self.client, graph_id)
 
@@ -162,6 +179,10 @@ class ZepEntityReader:
             边列表
         """
         logger.info(f"获取图谱 {graph_id} 的所有边...")
+        if self.provider == 'hivemind' or not self._zep_enabled:
+            builder = GraphBuilderService()
+            graph_data = builder.get_graph_data(graph_id)
+            return graph_data.get("edges", [])
 
         edges = fetch_all_edges(self.client, graph_id)
 
@@ -190,6 +211,11 @@ class ZepEntityReader:
             边列表
         """
         try:
+            if self.provider == 'hivemind' or not self._zep_enabled:
+                # Non-Zep mode: no per-node edge API available.
+                # Callers should use filter_defined_entities with full edge enrichment.
+                return []
+
             # 使用重试机制调用Zep API
             edges = self._call_with_retry(
                 func=lambda: self.client.graph.node.get_entity_edges(node_uuid=node_uuid),
@@ -346,6 +372,10 @@ class ZepEntityReader:
             EntityNode或None
         """
         try:
+            if not self._zep_enabled:
+                logger.debug(f"Zep disabled, skipping get_entity_with_context for {entity_uuid[:8]}")
+                return None
+
             # 使用重试机制获取节点
             node = self._call_with_retry(
                 func=lambda: self.client.graph.node.get(uuid_=entity_uuid),
@@ -433,5 +463,3 @@ class ZepEntityReader:
             enrich_with_edges=enrich_with_edges
         )
         return result.entities
-
-

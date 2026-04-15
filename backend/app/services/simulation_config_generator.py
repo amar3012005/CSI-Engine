@@ -20,6 +20,7 @@ from openai import OpenAI
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.token_usage_tracker import TokenUsageTracker
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.simulation_config')
@@ -78,16 +79,28 @@ class AgentActivityConfig:
     # 影响力权重（决定其发言被其他Agent看到的概率）
     influence_weight: float = 1.0
 
+    # 统一的Agent种子字段，供Profile生成与CSI执行共用
+    role: str = ""
+    skills: List[str] = field(default_factory=list)
+    qualification_score: float = 0.0
+    source_origin: str = "graph_entity"
+    source_priority: float = 0.0
+    entity_summary: str = ""
+    research_focus: List[str] = field(default_factory=list)
+
 
 @dataclass  
 class TimeSimulationConfig:
     """时间模拟配置（基于中国人作息习惯）"""
     # 模拟总时长（模拟小时数）
     total_simulation_hours: int = 72  # 默认模拟72小时（3天）
-    
+
     # 每轮代表的时间（模拟分钟）- 默认60分钟（1小时），加快时间流速
     minutes_per_round: int = 60
-    
+
+    # 模拟开始的小时（24小时制，0-23），默认9点（工作开始时间）
+    start_hour: int = 9
+
     # 每小时激活的Agent数量范围
     agents_per_hour_min: int = 5
     agents_per_hour_max: int = 20
@@ -143,6 +156,34 @@ class PlatformConfig:
 
 
 @dataclass
+class ResearchAgentAssignment:
+    """DeepResearch/CSI mode agent assignment."""
+    agent_id: int
+    entity_uuid: str
+    entity_name: str
+    entity_type: str
+    research_role: str
+    responsibility: str
+    evidence_priority: str
+    challenge_targets: List[str] = field(default_factory=list)
+    output_types: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ResearchWorkflowConfig:
+    """Research workflow configuration for DeepResearch/CSI mode."""
+    workflow_type: str = "deepresearch_csi"
+    mode_label: str = "DeepResearch / CSI"
+    research_rounds: List[Dict[str, Any]] = field(default_factory=list)
+    agent_assignments: List[ResearchAgentAssignment] = field(default_factory=list)
+    claim_policy: Dict[str, Any] = field(default_factory=dict)
+    debate_policy: Dict[str, Any] = field(default_factory=dict)
+    verdict_policy: Dict[str, Any] = field(default_factory=dict)
+    provenance_policy: Dict[str, Any] = field(default_factory=dict)
+    gate_policy: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class SimulationParameters:
     """完整的模拟参数配置"""
     # 基础信息
@@ -150,6 +191,8 @@ class SimulationParameters:
     project_id: str
     graph_id: str
     simulation_requirement: str
+    config_mode: str = "social"
+    mode_label: str = "Dual-Platform Social Simulation"
     
     # 时间配置
     time_config: TimeSimulationConfig = field(default_factory=TimeSimulationConfig)
@@ -163,6 +206,9 @@ class SimulationParameters:
     # 平台配置
     twitter_config: Optional[PlatformConfig] = None
     reddit_config: Optional[PlatformConfig] = None
+    
+    # DeepResearch / CSI workflow config
+    research_workflow_config: Optional[ResearchWorkflowConfig] = None
     
     # LLM配置
     llm_model: str = ""
@@ -180,11 +226,17 @@ class SimulationParameters:
             "project_id": self.project_id,
             "graph_id": self.graph_id,
             "simulation_requirement": self.simulation_requirement,
+            "config_mode": self.config_mode,
+            "mode_label": self.mode_label,
             "time_config": time_dict,
             "agent_configs": [asdict(a) for a in self.agent_configs],
             "event_config": asdict(self.event_config),
             "twitter_config": asdict(self.twitter_config) if self.twitter_config else None,
             "reddit_config": asdict(self.reddit_config) if self.reddit_config else None,
+            "research_workflow_config": (
+                asdict(self.research_workflow_config)
+                if self.research_workflow_config else None
+            ),
             "llm_model": self.llm_model,
             "llm_base_url": self.llm_base_url,
             "generated_at": self.generated_at,
@@ -225,11 +277,13 @@ class SimulationConfigGenerator:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        usage_scope: Optional[str] = None,
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
+        self.usage_scope = usage_scope
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
@@ -238,6 +292,26 @@ class SimulationConfigGenerator:
             api_key=self.api_key,
             base_url=self.base_url
         )
+
+    def _is_gpt_oss_model(self) -> bool:
+        """Whether current model is Groq-hosted gpt-oss."""
+        return "gpt-oss" in (self.model_name or "").lower()
+
+    def _build_chat_completion_kwargs(self, system_prompt: str, prompt: str, temperature: float) -> Dict[str, Any]:
+        """Build model-safe completion args (gpt-oss doesn't support strict response_format)."""
+        kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+        }
+        if self._is_gpt_oss_model():
+            kwargs["extra_body"] = {"include_reasoning": False}
+        else:
+            kwargs["response_format"] = {"type": "json_object"}
+        return kwargs
     
     def generate_config(
         self,
@@ -247,6 +321,7 @@ class SimulationConfigGenerator:
         simulation_requirement: str,
         document_text: str,
         entities: List[EntityNode],
+        config_mode: str = "social",
         enable_twitter: bool = True,
         enable_reddit: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -298,9 +373,15 @@ class SimulationConfigGenerator:
         time_config = self._parse_time_config(time_config_result, num_entities)
         reasoning_parts.append(f"时间配置: {time_config_result.get('reasoning', '成功')}")
         
-        # ========== 步骤2: 生成事件配置 ==========
-        report_progress(2, "生成事件配置和热点话题...")
-        event_config_result = self._generate_event_config(context, simulation_requirement, entities)
+        event_stage_message = (
+            "生成研究工作流和议题配置..."
+            if config_mode == "deepresearch" else
+            "生成事件配置和热点话题..."
+        )
+        report_progress(2, event_stage_message)
+        event_config_result = self._generate_event_config(
+            context, simulation_requirement, entities, config_mode=config_mode
+        )
         event_config = self._parse_event_config(event_config_result)
         reasoning_parts.append(f"事件配置: {event_config_result.get('reasoning', '成功')}")
         
@@ -327,15 +408,20 @@ class SimulationConfigGenerator:
         reasoning_parts.append(f"Agent配置: 成功生成 {len(all_agent_configs)} 个")
         
         # ========== 为初始帖子分配发布者 Agent ==========
-        logger.info("为初始帖子分配合适的发布者 Agent...")
-        event_config = self._assign_initial_post_agents(event_config, all_agent_configs)
-        assigned_count = len([p for p in event_config.initial_posts if p.get("poster_agent_id") is not None])
-        reasoning_parts.append(f"初始帖子分配: {assigned_count} 个帖子已分配发布者")
+        if config_mode == "social":
+            logger.info("为初始帖子分配合适的发布者 Agent...")
+            event_config = self._assign_initial_post_agents(event_config, all_agent_configs)
+            assigned_count = len([p for p in event_config.initial_posts if p.get("poster_agent_id") is not None])
+            reasoning_parts.append(f"初始帖子分配: {assigned_count} 个帖子已分配发布者")
         
         # ========== 最后一步: 生成平台配置 ==========
-        report_progress(total_steps, "生成平台配置...")
+        report_progress(
+            total_steps,
+            "生成研究执行配置..." if config_mode == "deepresearch" else "生成平台配置..."
+        )
         twitter_config = None
         reddit_config = None
+        research_workflow_config = None
         
         if enable_twitter:
             twitter_config = PlatformConfig(
@@ -357,26 +443,132 @@ class SimulationConfigGenerator:
                 echo_chamber_strength=0.6
             )
         
+        if config_mode == "deepresearch":
+            research_workflow_config = self._build_research_workflow_config(
+                simulation_requirement=simulation_requirement,
+                entities=entities,
+                agent_configs=all_agent_configs,
+                event_config=event_config
+            )
+            reasoning_parts.append("研究工作流: 已生成Claim/Debate/Verdict/Provenance/Gate策略")
+
         # 构建最终参数
         params = SimulationParameters(
             simulation_id=simulation_id,
             project_id=project_id,
             graph_id=graph_id,
             simulation_requirement=simulation_requirement,
+            config_mode=config_mode,
+            mode_label=(
+                "DeepResearch / CSI Workflow"
+                if config_mode == "deepresearch" else
+                "Dual-Platform Social Simulation"
+            ),
             time_config=time_config,
             agent_configs=all_agent_configs,
             event_config=event_config,
             twitter_config=twitter_config,
             reddit_config=reddit_config,
+            research_workflow_config=research_workflow_config,
             llm_model=self.model_name,
             llm_base_url=self.base_url,
             generation_reasoning=" | ".join(reasoning_parts)
         )
         
         logger.info(f"模拟配置生成完成: {len(params.agent_configs)} 个Agent配置")
-        
+
         return params
-    
+
+    # ------------------------------------------------------------------
+    # Web-research config (no graph entities required)
+    # ------------------------------------------------------------------
+
+    def generate_web_research_config(
+        self,
+        simulation_id: str,
+        project_id: str,
+        query: str,
+        team_agents: List[Dict[str, Any]],
+        research_config: Dict[str, Any],
+    ) -> SimulationParameters:
+        """Generate a minimal ``SimulationParameters`` for web-only research.
+
+        Unlike ``generate_config``, this does **not** require graph entities.
+        The caller supplies pre-generated agents from ``ResearchTeamGenerator``
+        and the workflow configuration dict.
+
+        Args:
+            simulation_id: Simulation identifier.
+            project_id: Parent project identifier.
+            query: The user's research query (used as simulation_requirement).
+            team_agents: List of agent dicts from ``ResearchTeamGenerator.generate_team()``.
+            research_config: ``research_workflow_config`` dict from the team generator.
+
+        Returns:
+            Fully populated ``SimulationParameters``.
+        """
+        agent_configs: List[AgentActivityConfig] = []
+        for idx, ag in enumerate(team_agents):
+            agent_configs.append(AgentActivityConfig(
+                agent_id=ag.get("agent_id", idx),
+                entity_uuid=f"webresearch_{idx}",
+                entity_name=ag.get("entity_name", ag.get("agent_name", f"Agent-{idx}")),
+                entity_type=ag.get("entity_type", "researcher"),
+                activity_level=0.8,
+                role=ag.get("research_role", "explorer"),
+                skills=ag.get("skills", []),
+                qualification_score=ag.get("qualification_score", 0.85),
+                source_origin="web_research_team",
+                research_focus=ag.get("skills", []),
+            ))
+
+        rwf = ResearchWorkflowConfig(
+            workflow_type=research_config.get("workflow_type", "web_research_csi"),
+            mode_label="Web Research / CSI",
+            research_rounds=research_config.get("research_rounds", []),
+            claim_policy=research_config.get("claim_policy", {}),
+            debate_policy=research_config.get("debate_policy", {}),
+            verdict_policy=research_config.get("verdict_policy", {}),
+            provenance_policy=research_config.get("provenance_policy", {}),
+            gate_policy=research_config.get("gate_policy", {}),
+        )
+        for ag in team_agents:
+            rwf.agent_assignments.append(ResearchAgentAssignment(
+                agent_id=ag.get("agent_id", 0),
+                entity_uuid=f"webresearch_{ag.get('agent_id', 0)}",
+                entity_name=ag.get("entity_name", ag.get("agent_name", "")),
+                entity_type=ag.get("entity_type", "researcher"),
+                research_role=ag.get("research_role", "explorer"),
+                responsibility=ag.get("responsibility", ""),
+                evidence_priority=ag.get("evidence_priority", "source_diversity"),
+                challenge_targets=ag.get("challenge_targets", []),
+                output_types=ag.get("world_actions", []) + ag.get("peer_actions", []),
+            ))
+
+        params = SimulationParameters(
+            simulation_id=simulation_id,
+            project_id=project_id,
+            graph_id="",
+            simulation_requirement=query,
+            config_mode="web_research",
+            mode_label="Web Research (query-only)",
+            time_config=TimeSimulationConfig(
+                total_simulation_hours=1,
+                minutes_per_round=60,
+            ),
+            agent_configs=agent_configs,
+            event_config=EventConfig(hot_topics=[query]),
+            research_workflow_config=rwf,
+            llm_model=self.model_name,
+            llm_base_url=self.base_url,
+            generation_reasoning="Web-research mode: team generated from query, no graph dependency",
+        )
+        logger.info(
+            "Web-research config generated: %d agents for simulation %s",
+            len(agent_configs), simulation_id,
+        )
+        return params
+
     def _build_context(
         self,
         simulation_requirement: str,
@@ -440,15 +632,24 @@ class SimulationConfigGenerator:
         for attempt in range(max_attempts):
             try:
                 response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
+                    **self._build_chat_completion_kwargs(
+                        system_prompt=system_prompt,
+                        prompt=prompt,
+                        temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
+                    )
                     # 不设置max_tokens，让LLM自由发挥
                 )
+
+                usage = getattr(response, "usage", None)
+                if self.usage_scope and usage:
+                    TokenUsageTracker.record_usage(
+                        scope_id=self.usage_scope,
+                        prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                        completion_tokens=getattr(usage, "completion_tokens", 0),
+                        total_tokens=getattr(usage, "total_tokens", 0),
+                        model=self.model_name,
+                        source="simulation_config_generator",
+                    )
                 
                 content = response.choices[0].message.content
                 finish_reason = response.choices[0].finish_reason
@@ -564,6 +765,7 @@ class SimulationConfigGenerator:
 {{
     "total_simulation_hours": 72,
     "minutes_per_round": 60,
+    "start_hour": 9,
     "agents_per_hour_min": 5,
     "agents_per_hour_max": 50,
     "peak_hours": [19, 20, 21, 22],
@@ -576,6 +778,7 @@ class SimulationConfigGenerator:
 字段说明：
 - total_simulation_hours (int): 模拟总时长，24-168小时，突发事件短、持续话题长
 - minutes_per_round (int): 每轮时长，30-120分钟，建议60分钟
+- start_hour (int): 模拟开始的时刻（0-23），默认9（上午9点工作开始），确保模拟从活跃时段开始
 - agents_per_hour_min (int): 每小时最少激活Agent数（取值范围: 1-{max_agents_allowed}）
 - agents_per_hour_max (int): 每小时最多激活Agent数（取值范围: 1-{max_agents_allowed}）
 - peak_hours (int数组): 高峰时段，根据事件参与群体调整
@@ -597,13 +800,14 @@ class SimulationConfigGenerator:
         return {
             "total_simulation_hours": 72,
             "minutes_per_round": 60,  # 每轮1小时，加快时间流速
+            "start_hour": 9,  # 从上午9点开始，确保首轮即有活跃Agent
             "agents_per_hour_min": max(1, num_entities // 15),
             "agents_per_hour_max": max(5, num_entities // 5),
             "peak_hours": [19, 20, 21, 22],
             "off_peak_hours": [0, 1, 2, 3, 4, 5],
             "morning_hours": [6, 7, 8],
             "work_hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-            "reasoning": "使用默认中国人作息配置（每轮1小时）"
+            "reasoning": "使用默认中国人作息配置（每轮1小时，从9点开始）"
         }
     
     def _parse_time_config(self, result: Dict[str, Any], num_entities: int) -> TimeSimulationConfig:
@@ -629,6 +833,7 @@ class SimulationConfigGenerator:
         return TimeSimulationConfig(
             total_simulation_hours=result.get("total_simulation_hours", 72),
             minutes_per_round=result.get("minutes_per_round", 60),  # 默认每轮1小时
+            start_hour=result.get("start_hour", 9),  # 默认从9点开始
             agents_per_hour_min=agents_per_hour_min,
             agents_per_hour_max=agents_per_hour_max,
             peak_hours=result.get("peak_hours", [19, 20, 21, 22]),
@@ -642,12 +847,20 @@ class SimulationConfigGenerator:
         )
     
     def _generate_event_config(
-        self, 
-        context: str, 
+        self,
+        context: str,
         simulation_requirement: str,
-        entities: List[EntityNode]
+        entities: List[EntityNode],
+        config_mode: str = "social"
     ) -> Dict[str, Any]:
         """生成事件配置"""
+        if config_mode == "deepresearch":
+            return {
+                "hot_topics": self._extract_research_topics(simulation_requirement, entities),
+                "narrative_direction": "research_workflow",
+                "initial_posts": [],
+                "reasoning": "DeepResearch模式跳过社交平台初始帖子，改为研究议题和工作流配置"
+            }
         
         # 获取可用的实体类型列表，供 LLM 参考
         entity_types_available = list(set(
@@ -720,6 +933,179 @@ class SimulationConfigGenerator:
             scheduled_events=[],
             hot_topics=result.get("hot_topics", []),
             narrative_direction=result.get("narrative_direction", "")
+        )
+
+    def _extract_research_topics(self, simulation_requirement: str, entities: List[EntityNode]) -> List[str]:
+        """Extract a compact topic list for DeepResearch mode."""
+        topic_terms: List[str] = []
+        req_tokens = [t.strip(" ,.;:()[]{}").lower() for t in simulation_requirement.split()]
+        for token in req_tokens:
+            if len(token) >= 4 and token.isascii() and token not in topic_terms:
+                topic_terms.append(token)
+            if len(topic_terms) >= 8:
+                break
+
+        for entity in entities[:20]:
+            etype = entity.get_entity_type() or ""
+            if etype and etype.lower() not in {"node", "person"} and etype not in topic_terms:
+                topic_terms.append(etype)
+            if len(topic_terms) >= 12:
+                break
+        return topic_terms[:12]
+
+    def _build_research_workflow_config(
+        self,
+        simulation_requirement: str,
+        entities: List[EntityNode],
+        agent_configs: List[AgentActivityConfig],
+        event_config: EventConfig,
+    ) -> ResearchWorkflowConfig:
+        """Build a CSI-oriented workflow config while keeping agent/time config compatible."""
+        query_text = (simulation_requirement or "").lower()
+
+        # Define 8 core CSI roles
+        CSI_ROLES = [
+            "explorer",
+            "domain_expert", 
+            "fact_checker",
+            "challenger",
+            "synthesizer",
+            "communicator",
+            "methodologist",
+            "second_domain_expert"
+        ]
+
+        def classify_role(entity_type_str: str, index: int) -> Dict[str, Any]:
+            # Assign one of the 8 roles based on index to ensure full coverage
+            assigned_role = CSI_ROLES[index % len(CSI_ROLES)]
+            
+            role_definitions = {
+                "explorer": {
+                    "responsibility": f"Discovers high-quality primary and secondary sources. Entity: {entity_type_str}",
+                    "evidence_priority": "source_diversity",
+                    "output_types": ["SEARCH_WEB", "READ_URL", "PROPOSE_CLAIM"],
+                    "challenge_targets": ["fact_checker"]
+                },
+                "domain_expert": {
+                    "responsibility": f"Validates technical claims and core mechanisms. Entity: {entity_type_str}",
+                    "evidence_priority": "technical_correctness",
+                    "output_types": ["READ_URL", "PROPOSE_CLAIM", "EVALUATE_CLAIM"],
+                    "challenge_targets": ["challenger"]
+                },
+                "fact_checker": {
+                    "responsibility": f"Verifies claims against independent data. Entity: {entity_type_str}",
+                    "evidence_priority": "peer_reviewed",
+                    "output_types": ["SEARCH_WEB", "VERIFY_CLAIM", "CHALLENGE_CLAIM"],
+                    "challenge_targets": ["explorer", "domain_expert"]
+                },
+                "challenger": {
+                    "responsibility": f"Seeks counter-evidence and identifies framing bias. Entity: {entity_type_str}",
+                    "evidence_priority": "counter_evidence",
+                    "output_types": ["SEARCH_WEB", "CHALLENGE_CLAIM", "COUNTER_ARGUE"],
+                    "challenge_targets": ["domain_expert", "synthesizer"]
+                },
+                "synthesizer": {
+                    "responsibility": f"Unifies findings and resolves contradictions. Entity: {entity_type_str}",
+                    "evidence_priority": "coherence",
+                    "output_types": ["SYNTHESIZE", "RESOLVE_CONTRADICTION", "PROPOSE_CONCLUSION"],
+                    "challenge_targets": ["communicator"]
+                },
+                "communicator": {
+                    "responsibility": f"Drafts final report for specific stakeholders. Entity: {entity_type_str}",
+                    "evidence_priority": "clarity",
+                    "output_types": ["SUMMARIZE", "TRANSLATE_FINDING", "DRAFT_REPORT"],
+                    "challenge_targets": []
+                },
+                "methodologist": {
+                    "responsibility": f"Evaluates inquiry frameworks and data rigor. Entity: {entity_type_str}",
+                    "evidence_priority": "methodological_rigor",
+                    "output_types": ["READ_URL", "EVALUATE_METHOD", "CHALLENGE_CLAIM"],
+                    "challenge_targets": ["domain_expert", "explorer"]
+                },
+                "second_domain_expert": {
+                    "responsibility": f"Provides alternative domain perspective. Entity: {entity_type_str}",
+                    "evidence_priority": "technical_correctness",
+                    "output_types": ["READ_URL", "PROPOSE_CLAIM", "EVALUATE_CLAIM", "COUNTER_ARGUE"],
+                    "challenge_targets": ["domain_expert", "challenger"]
+                }
+            }
+            
+            return role_definitions[assigned_role]
+
+        assignments: List[ResearchAgentAssignment] = []
+        for i, agent in enumerate(agent_configs):
+            role_info = classify_role(agent.entity_type, i)
+            
+            # Synchronize AgentActivityConfig with CSI role
+            agent.role = role_info["research_role"] if "research_role" in role_info else CSI_ROLES[i % len(CSI_ROLES)]
+            agent.research_focus = [agent.entity_type, agent.role]
+            
+            assignments.append(
+                ResearchAgentAssignment(
+                    agent_id=agent.agent_id,
+                    entity_uuid=agent.entity_uuid,
+                    entity_name=agent.entity_name,
+                    entity_type=agent.entity_type,
+                    research_role=agent.role,
+                    responsibility=role_info["responsibility"],
+                    evidence_priority=role_info["evidence_priority"],
+                    challenge_targets=role_info["challenge_targets"],
+                    output_types=role_info["output_types"],
+                )
+            )
+
+        rounds = [
+            {
+                "round_id": "collect",
+                "label": "Source Discovery & Claim Extraction",
+                "description": "Agents perform SEARCH_WEB to build initial evidence base and extract core claims.",
+                "expected_outputs": ["SEARCH_WEB", "READ_URL", "PROPOSE_CLAIM"],
+            },
+            {
+                "round_id": "debate",
+                "label": "Adversarial Peer Review",
+                "description": "Agents challenge weak claims, provide counter-evidence, and verify data.",
+                "expected_outputs": ["VERIFY_CLAIM", "CHALLENGE_CLAIM", "COUNTER_ARGUE"],
+            },
+            {
+                "round_id": "verdict",
+                "label": "Synthesis & Convergence",
+                "description": "Agents resolve contradictions and synthesize high-level conclusions.",
+                "expected_outputs": ["SYNTHESIZE", "RESOLVE_CONTRADICTION", "PROPOSE_CONCLUSION"],
+            },
+            {
+                "round_id": "report",
+                "label": "Final Reporting",
+                "description": "Communicators draft the final research output with full provenance.",
+                "expected_outputs": ["SUMMARIZE", "DRAFT_REPORT"],
+            },
+        ]
+
+        return ResearchWorkflowConfig(
+            research_rounds=rounds,
+            agent_assignments=assignments,
+            claim_policy={
+                "mandatory_citation": True,
+                "verification_requirement": "two_peer_reviews",
+                "topic_focus": self._extract_research_topics(simulation_requirement, entities),
+            },
+            debate_policy={
+                "targeted_critique": True,
+                "max_consecutive_challenges": 3,
+                "require_opposing_viewpoint": True,
+            },
+            verdict_policy={
+                "consensus_threshold": 0.8,
+                "confidence_scoring_mandatory": True,
+            },
+            provenance_policy={
+                "track_source_graph": True,
+                "minimum_sources_per_claim": 2,
+            },
+            gate_policy={
+                "block_final_synthesis_if_low_coverage": True,
+                "minimum_claim_verification_rate": 0.85,
+            },
         )
     
     def _assign_initial_post_agents(
@@ -877,6 +1263,7 @@ class SimulationConfigGenerator:
         for i, entity in enumerate(entities):
             agent_id = start_idx + i
             cfg = llm_configs.get(agent_id, {})
+            seed = self._build_agent_seed(entity)
             
             # 如果LLM没有生成，使用规则生成
             if not cfg:
@@ -895,11 +1282,84 @@ class SimulationConfigGenerator:
                 response_delay_max=cfg.get("response_delay_max", 60),
                 sentiment_bias=cfg.get("sentiment_bias", 0.0),
                 stance=cfg.get("stance", "neutral"),
-                influence_weight=cfg.get("influence_weight", 1.0)
+                influence_weight=cfg.get("influence_weight", 1.0),
+                role=seed["role"],
+                skills=seed["skills"],
+                qualification_score=seed["qualification_score"],
+                source_origin=seed["source_origin"],
+                source_priority=seed["source_priority"],
+                entity_summary=seed["entity_summary"],
+                research_focus=seed["research_focus"],
             )
             configs.append(config)
-        
+
         return configs
+
+    def _build_agent_seed(self, entity: EntityNode) -> Dict[str, Any]:
+        """Build a stable agent seed so config generation and profile generation use the same roster."""
+        entity_type = (entity.get_entity_type() or "Unknown").strip()
+        entity_type_lower = entity_type.lower()
+        summary = (entity.summary or "").strip()
+
+        role_map = {
+            "physicist": "Physics Research Lead",
+            "physicsprofessor": "Physics Professor",
+            "researcher": "Research Analyst",
+            "scienceeducator": "Science Educator",
+            "physicsstudent": "Graduate Physics Student",
+            "journalist": "Science Reporter",
+            "physicsjournal": "Journal Editor",
+            "physics journal": "Journal Editor",
+            "sciencemagazine": "Science Magazine Editor",
+            "science magazine": "Science Magazine Editor",
+            "organization": "Institutional Research Liaison",
+            "person": "Domain Participant",
+        }
+        skills_map = {
+            "physicist": ["electrodynamics", "field theory", "mathematical modeling", "mechanism validation"],
+            "physicsprofessor": ["theory synthesis", "teaching", "peer review", "scientific writing"],
+            "researcher": ["literature review", "source comparison", "evidence synthesis", "methodology"],
+            "scienceeducator": ["science communication", "concept explanation", "curriculum framing"],
+            "physicsstudent": ["derivation tracing", "problem solving", "note synthesis"],
+            "journalist": ["source verification", "interview framing", "narrative scrutiny"],
+            "physicsjournal": ["peer review", "publication standards", "citation quality"],
+            "physics journal": ["peer review", "publication standards", "citation quality"],
+            "sciencemagazine": ["science communication", "editorial judgment", "public explanation"],
+            "science magazine": ["science communication", "editorial judgment", "public explanation"],
+            "organization": ["institutional memory", "program context", "stakeholder communication"],
+            "person": ["discussion", "observation", "topic analysis"],
+        }
+        qualification_map = {
+            "physicist": 0.98,
+            "physicsprofessor": 0.96,
+            "researcher": 0.94,
+            "scienceeducator": 0.91,
+            "physicsstudent": 0.85,
+            "journalist": 0.84,
+            "physicsjournal": 0.9,
+            "physics journal": 0.9,
+            "sciencemagazine": 0.86,
+            "science magazine": 0.86,
+            "organization": 0.8,
+            "person": 0.72,
+        }
+
+        focus_tokens = [entity_type, entity.name]
+        if summary:
+            focus_tokens.extend(part.strip() for part in summary.split(",")[:4] if part.strip())
+
+        return {
+            "role": role_map.get(entity_type_lower, entity_type or "Research Specialist"),
+            "skills": skills_map.get(
+                entity_type_lower,
+                ["evidence review", "topic analysis", "structured discussion"],
+            ),
+            "qualification_score": qualification_map.get(entity_type_lower, 0.74),
+            "source_origin": "ontology_entity",
+            "source_priority": qualification_map.get(entity_type_lower, 0.74),
+            "entity_summary": summary[: self.AGENT_SUMMARY_LENGTH] if summary else "",
+            "research_focus": focus_tokens[:6],
+        }
     
     def _generate_agent_config_by_rule(self, entity: EntityNode) -> Dict[str, Any]:
         """基于规则生成单个Agent配置（中国人作息）"""
@@ -984,4 +1444,3 @@ class SimulationConfigGenerator:
                 "influence_weight": 1.0
             }
     
-

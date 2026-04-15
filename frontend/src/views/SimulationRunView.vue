@@ -1,39 +1,5 @@
 <template>
   <div class="main-view">
-    <!-- Header -->
-    <header class="app-header">
-      <div class="header-left">
-        <div class="brand" @click="router.push('/')">MIROFISH</div>
-      </div>
-      
-      <div class="header-center">
-        <div class="view-switcher">
-          <button 
-            v-for="mode in ['graph', 'split', 'workbench']" 
-            :key="mode"
-            class="switch-btn"
-            :class="{ active: viewMode === mode }"
-            @click="viewMode = mode"
-          >
-            {{ { graph: '图谱', split: '双栏', workbench: '工作台' }[mode] }}
-          </button>
-        </div>
-      </div>
-
-      <div class="header-right">
-        <div class="workflow-step">
-          <span class="step-num">Step 3/5</span>
-          <span class="step-name">开始模拟</span>
-        </div>
-        <div class="step-divider"></div>
-        <span class="status-indicator" :class="statusClass">
-          <span class="dot"></span>
-          {{ statusText }}
-        </span>
-      </div>
-    </header>
-
-    <!-- Main Content Area -->
     <main class="content-area">
       <!-- Left Panel: Graph -->
       <div class="panel-wrapper left" :style="leftPanelStyle">
@@ -42,13 +8,23 @@
           :loading="graphLoading"
           :currentPhase="3"
           :isSimulating="isSimulating"
+          :simulationId="currentSimulationId"
+          :csiAutoRefresh="csiShouldAutoRefresh"
           @refresh="refreshGraph"
           @toggle-maximize="toggleMaximize('graph')"
         />
       </div>
 
-      <!-- Right Panel: Step3 开始模拟 -->
-      <div class="panel-wrapper right" :style="rightPanelStyle">
+      <!-- Vertical Resizer Handle -->
+        <div 
+          v-show="viewMode === 'split'"
+          class="layout-resizer" 
+          :style="{ right: rightPanelWidth + '%' }"
+          @mousedown="startDrag"
+        ></div>
+
+        <!-- Right Panel: Step3 Start Simulation -->
+        <div class="panel-wrapper right" :class="{ dragging: isDragging }" :style="rightPanelStyle">
         <Step3Simulation
           :simulationId="currentSimulationId"
           :maxRounds="maxRounds"
@@ -87,26 +63,60 @@ const viewMode = ref('split')
 
 // Data State
 const currentSimulationId = ref(route.params.simulationId)
-// 直接在初始化时从 query 参数获取 maxRounds，确保子组件能立即获取到值
+// Get maxRounds from query params at init time so child components have it immediately
 const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
-const minutesPerRound = ref(30) // 默认每轮30分钟
+const minutesPerRound = ref(30) // default 30 minutes per round
+const configMode = ref(route.query.configMode || 'web_research')
 const projectData = ref(null)
 const graphData = ref(null)
 const graphLoading = ref(false)
 const systemLogs = ref([])
 const currentStatus = ref('processing') // processing | completed | error
 
+
+// Panel Resizer Logic
+const PANEL_WIDTH_KEY = 'mirofish_right_panel_width'
+const savedWidth = localStorage.getItem(PANEL_WIDTH_KEY)
+const rightPanelWidth = ref(savedWidth ? Number(savedWidth) : 42) // Percentage
+const isDragging = ref(false)
+
+const startDrag = (e) => {
+  isDragging.value = true
+  document.addEventListener('mousemove', onDrag)
+  document.addEventListener('mouseup', stopDrag)
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
+
+const onDrag = (e) => {
+  if (!isDragging.value) return
+  const containerWidth = window.innerWidth
+  let newWidthPct = 100 - (e.clientX / containerWidth) * 100
+  // Constrain between 20% and 80%
+  if (newWidthPct < 20) newWidthPct = 20
+  if (newWidthPct > 80) newWidthPct = 80
+  rightPanelWidth.value = newWidthPct
+  localStorage.setItem(PANEL_WIDTH_KEY, rightPanelWidth.value)
+}
+
+const stopDrag = () => {
+  isDragging.value = false
+  document.removeEventListener('mousemove', onDrag)
+  document.removeEventListener('mouseup', stopDrag)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+}
+
 // --- Computed Layout Styles ---
 const leftPanelStyle = computed(() => {
-  if (viewMode.value === 'graph') return { width: '100%', opacity: 1, transform: 'translateX(0)' }
-  if (viewMode.value === 'workbench') return { width: '0%', opacity: 0, transform: 'translateX(-20px)' }
-  return { width: '50%', opacity: 1, transform: 'translateX(0)' }
+  // Graph stays in the background always: 100% width
+  return { width: '100%', opacity: 1, zIndex: 1 }
 })
 
 const rightPanelStyle = computed(() => {
   if (viewMode.value === 'workbench') return { width: '100%', opacity: 1, transform: 'translateX(0)' }
-  if (viewMode.value === 'graph') return { width: '0%', opacity: 0, transform: 'translateX(20px)' }
-  return { width: '50%', opacity: 1, transform: 'translateX(0)' }
+  if (viewMode.value === 'graph') return { width: '0%', opacity: 0, transform: 'translateX(100%)' }
+  return { width: rightPanelWidth.value + '%', opacity: 1, transform: 'translateX(0)' }
 })
 
 // --- Status Computed ---
@@ -121,6 +131,9 @@ const statusText = computed(() => {
 })
 
 const isSimulating = computed(() => currentStatus.value === 'processing')
+const isDeepResearchMode = computed(() => configMode.value === 'deepresearch' || configMode.value === 'web_research')
+// CSI artifacts should auto-refresh during any simulation, not just deepresearch
+const csiShouldAutoRefresh = computed(() => isSimulating.value)
 
 // --- Helpers ---
 const addLog = (msg) => {
@@ -145,104 +158,113 @@ const toggleMaximize = (target) => {
 }
 
 const handleGoBack = async () => {
-  // 在返回 Step 2 之前，先关闭正在运行的模拟
-  addLog('准备返回 Step 2，正在关闭模拟...')
+  // Close the running simulation before going back to Step 2
+  addLog('Preparing to go back to Step 2, closing simulation...')
+
+  if (currentStatus.value === 'completed') {
+    addLog('Simulation already completed; preserving persisted state and returning without restart')
+    router.push({ name: 'Simulation', params: { simulationId: currentSimulationId.value } })
+    return
+  }
   
-  // 停止轮询
+  // Stop polling
   stopGraphRefresh()
   
   try {
-    // 先尝试优雅关闭模拟环境
+    // Try graceful shutdown of simulation environment first
     const envStatusRes = await getEnvStatus({ simulation_id: currentSimulationId.value })
     
     if (envStatusRes.success && envStatusRes.data?.env_alive) {
-      addLog('正在关闭模拟环境...')
+      addLog('Closing simulation environment...')
       try {
         await closeSimulationEnv({ 
           simulation_id: currentSimulationId.value,
           timeout: 10
         })
-        addLog('✓ 模拟环境已关闭')
+        addLog('✓ Simulation environment closed')
       } catch (closeErr) {
-        addLog(`关闭模拟环境失败，尝试强制停止...`)
+        addLog(`Failed to close simulation environment, attempting force stop...`)
         try {
           await stopSimulation({ simulation_id: currentSimulationId.value })
-          addLog('✓ 模拟已强制停止')
+          addLog('✓ Simulation force stopped')
         } catch (stopErr) {
-          addLog(`强制停止失败: ${stopErr.message}`)
+          addLog(`Force stop failed: ${stopErr.message}`)
         }
       }
     } else {
-      // 环境未运行，检查是否需要停止进程
+      // Environment not running, check if we need to stop the process
       if (isSimulating.value) {
-        addLog('正在停止模拟进程...')
+        addLog('Stopping simulation process...')
         try {
           await stopSimulation({ simulation_id: currentSimulationId.value })
-          addLog('✓ 模拟已停止')
+          addLog('✓ Simulation stopped')
         } catch (err) {
-          addLog(`停止模拟失败: ${err.message}`)
+          addLog(`Failed to stop simulation: ${err.message}`)
         }
       }
     }
   } catch (err) {
-    addLog(`检查模拟状态失败: ${err.message}`)
+    addLog(`Failed to check simulation status: ${err.message}`)
   }
   
-  // 返回到 Step 2 (环境搭建)
+  // Go back to Step 2 (Environment Setup)
   router.push({ name: 'Simulation', params: { simulationId: currentSimulationId.value } })
 }
 
 const handleNextStep = () => {
-  // Step3Simulation 组件会直接处理报告生成和路由跳转
-  // 这个方法仅作为备用
-  addLog('进入 Step 4: 报告生成')
+  // Step3Simulation component handles report generation and routing directly
+  // This method is a fallback
+  addLog('Entering Step 4: Report Generation')
 }
 
 // --- Data Logic ---
 const loadSimulationData = async () => {
   try {
-    addLog(`加载模拟数据: ${currentSimulationId.value}`)
+    addLog(`Loading simulation data: ${currentSimulationId.value}`)
     
-    // 获取 simulation 信息
+    // Get simulation info
     const simRes = await getSimulation(currentSimulationId.value)
     if (simRes.success && simRes.data) {
       const simData = simRes.data
       
-      // 获取 simulation config 以获取 minutes_per_round
+      // Get simulation config to obtain minutes_per_round
       try {
         const configRes = await getSimulationConfig(currentSimulationId.value)
+        if (configRes.success && configRes.data) {
+          configMode.value = configRes.data.config_mode || configMode.value
+        }
         if (configRes.success && configRes.data?.time_config?.minutes_per_round) {
           minutesPerRound.value = configRes.data.time_config.minutes_per_round
-          addLog(`时间配置: 每轮 ${minutesPerRound.value} 分钟`)
+          addLog(`Time config: ${minutesPerRound.value} minutes per round`)
         }
       } catch (configErr) {
-        addLog(`获取时间配置失败，使用默认值: ${minutesPerRound.value}分钟/轮`)
+        addLog(`Failed to get time config, using defaults: ${minutesPerRound.value} min/round`)
       }
       
-      // 获取 project 信息
+      // Get project info
       if (simData.project_id) {
         const projRes = await getProject(simData.project_id)
         if (projRes.success && projRes.data) {
           projectData.value = projRes.data
-          addLog(`项目加载成功: ${projRes.data.project_id}`)
+          addLog(`Project loaded successfully: ${projRes.data.project_id}`)
           
-          // 获取 graph 数据
+          // Get graph data
           if (projRes.data.graph_id) {
             await loadGraph(projRes.data.graph_id)
           }
         }
       }
     } else {
-      addLog(`加载模拟数据失败: ${simRes.error || '未知错误'}`)
+      addLog(`Failed to load simulation data: ${simRes.error || 'Unknown error'}`)
     }
   } catch (err) {
-    addLog(`加载异常: ${err.message}`)
+    addLog(`Load exception: ${err.message}`)
   }
 }
 
 const loadGraph = async (graphId) => {
-  // 当正在模拟时，自动刷新不显示全屏 loading，以免闪烁
-  // 手动刷新或初始加载时显示 loading
+  // During simulation, auto-refresh skips full-screen loading to avoid flicker
+  // Manual refresh or initial load shows loading
   if (!isSimulating.value) {
     graphLoading.value = true
   }
@@ -252,11 +274,11 @@ const loadGraph = async (graphId) => {
     if (res.success) {
       graphData.value = res.data
       if (!isSimulating.value) {
-        addLog('图谱数据加载成功')
+        addLog('Graph data loaded successfully')
       }
     }
   } catch (err) {
-    addLog(`图谱加载失败: ${err.message}`)
+    addLog(`Graph load failed: ${err.message}`)
   } finally {
     graphLoading.value = false
   }
@@ -273,8 +295,8 @@ let graphRefreshTimer = null
 
 const startGraphRefresh = () => {
   if (graphRefreshTimer) return
-  addLog('开启图谱实时刷新 (30s)')
-  // 立即刷新一次，然后每30秒刷新
+  addLog('Starting graph auto-refresh (30s)')
+  // Refresh immediately, then every 30 seconds
   graphRefreshTimer = setInterval(refreshGraph, 30000)
 }
 
@@ -282,7 +304,7 @@ const stopGraphRefresh = () => {
   if (graphRefreshTimer) {
     clearInterval(graphRefreshTimer)
     graphRefreshTimer = null
-    addLog('停止图谱实时刷新')
+    addLog('Stopping graph auto-refresh')
   }
 }
 
@@ -295,11 +317,11 @@ watch(isSimulating, (newValue) => {
 }, { immediate: true })
 
 onMounted(() => {
-  addLog('SimulationRunView 初始化')
-  
-  // 记录 maxRounds 配置（值已在初始化时从 query 参数获取）
+  addLog('SimulationRunView initialized')
+
+  // Log maxRounds config (value already obtained from query params at init)
   if (maxRounds.value) {
-    addLog(`自定义模拟轮数: ${maxRounds.value}`)
+    addLog(`Custom simulation rounds: ${maxRounds.value}`)
   }
   
   loadSimulationData()
@@ -315,34 +337,46 @@ onUnmounted(() => {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: #FFF;
+  background: #ebe5df;
   overflow: hidden;
   font-family: 'Space Grotesk', 'Noto Sans SC', system-ui, sans-serif;
 }
 
-/* Header */
-.app-header {
-  height: 60px;
-  border-bottom: 1px solid #EAEAEA;
+/* Overlay header */
+.run-overlay-bar {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  right: 16px;
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 24px;
-  background: #FFF;
-  z-index: 100;
-  position: relative;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+  z-index: 90;
 }
 
-.header-center {
+.run-overlay-center {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
 }
 
+.run-overlay-right,
+.run-overlay-left {
+  display: flex;
+  align-items: center;
+}
+
 .brand {
   font-family: 'JetBrains Mono', monospace;
   font-weight: 800;
-  font-size: 18px;
+  font-size: 16px;
   letter-spacing: 1px;
   cursor: pointer;
 }
@@ -428,9 +462,9 @@ onUnmounted(() => {
 /* Content */
 .content-area {
   flex: 1;
-  display: flex;
   position: relative;
   overflow: hidden;
+  padding-top: 68px;
 }
 
 .panel-wrapper {
@@ -440,8 +474,44 @@ onUnmounted(() => {
   will-change: width, opacity, transform;
 }
 
-.panel-wrapper.left {
-  border-right: 1px solid #EAEAEA;
+.panel-wrapper.dragging {
+  transition: none !important;
 }
-</style>
 
+.panel-wrapper.left {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+.panel-wrapper.right {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 2;
+  background: rgba(255, 255, 255, 0.84);
+  backdrop-filter: blur(14px);
+  box-shadow: -12px 0 36px rgba(15, 23, 42, 0.08);
+  border-left: 1px solid rgba(234, 234, 234, 0.9);
+}
+
+.panel-wrapper.left {
+  border-right: none;
+}
+
+.layout-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 12px;
+  margin-right: -6px;
+  z-index: 100;
+  cursor: col-resize;
+  background: transparent;
+}
+
+.layout-resizer:hover, .layout-resizer:active {
+  background: rgba(0,0,0,0.05);
+}
+
+</style>

@@ -7,8 +7,13 @@ import os
 import uuid
 import time
 import threading
+import json
+import hashlib
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
+from datetime import datetime
+from urllib import request as urlrequest
+from urllib.error import URLError, HTTPError
 
 from zep_cloud.client import Zep
 from zep_cloud import EpisodeData, EntityEdgeSourceTarget
@@ -43,12 +48,78 @@ class GraphBuilderService:
     """
     
     def __init__(self, api_key: Optional[str] = None):
+        self.provider = Config.GRAPH_PROVIDER
+        self._zep_enabled = Config.zep_enabled()
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.client = None
+        self.hivemind_api_url = Config.HIVEMIND_API_URL
+        self.hivemind_api_key = Config.HIVEMIND_API_KEY
+
+        if self.provider == 'zep' and self._zep_enabled:
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = Zep(api_key=self.api_key)
+        elif self.provider == 'hivemind':
+            if not self.hivemind_api_url or not self.hivemind_api_key:
+                raise ValueError("HIVEMIND_API_URL/HIVEMIND_API_KEY 未配置")
+        elif self.provider == 'zep' and not self._zep_enabled:
+            # Zep provider selected but disabled -- read-only local mode
+            pass
+        else:
+            raise ValueError(f"不支持的 GRAPH_PROVIDER: {self.provider}")
+
         self.task_manager = TaskManager()
+
+    @property
+    def _local_graph_dir(self) -> str:
+        path = os.path.join(Config.UPLOAD_FOLDER, 'graphs')
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _graph_file(self, graph_id: str) -> str:
+        return os.path.join(self._local_graph_dir, f"{graph_id}.json")
+
+    def _load_local_graph(self, graph_id: str) -> Dict[str, Any]:
+        path = self._graph_file(graph_id)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"图谱不存在: {graph_id}")
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _save_local_graph(self, graph: Dict[str, Any]):
+        path = self._graph_file(graph["graph_id"])
+        graph["updated_at"] = datetime.now().isoformat()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(graph, f, ensure_ascii=False, indent=2)
+
+    def _hm_headers(self) -> Dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "X-API-Key": self.hivemind_api_key,
+            "Authorization": f"Bearer {self.hivemind_api_key}",
+        }
+
+    def _hivemind_post(self, endpoint: str, payload: Dict[str, Any], timeout: float = 6.0) -> Dict[str, Any]:
+        url = f"{self.hivemind_api_url}{endpoint}"
+        body = json.dumps(payload).encode("utf-8")
+        req = urlrequest.Request(url=url, data=body, headers=self._hm_headers(), method="POST")
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HIVEMIND API 错误 {e.code}: {detail[:200]}")
+        except URLError as e:
+            raise RuntimeError(f"HIVEMIND API 不可达: {e.reason}")
+
+    def _node_uuid(self, graph_id: str, node_type: str, name: str) -> str:
+        raw = f"{graph_id}:{node_type}:{name.strip().lower()}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def _edge_uuid(self, graph_id: str, source: str, target: str, relation: str) -> str:
+        raw = f"{graph_id}:{source}:{target}:{relation}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
     
     def build_graph_async(
         self,
@@ -187,17 +258,61 @@ class GraphBuilderService:
     def create_graph(self, name: str) -> str:
         """创建Zep图谱（公开方法）"""
         graph_id = f"mirofish_{uuid.uuid4().hex[:16]}"
-        
-        self.client.graph.create(
-            graph_id=graph_id,
-            name=name,
-            description="MiroFish Social Simulation Graph"
-        )
-        
+        if self.provider == 'zep':
+            self.client.graph.create(
+                graph_id=graph_id,
+                name=name,
+                description="MiroFish Social Simulation Graph"
+            )
+        else:
+            graph = {
+                "graph_id": graph_id,
+                "name": name,
+                "provider": "hivemind",
+                "ontology": {"entity_types": [], "edge_types": []},
+                "nodes": [],
+                "edges": [],
+                "episodes": [],
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            }
+            self._save_local_graph(graph)
         return graph_id
     
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
         """设置图谱本体（公开方法）"""
+        if self.provider == 'hivemind':
+            graph = self._load_local_graph(graph_id)
+            graph["ontology"] = {
+                "entity_types": ontology.get("entity_types", []),
+                "edge_types": ontology.get("edge_types", []),
+            }
+            nodes = graph.get("nodes", [])
+            seen = {n["uuid"] for n in nodes}
+            for entity in ontology.get("entity_types", []):
+                label = entity.get("name", "Entity")
+                description = entity.get("description", "")
+                examples = entity.get("examples", [])[:3] or [label]
+                for ex in examples:
+                    node_uuid = self._node_uuid(graph_id, label, ex)
+                    if node_uuid in seen:
+                        continue
+                    seen.add(node_uuid)
+                    nodes.append({
+                        "uuid": node_uuid,
+                        "name": ex,
+                        "labels": ["Entity", label],
+                        "summary": description,
+                        "attributes": {
+                            "entity_type": label,
+                            "source": "ontology_seed"
+                        },
+                        "created_at": datetime.now().isoformat(),
+                    })
+            graph["nodes"] = nodes
+            self._save_local_graph(graph)
+            return
+
         import warnings
         from typing import Optional
         from pydantic import Field
@@ -293,6 +408,114 @@ class GraphBuilderService:
         progress_callback: Optional[Callable] = None
     ) -> List[str]:
         """分批添加文本到图谱，返回所有 episode 的 uuid 列表"""
+        if self.provider == 'hivemind':
+            graph = self._load_local_graph(graph_id)
+            episodes = graph.get("episodes", [])
+            nodes = graph.get("nodes", [])
+            edges = graph.get("edges", [])
+            node_ids = {n["uuid"] for n in nodes}
+            edge_ids = {e["uuid"] for e in edges}
+            total_chunks = len(chunks)
+            existing_entities = [n for n in nodes if "Entity" in (n.get("labels") or [])]
+
+            for idx, chunk in enumerate(chunks):
+                ep_uuid = f"ep_{uuid.uuid4().hex[:12]}"
+                chunk_name = f"Chunk {len(episodes) + 1}"
+                chunk_uuid = self._node_uuid(graph_id, "DocumentChunk", chunk_name)
+                if chunk_uuid not in node_ids:
+                    node_ids.add(chunk_uuid)
+                    nodes.append({
+                        "uuid": chunk_uuid,
+                        "name": chunk_name,
+                        "labels": ["Node", "DocumentChunk"],
+                        "summary": chunk[:300],
+                        "attributes": {"content": chunk[:2000]},
+                        "created_at": datetime.now().isoformat(),
+                    })
+
+                # 简单实体链接：基于名称出现在文本中的实体进行连接
+                matched_entities = []
+                chunk_lower = chunk.lower()
+                for entity in existing_entities:
+                    name = (entity.get("name") or "").strip()
+                    if name and name.lower() in chunk_lower:
+                        matched_entities.append(entity)
+
+                for entity in matched_entities:
+                    rel = "mentions"
+                    e_uuid = self._edge_uuid(graph_id, chunk_uuid, entity["uuid"], rel)
+                    if e_uuid not in edge_ids:
+                        edge_ids.add(e_uuid)
+                        edges.append({
+                            "uuid": e_uuid,
+                            "name": rel.upper(),
+                            "fact": f"{chunk_name} mentions {entity['name']}",
+                            "fact_type": rel,
+                            "source_node_uuid": chunk_uuid,
+                            "target_node_uuid": entity["uuid"],
+                            "attributes": {},
+                            "created_at": datetime.now().isoformat(),
+                            "episodes": [ep_uuid],
+                        })
+
+                # 实体共现边
+                for i in range(len(matched_entities)):
+                    for j in range(i + 1, len(matched_entities)):
+                        s = matched_entities[i]["uuid"]
+                        t = matched_entities[j]["uuid"]
+                        rel = "co_occurs"
+                        e_uuid = self._edge_uuid(graph_id, s, t, rel)
+                        if e_uuid not in edge_ids:
+                            edge_ids.add(e_uuid)
+                            edges.append({
+                                "uuid": e_uuid,
+                                "name": "CO_OCCURS",
+                                "fact": f"{matched_entities[i]['name']} co-occurs with {matched_entities[j]['name']}",
+                                "fact_type": rel,
+                                "source_node_uuid": s,
+                                "target_node_uuid": t,
+                                "attributes": {},
+                                "created_at": datetime.now().isoformat(),
+                                "episodes": [ep_uuid],
+                            })
+
+                episodes.append({
+                    "uuid": ep_uuid,
+                    "type": "text",
+                    "data": chunk,
+                    "processed": True,
+                    "created_at": datetime.now().isoformat(),
+                })
+
+                # 可选: 同步到 HIVEMIND memories（默认关闭，避免拖慢构建）
+                if Config.HIVEMIND_SYNC_EPISODES:
+                    try:
+                        self._hivemind_post(
+                            "/api/memories",
+                            {
+                                "title": f"MiroFish Episode {ep_uuid}",
+                                "content": chunk,
+                                "project": f"mirofish/{graph_id}",
+                                "tags": ["mirofish", "episode", graph_id],
+                            },
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        # 不阻塞图构建流程
+                        pass
+
+                if progress_callback:
+                    progress_callback(
+                        f"发送第 {idx + 1}/{total_chunks} 批数据...",
+                        (idx + 1) / max(total_chunks, 1),
+                    )
+
+            graph["episodes"] = episodes
+            graph["nodes"] = nodes
+            graph["edges"] = edges
+            self._save_local_graph(graph)
+            return [ep["uuid"] for ep in episodes]
+
         episode_uuids = []
         total_chunks = len(chunks)
         
@@ -345,6 +568,11 @@ class GraphBuilderService:
         timeout: int = 600
     ):
         """等待所有 episode 处理完成（通过查询每个 episode 的 processed 状态）"""
+        if self.provider == 'hivemind':
+            if progress_callback:
+                progress_callback("HIVEMIND 模式无需等待异步处理", 1.0)
+            return
+
         if not episode_uuids:
             if progress_callback:
                 progress_callback("无需等待（没有 episode）", 1.0)
@@ -396,6 +624,22 @@ class GraphBuilderService:
     
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """获取图谱信息"""
+        if self.provider == 'hivemind':
+            graph = self._load_local_graph(graph_id)
+            nodes = graph.get("nodes", [])
+            edges = graph.get("edges", [])
+            entity_types = set()
+            for node in nodes:
+                for label in node.get("labels", []):
+                    if label not in ["Entity", "Node", "DocumentChunk"]:
+                        entity_types.add(label)
+            return GraphInfo(
+                graph_id=graph_id,
+                node_count=len(nodes),
+                edge_count=len(edges),
+                entity_types=list(entity_types),
+            )
+
         # 获取节点（分页）
         nodes = fetch_all_nodes(self.client, graph_id)
 
@@ -427,6 +671,40 @@ class GraphBuilderService:
         Returns:
             包含nodes和edges的字典，包括时间信息、属性等详细数据
         """
+        if self.provider == 'hivemind':
+            graph = self._load_local_graph(graph_id)
+            nodes_data = graph.get("nodes", [])
+            edges_data = graph.get("edges", [])
+
+            # 补齐展示字段，保持与前端结构兼容
+            node_map = {n["uuid"]: n.get("name", "") for n in nodes_data}
+            normalized_edges = []
+            for edge in edges_data:
+                normalized_edges.append({
+                    "uuid": edge.get("uuid"),
+                    "name": edge.get("name", ""),
+                    "fact": edge.get("fact", ""),
+                    "fact_type": edge.get("fact_type") or edge.get("name", ""),
+                    "source_node_uuid": edge.get("source_node_uuid"),
+                    "target_node_uuid": edge.get("target_node_uuid"),
+                    "source_node_name": node_map.get(edge.get("source_node_uuid"), ""),
+                    "target_node_name": node_map.get(edge.get("target_node_uuid"), ""),
+                    "attributes": edge.get("attributes", {}),
+                    "created_at": edge.get("created_at"),
+                    "valid_at": edge.get("valid_at"),
+                    "invalid_at": edge.get("invalid_at"),
+                    "expired_at": edge.get("expired_at"),
+                    "episodes": edge.get("episodes", []),
+                })
+
+            return {
+                "graph_id": graph_id,
+                "nodes": nodes_data,
+                "edges": normalized_edges,
+                "node_count": len(nodes_data),
+                "edge_count": len(normalized_edges),
+            }
+
         nodes = fetch_all_nodes(self.client, graph_id)
         edges = fetch_all_edges(self.client, graph_id)
 
@@ -496,5 +774,9 @@ class GraphBuilderService:
     
     def delete_graph(self, graph_id: str):
         """删除图谱"""
+        if self.provider == 'hivemind':
+            path = self._graph_file(graph_id)
+            if os.path.exists(path):
+                os.remove(path)
+            return
         self.client.graph.delete(graph_id=graph_id)
-

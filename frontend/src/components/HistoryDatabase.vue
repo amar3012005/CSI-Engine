@@ -4,20 +4,20 @@
     :class="{ 'no-projects': projects.length === 0 && !loading }"
     ref="historyContainer"
   >
-    <!-- 背景装饰：技术网格线（只在有项目时显示） -->
+    <!-- Background decoration: tech grid lines (only shown when projects exist) -->
     <div v-if="projects.length > 0 || loading" class="tech-grid-bg">
       <div class="grid-pattern"></div>
       <div class="gradient-overlay"></div>
     </div>
 
-    <!-- 标题区域 -->
+    <!-- Title area -->
     <div class="section-header">
       <div class="section-line"></div>
-      <span class="section-title">推演记录</span>
+      <span class="section-title">Simulation History</span>
       <div class="section-line"></div>
     </div>
 
-    <!-- 卡片容器（只在有项目时显示） -->
+    <!-- Card container (only shown when projects exist) -->
     <div v-if="projects.length > 0" class="cards-container" :class="{ expanded: isExpanded }" :style="containerStyle">
       <div 
         v-for="(project, index) in projects" 
@@ -29,33 +29,33 @@
         @mouseleave="hoveringCard = null"
         @click="navigateToProject(project)"
       >
-        <!-- 卡片头部：simulation_id 和 功能可用状态 -->
+        <!-- Card header: simulation_id and feature availability status -->
         <div class="card-header">
           <span class="card-id">{{ formatSimulationId(project.simulation_id) }}</span>
           <div class="card-status-icons">
             <span 
               class="status-icon" 
               :class="{ available: project.project_id, unavailable: !project.project_id }"
-              title="图谱构建"
+              title="Graph Build"
             >◇</span>
             <span 
               class="status-icon available" 
-              title="环境搭建"
+              title="Environment Setup"
             >◈</span>
             <span 
               class="status-icon" 
               :class="{ available: project.report_id, unavailable: !project.report_id }"
-              title="分析报告"
+              title="Analysis Report"
             >◆</span>
           </div>
         </div>
 
-        <!-- 文件列表区域 -->
+        <!-- Files list area -->
         <div class="card-files-wrapper">
-          <!-- 角落装饰 - 取景框风格 -->
+          <!-- Corner decoration - viewfinder style -->
           <div class="corner-mark top-left-only"></div>
           
-          <!-- 文件列表 -->
+          <!-- File list -->
           <div class="files-list" v-if="project.files && project.files.length > 0">
             <div 
               v-for="(file, fileIndex) in project.files.slice(0, 3)" 
@@ -65,25 +65,25 @@
               <span class="file-tag" :class="getFileType(file.filename)">{{ getFileTypeLabel(file.filename) }}</span>
               <span class="file-name">{{ truncateFilename(file.filename, 20) }}</span>
             </div>
-            <!-- 如果有更多文件，显示提示 -->
+            <!-- Show hint if more files exist -->
             <div v-if="project.files.length > 3" class="files-more">
-              +{{ project.files.length - 3 }} 个文件
+              +{{ project.files.length - 3 }} files
             </div>
           </div>
-          <!-- 无文件时的占位 -->
+          <!-- Placeholder when no files -->
           <div class="files-empty" v-else>
             <span class="empty-file-icon">◇</span>
-            <span class="empty-file-text">暂无文件</span>
+            <span class="empty-file-text">No files</span>
           </div>
         </div>
 
-        <!-- 卡片标题（使用模拟需求的前20字作为标题） -->
+        <!-- Card title (first 20 chars of simulation requirement) -->
         <h3 class="card-title">{{ getSimulationTitle(project.simulation_requirement) }}</h3>
 
-        <!-- 卡片描述（模拟需求完整展示） -->
+        <!-- Card description (full simulation requirement) -->
         <p class="card-desc">{{ truncateText(project.simulation_requirement, 55) }}</p>
 
-        <!-- 卡片底部 -->
+        <!-- Card footer -->
         <div class="card-footer">
           <div class="card-datetime">
             <span class="card-date">{{ formatDate(project.created_at) }}</span>
@@ -94,23 +94,23 @@
           </span>
         </div>
         
-        <!-- 底部装饰线 (hover时展开) -->
+        <!-- Bottom decoration line (expands on hover) -->
         <div class="card-bottom-line"></div>
       </div>
     </div>
 
-    <!-- 加载状态 -->
+    <!-- Loading state -->
     <div v-if="loading" class="loading-state">
       <span class="loading-spinner"></span>
-      <span class="loading-text">加载中...</span>
+      <span class="loading-text">Loading...</span>
     </div>
 
-    <!-- 历史回放详情弹窗 -->
+    <!-- History replay detail modal -->
     <Teleport to="body">
       <Transition name="modal">
         <div v-if="selectedProject" class="modal-overlay" @click.self="closeModal">
           <div class="modal-content">
-            <!-- 弹窗头部 -->
+            <!-- Modal header -->
             <div class="modal-header">
               <div class="modal-title-section">
                 <span class="modal-id">{{ formatSimulationId(selectedProject.simulation_id) }}</span>
@@ -122,35 +122,35 @@
               <button class="modal-close" @click="closeModal">×</button>
             </div>
 
-            <!-- 弹窗内容 -->
+            <!-- Modal content -->
             <div class="modal-body">
-              <!-- 模拟需求 -->
+              <!-- Simulation requirement -->
               <div class="modal-section">
-                <div class="modal-label">模拟需求</div>
-                <div class="modal-requirement">{{ selectedProject.simulation_requirement || '无' }}</div>
+                <div class="modal-label">Simulation Requirement</div>
+                <div class="modal-requirement">{{ selectedProject.simulation_requirement || 'None' }}</div>
               </div>
 
-              <!-- 文件列表 -->
+              <!-- File list -->
               <div class="modal-section">
-                <div class="modal-label">关联文件</div>
+                <div class="modal-label">Associated Files</div>
                 <div class="modal-files" v-if="selectedProject.files && selectedProject.files.length > 0">
                   <div v-for="(file, index) in selectedProject.files" :key="index" class="modal-file-item">
                     <span class="file-tag" :class="getFileType(file.filename)">{{ getFileTypeLabel(file.filename) }}</span>
                     <span class="modal-file-name">{{ file.filename }}</span>
                   </div>
                 </div>
-                <div class="modal-empty" v-else>暂无关联文件</div>
+                <div class="modal-empty" v-else>No associated files</div>
               </div>
             </div>
 
-            <!-- 推演回放分割线 -->
+            <!-- Simulation replay divider -->
             <div class="modal-divider">
               <span class="divider-line"></span>
-              <span class="divider-text">推演回放</span>
+              <span class="divider-text">Simulation Replay</span>
               <span class="divider-line"></span>
             </div>
 
-            <!-- 导航按钮 -->
+            <!-- Navigation buttons -->
             <div class="modal-actions">
               <button 
                 class="modal-btn btn-project" 
@@ -159,7 +159,7 @@
               >
                 <span class="btn-step">Step1</span>
                 <span class="btn-icon">◇</span>
-                <span class="btn-text">图谱构建</span>
+                <span class="btn-text">Graph Build</span>
               </button>
               <button 
                 class="modal-btn btn-simulation" 
@@ -167,7 +167,7 @@
               >
                 <span class="btn-step">Step2</span>
                 <span class="btn-icon">◈</span>
-                <span class="btn-text">环境搭建</span>
+                <span class="btn-text">Environment Setup</span>
               </button>
               <button 
                 class="modal-btn btn-report" 
@@ -176,12 +176,12 @@
               >
                 <span class="btn-step">Step4</span>
                 <span class="btn-icon">◆</span>
-                <span class="btn-text">分析报告</span>
+                <span class="btn-text">Analysis Report</span>
               </button>
             </div>
-            <!-- 不可回放提示 -->
+            <!-- Non-replayable hint -->
             <div class="modal-playback-hint">
-              <span class="hint-text">Step3「开始模拟」与 Step5「深度互动」需在运行中启动，不支持历史回放</span>
+              <span class="hint-text">Step3 "Start Simulation" and Step5 "Deep Interaction" must be launched during a live run and do not support history replay</span>
             </div>
           </div>
         </div>
@@ -198,56 +198,56 @@ import { getSimulationHistory } from '../api/simulation'
 const router = useRouter()
 const route = useRoute()
 
-// 状态
+// State
 const projects = ref([])
 const loading = ref(true)
 const isExpanded = ref(false)
 const hoveringCard = ref(null)
 const historyContainer = ref(null)
-const selectedProject = ref(null)  // 当前选中的项目（用于弹窗）
+const selectedProject = ref(null)  // Currently selected project (for modal)
 let observer = null
-let isAnimating = false  // 动画锁，防止闪烁
-let expandDebounceTimer = null  // 防抖定时器
-let pendingState = null  // 记录待执行的目标状态
+let isAnimating = false  // Animation lock to prevent flickering
+let expandDebounceTimer = null  // Debounce timer
+let pendingState = null  // Pending target state
 
-// 卡片布局配置 - 调整为更宽的比例
+// Card layout config - adjusted for wider proportions
 const CARDS_PER_ROW = 4
 const CARD_WIDTH = 280  
 const CARD_HEIGHT = 280 
 const CARD_GAP = 24
 
-// 动态计算容器高度样式
+// Dynamically compute container height style
 const containerStyle = computed(() => {
   if (!isExpanded.value) {
-    // 折叠态：固定高度
+    // Collapsed state: fixed height
     return { minHeight: '420px' }
   }
   
-  // 展开态：根据卡片数量动态计算高度
+  // Expanded state: dynamically compute height based on card count
   const total = projects.value.length
   if (total === 0) {
     return { minHeight: '280px' }
   }
   
   const rows = Math.ceil(total / CARDS_PER_ROW)
-  // 计算实际需要的高度：行数 * 卡片高度 + (行数-1) * 间距 + 少量底部间距
+  // Calculate actual height needed: rows * card height + (rows-1) * gap + small bottom padding
   const expandedHeight = rows * CARD_HEIGHT + (rows - 1) * CARD_GAP + 10
   
   return { minHeight: `${expandedHeight}px` }
 })
 
-// 获取卡片样式
+// Get card style
 const getCardStyle = (index) => {
   const total = projects.value.length
   
   if (isExpanded.value) {
-    // 展开态：网格布局
+    // Expanded state: grid layout
     const transition = 'transform 700ms cubic-bezier(0.23, 1, 0.32, 1), opacity 700ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 0.3s ease, border-color 0.3s ease'
 
     const col = index % CARDS_PER_ROW
     const row = Math.floor(index / CARDS_PER_ROW)
     
-    // 计算当前行的卡片数量，确保每行居中
+    // Calculate cards in current row to ensure centering
     const currentRowStart = row * CARDS_PER_ROW
     const currentRowCards = Math.min(CARDS_PER_ROW, total - currentRowStart)
     
@@ -257,7 +257,7 @@ const getCardStyle = (index) => {
     const colInRow = index % CARDS_PER_ROW
     const x = startX + colInRow * (CARD_WIDTH + CARD_GAP)
     
-    // 向下展开，增加与标题的间距
+    // Expand downward, increase spacing from title
     const y = 20 + row * (CARD_HEIGHT + CARD_GAP)
 
     return {
@@ -267,14 +267,14 @@ const getCardStyle = (index) => {
       transition: transition
     }
   } else {
-    // 折叠态：扇形堆叠
+    // Collapsed state: fan stack
     const transition = 'transform 700ms cubic-bezier(0.23, 1, 0.32, 1), opacity 700ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 0.3s ease, border-color 0.3s ease'
 
     const centerIndex = (total - 1) / 2
     const offset = index - centerIndex
     
     const x = offset * 35
-    // 调整起始位置，靠近标题但保持适当间距
+    // Adjust starting position, close to title but with proper spacing
     const y = 25 + Math.abs(offset) * 8
     const r = offset * 3
     const s = 0.95 - Math.abs(offset) * 0.05
@@ -288,24 +288,24 @@ const getCardStyle = (index) => {
   }
 }
 
-// 根据轮数进度获取样式类
+// Get style class based on round progress
 const getProgressClass = (simulation) => {
   const current = simulation.current_round || 0
   const total = simulation.total_rounds || 0
   
   if (total === 0 || current === 0) {
-    // 未开始
+    // Not started
     return 'not-started'
   } else if (current >= total) {
-    // 已完成
+    // Completed
     return 'completed'
   } else {
-    // 进行中
+    // In progress
     return 'in-progress'
   }
 }
 
-// 格式化日期（只显示日期部分）
+// Format date (date part only)
 const formatDate = (dateStr) => {
   if (!dateStr) return ''
   try {
@@ -316,7 +316,7 @@ const formatDate = (dateStr) => {
   }
 }
 
-// 格式化时间（显示时:分）
+// Format time (HH:MM)
 const formatTime = (dateStr) => {
   if (!dateStr) return ''
   try {
@@ -646,7 +646,7 @@ onUnmounted(() => {
 .section-title {
   font-size: 0.8rem;
   font-weight: 500;
-  color: #9CA3AF;
+  color: #a3a3a3;
   letter-spacing: 3px;
   text-transform: uppercase;
 }
@@ -666,8 +666,8 @@ onUnmounted(() => {
 .project-card {
   position: absolute;
   width: 280px;
-  background: #FFFFFF;
-  border: 1px solid #E5E7EB;
+  background: #ffffff;
+  border: 1px solid #e3e0db;
   border-radius: 0;
   padding: 14px;
   cursor: pointer;
@@ -677,7 +677,7 @@ onUnmounted(() => {
 
 .project-card:hover {
   box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-  border-color: rgba(0, 0, 0, 0.4);
+  border-color: #117dff;
   z-index: 1000 !important;
 }
 
@@ -698,7 +698,7 @@ onUnmounted(() => {
 }
 
 .card-id {
-  color: #6B7280;
+  color: #525252;
   letter-spacing: 0.5px;
   font-weight: 500;
 }
@@ -747,8 +747,8 @@ onUnmounted(() => {
 /* 进度状态颜色 */
 .card-progress.completed { color: #10B981; }    /* 已完成 - 绿色 */
 .card-progress.in-progress { color: #F59E0B; }  /* 进行中 - 橙色 */
-.card-progress.not-started { color: #9CA3AF; }  /* 未开始 - 灰色 */
-.card-status.pending { color: #9CA3AF; }
+.card-progress.not-started { color: #a3a3a3; }  /* 未开始 - 灰色 */
+.card-status.pending { color: #a3a3a3; }
 
 /* 文件列表区域 */
 .card-files-wrapper {
@@ -758,9 +758,9 @@ onUnmounted(() => {
   max-height: 110px;
   margin-bottom: 12px;
   padding: 8px 10px;
-  background: linear-gradient(135deg, #f8f9fa 0%, #f1f3f4 100%);
+  background: #faf9f4;
   border-radius: 4px;
-  border: 1px solid #e8eaed;
+  border: 1px solid #e3e0db;
   overflow: hidden;
 }
 
@@ -778,7 +778,7 @@ onUnmounted(() => {
   padding: 3px 6px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.6rem;
-  color: #6B7280;
+  color: #525252;
   background: rgba(255, 255, 255, 0.5);
   border-radius: 3px;
   letter-spacing: 0.3px;
@@ -830,7 +830,7 @@ onUnmounted(() => {
 .file-tag.other { background: #f3f4f6; color: #6b7280; }
 
 .file-name {
-  font-family: 'Inter', sans-serif;
+  font-family: 'Space Grotesk', sans-serif;
   font-size: 0.7rem;
   color: #4b5563;
   white-space: nowrap;
@@ -846,7 +846,7 @@ onUnmounted(() => {
   justify-content: center;
   gap: 8px;
   height: 48px;
-  color: #9CA3AF;
+  color: #a3a3a3;
 }
 
 .empty-file-icon {
@@ -863,7 +863,7 @@ onUnmounted(() => {
 /* 悬停时文件区域效果 */
 .project-card:hover .card-files-wrapper {
   border-color: #d1d5db;
-  background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+  background: #ffffff;
 }
 
 /* 角落装饰 */
@@ -881,10 +881,10 @@ onUnmounted(() => {
 
 /* 卡片标题 */
 .card-title {
-  font-family: 'Inter', -apple-system, sans-serif;
+  font-family: 'Space Grotesk', sans-serif;
   font-size: 0.9rem;
   font-weight: 700;
-  color: #111827;
+  color: #0a0a0a;
   margin: 0 0 6px 0;
   line-height: 1.4;
   white-space: nowrap;
@@ -899,9 +899,9 @@ onUnmounted(() => {
 
 /* 卡片描述 */
 .card-desc {
-  font-family: 'Inter', sans-serif;
+  font-family: 'Space Grotesk', sans-serif;
   font-size: 0.75rem;
-  color: #6B7280;
+  color: #525252;
   margin: 0 0 16px 0;
   line-height: 1.5;
   height: 34px;
@@ -921,7 +921,7 @@ onUnmounted(() => {
   border-top: 1px solid #F3F4F6;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.65rem;
-  color: #9CA3AF;
+  color: #a3a3a3;
   font-weight: 500;
 }
 
@@ -949,7 +949,7 @@ onUnmounted(() => {
 /* 进度状态颜色 - 底部 */
 .card-footer .card-progress.completed { color: #10B981; }
 .card-footer .card-progress.in-progress { color: #F59E0B; }
-.card-footer .card-progress.not-started { color: #9CA3AF; }
+.card-footer .card-progress.not-started { color: #a3a3a3; }
 
 /* 底部装饰线 */
 .card-bottom-line {
@@ -974,7 +974,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 14px;
   padding: 48px;
-  color: #9CA3AF;
+  color: #a3a3a3;
 }
 
 .empty-icon {
@@ -986,7 +986,7 @@ onUnmounted(() => {
   width: 24px;
   height: 24px;
   border: 2px solid #E5E7EB;
-  border-top-color: #6B7280;
+  border-top-color: #525252;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -1027,12 +1027,12 @@ onUnmounted(() => {
 }
 
 .modal-content {
-  background: #FFFFFF;
+  background: #ffffff;
   width: 560px;
   max-width: 90vw;
   max-height: 85vh;
   overflow-y: auto;
-  border: 1px solid #E5E7EB;
+  border: 1px solid #e3e0db;
   border-radius: 8px;
   box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
 }
@@ -1073,7 +1073,7 @@ onUnmounted(() => {
   align-items: center;
   padding: 20px 32px;
   border-bottom: 1px solid #F3F4F6;
-  background: #FFFFFF;
+  background: #ffffff;
 }
 
 .modal-title-section {
@@ -1086,7 +1086,7 @@ onUnmounted(() => {
   font-family: 'JetBrains Mono', monospace;
   font-size: 1rem;
   font-weight: 600;
-  color: #111827;
+  color: #0a0a0a;
   letter-spacing: 0.5px;
 }
 
@@ -1099,17 +1099,17 @@ onUnmounted(() => {
   font-weight: 600;
   padding: 4px 8px;
   border-radius: 4px;
-  background: #F9FAFB;
+  background: #faf9f4;
 }
 
 .modal-progress.completed { color: #10B981; background: rgba(16, 185, 129, 0.1); }
 .modal-progress.in-progress { color: #F59E0B; background: rgba(245, 158, 11, 0.1); }
-.modal-progress.not-started { color: #9CA3AF; background: #F3F4F6; }
+.modal-progress.not-started { color: #a3a3a3; background: #f3f1ec; }
 
 .modal-create-time {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.75rem;
-  color: #9CA3AF;
+  color: #a3a3a3;
   letter-spacing: 0.3px;
 }
 
@@ -1119,7 +1119,7 @@ onUnmounted(() => {
   border: none;
   background: transparent;
   font-size: 1.5rem;
-  color: #9CA3AF;
+  color: #a3a3a3;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -1129,8 +1129,8 @@ onUnmounted(() => {
 }
 
 .modal-close:hover {
-  background: #F3F4F6;
-  color: #111827;
+  background: #f3f1ec;
+  color: #0a0a0a;
 }
 
 /* 弹窗内容 */
@@ -1149,7 +1149,7 @@ onUnmounted(() => {
 .modal-label {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.75rem;
-  color: #6B7280;
+  color: #525252;
   text-transform: uppercase;
   letter-spacing: 1px;
   margin-bottom: 10px;
@@ -1158,10 +1158,10 @@ onUnmounted(() => {
 
 .modal-requirement {
   font-size: 0.95rem;
-  color: #374151;
+  color: #525252;
   line-height: 1.6;
   padding: 16px;
-  background: #F9FAFB;
+  background: #faf9f4;
   border: 1px solid #F3F4F6;
   border-radius: 8px;
 }
@@ -1181,7 +1181,7 @@ onUnmounted(() => {
 }
 
 .modal-files::-webkit-scrollbar-track {
-  background: #F3F4F6;
+  background: #f3f1ec;
   border-radius: 2px;
 }
 
@@ -1199,8 +1199,8 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
-  background: #FFFFFF;
-  border: 1px solid #E5E7EB;
+  background: #ffffff;
+  border: 1px solid #e3e0db;
   border-radius: 6px;
   transition: all 0.2s ease;
 }
@@ -1212,7 +1212,7 @@ onUnmounted(() => {
 
 .modal-file-name {
   font-size: 0.85rem;
-  color: #4B5563;
+  color: #525252;
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1221,9 +1221,9 @@ onUnmounted(() => {
 
 .modal-empty {
   font-size: 0.85rem;
-  color: #9CA3AF;
+  color: #a3a3a3;
   padding: 16px;
-  background: #F9FAFB;
+  background: #faf9f4;
   border: 1px dashed #E5E7EB;
   border-radius: 6px;
   text-align: center;
@@ -1235,7 +1235,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 16px;
   padding: 10px 32px 0;
-  background: #FFFFFF;
+  background: #ffffff;
 }
 
 .divider-line {
@@ -1247,7 +1247,7 @@ onUnmounted(() => {
 .divider-text {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.7rem;
-  color: #9CA3AF;
+  color: #a3a3a3;
   letter-spacing: 2px;
   text-transform: uppercase;
   white-space: nowrap;
@@ -1258,7 +1258,7 @@ onUnmounted(() => {
   display: flex;
   gap: 16px;
   padding: 20px 32px;
-  background: #FFFFFF;
+  background: #ffffff;
 }
 
 .modal-btn {
@@ -1268,9 +1268,9 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   padding: 16px;
-  border: 1px solid #E5E7EB;
+  border: 1px solid #e3e0db;
   border-radius: 8px;
-  background: #FFFFFF;
+  background: #ffffff;
   cursor: pointer;
   transition: all 0.2s ease;
   position: relative;
@@ -1286,14 +1286,14 @@ onUnmounted(() => {
 .modal-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-  background: #F9FAFB;
+  background: #faf9f4;
 }
 
 .btn-step {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.6rem;
   font-weight: 500;
-  color: #9CA3AF;
+  color: #a3a3a3;
   letter-spacing: 0.5px;
   text-transform: uppercase;
 }
@@ -1309,7 +1309,7 @@ onUnmounted(() => {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.5px;
-  color: #4B5563;
+  color: #525252;
 }
 
 .modal-btn.btn-project .btn-icon { color: #3B82F6; }
@@ -1317,7 +1317,7 @@ onUnmounted(() => {
 .modal-btn.btn-report .btn-icon { color: #10B981; }
 
 .modal-btn:hover:not(:disabled) .btn-text {
-  color: #111827;
+  color: #0a0a0a;
 }
 
 /* 不可回放提示 */
@@ -1326,13 +1326,13 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   padding: 0 32px 20px;
-  background: #FFFFFF;
+  background: #ffffff;
 }
 
 .hint-text {
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.7rem;
-  color: #9CA3AF;
+  color: #a3a3a3;
   letter-spacing: 0.3px;
   text-align: center;
   line-height: 1.5;

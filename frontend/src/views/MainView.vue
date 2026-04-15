@@ -1,9 +1,10 @@
+
 <template>
   <div class="main-view">
     <!-- Header -->
     <header class="app-header">
       <div class="header-left">
-        <div class="brand" @click="router.push('/')">MIROFISH</div>
+        <div class="brand" @click="router.push('/')"></div>
       </div>
       
       <div class="header-center">
@@ -35,16 +36,53 @@
 
     <!-- Main Content Area -->
     <main class="content-area">
+
+      <!-- Floating Entry/Query Card (Persistent) -->
+      <div class="entry-overlay" :class="{ 'solid': !isDocked }"></div>
+      <div class="entry-card-wrapper" :class="{ 'docked': isDocked }">
+        <div class="entry-card">
+          <div class="entry-chrome">
+            <div class="traffic-lights">
+              <span class="dot red"></span>
+              <span class="dot yellow"></span>
+              <span class="dot green"></span>
+            </div>
+            <span class="entry-label">AI Research</span>
+          </div>
+          <div class="entry-body">
+            <div class="entry-query">{{ projectData?.simulation_requirement || currentProjectId || 'Processing...' }}</div>
+          </div>
+          <div class="entry-footer">
+            <span class="entry-status">
+              <span class="spin-icon" v-if="!isDocked">&#8635;</span>
+              <span class="dot-icon green" v-else></span> 
+              {{ isDocked ? 'Researching...' : 'Setting up research environment...' }}
+            </span>
+          </div>
+        </div>
+      </div>
+
       <!-- Left Panel: Graph -->
       <div class="panel-wrapper left" :style="leftPanelStyle">
         <GraphPanel 
           :graphData="graphData"
           :loading="graphLoading"
           :currentPhase="currentPhase"
+          :simulationId="currentSimulationId"
           @refresh="refreshGraph"
           @toggle-maximize="toggleMaximize('graph')"
         />
       </div>
+
+      <!-- Right Panel: Step Components -->
+      
+      <!-- Vertical Resizer Handle -->
+      <div 
+        v-show="viewMode === 'split'"
+        class="layout-resizer" 
+        :style="{ right: rightPanelWidth + '%' }"
+        @mousedown="startDrag"
+      ></div>
 
       <!-- Right Panel: Step Components -->
       <div class="panel-wrapper right" :style="rightPanelStyle">
@@ -64,6 +102,7 @@
           v-else-if="currentStep === 2"
           :projectData="projectData"
           :graphData="graphData"
+          :configMode="route.query.configMode || 'social'"
           :systemLogs="systemLogs"
           @go-back="handleGoBack"
           @next-step="handleNextStep"
@@ -93,6 +132,9 @@ const viewMode = ref('split') // graph | split | workbench
 const currentStep = ref(1) // 1: 图谱构建, 2: 环境搭建, 3: 开始模拟, 4: 报告生成, 5: 深度互动
 const stepNames = ['图谱构建', '环境搭建', '开始模拟', '报告生成', '深度互动']
 
+// Dock Animation
+const isDocked = ref(false)
+
 // Data State
 const currentProjectId = ref(route.params.projectId)
 const loading = ref(false)
@@ -109,17 +151,48 @@ const systemLogs = ref([])
 let pollTimer = null
 let graphPollTimer = null
 
+
+// Panel Resizer Logic
+const rightPanelWidth = ref(50) // Percentage
+const isDragging = ref(false)
+
+const startDrag = (e) => {
+  isDragging.value = true
+  document.addEventListener('mousemove', onDrag)
+  document.addEventListener('mouseup', stopDrag)
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
+
+const onDrag = (e) => {
+  if (!isDragging.value) return
+  const containerWidth = window.innerWidth
+  let newWidthPct = 100 - (e.clientX / containerWidth) * 100
+  // Constrain between 20% and 80%
+  if (newWidthPct < 20) newWidthPct = 20
+  if (newWidthPct > 80) newWidthPct = 80
+  rightPanelWidth.value = newWidthPct
+}
+
+const stopDrag = () => {
+  isDragging.value = false
+  document.removeEventListener('mousemove', onDrag)
+  document.removeEventListener('mouseup', stopDrag)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+}
+
 // --- Computed Layout Styles ---
 const leftPanelStyle = computed(() => {
-  if (viewMode.value === 'graph') return { width: '100%', opacity: 1, transform: 'translateX(0)' }
-  if (viewMode.value === 'workbench') return { width: '0%', opacity: 0, transform: 'translateX(-20px)' }
-  return { width: '50%', opacity: 1, transform: 'translateX(0)' }
+  // Graph stays in background
+  return { width: '100%', opacity: 1, transform: 'translateX(0)', zIndex: 1 }
 })
 
 const rightPanelStyle = computed(() => {
+  // Right panel overrides graph. Slides from right.
   if (viewMode.value === 'workbench') return { width: '100%', opacity: 1, transform: 'translateX(0)' }
-  if (viewMode.value === 'graph') return { width: '0%', opacity: 0, transform: 'translateX(20px)' }
-  return { width: '50%', opacity: 1, transform: 'translateX(0)' }
+  if (viewMode.value === 'graph') return { width: '0%', opacity: 0, transform: 'translateX(100%)' }
+  return { width: rightPanelWidth.value + '%', opacity: 1, transform: 'translateX(0)' }
 })
 
 // --- Status Computed ---
@@ -188,9 +261,12 @@ const initProject = async () => {
 
 const handleNewProject = async () => {
   const pending = getPendingUpload()
-  if (!pending.isPending || pending.files.length === 0) {
-    error.value = 'No pending files found.'
-    addLog('Error: No pending files found for new project.')
+  const hasFiles = pending.files.length > 0
+  const hasUrls = (pending.urls || []).length > 0
+
+  if (!pending.isPending || (!hasFiles && !hasUrls)) {
+    error.value = 'No pending sources found.'
+    addLog('Error: No pending files or URLs found for new project.')
     return
   }
   
@@ -202,6 +278,7 @@ const handleNewProject = async () => {
     
     const formData = new FormData()
     pending.files.forEach(f => formData.append('files', f))
+    ;(pending.urls || []).forEach(url => formData.append('urls', url))
     formData.append('simulation_requirement', pending.simulationRequirement)
     
     const res = await generateOntology(formData)
@@ -210,7 +287,11 @@ const handleNewProject = async () => {
       currentProjectId.value = res.data.project_id
       projectData.value = res.data
       
-      router.replace({ name: 'Process', params: { projectId: res.data.project_id } })
+      router.replace({
+        name: 'Process',
+        params: { projectId: res.data.project_id },
+        query: route.query
+      })
       ontologyProgress.value = null
       addLog(`Ontology generated successfully for project ${res.data.project_id}`)
       await startBuildGraph()
@@ -396,6 +477,11 @@ const stopGraphPolling = () => {
 
 onMounted(() => {
   initProject()
+  
+  // Slide query card down naturally after components load
+  setTimeout(() => {
+    isDocked.value = true
+  }, 1000)
 })
 
 onUnmounted(() => {
@@ -537,4 +623,112 @@ onUnmounted(() => {
 .panel-wrapper.left {
   border-right: 1px solid #EAEAEA;
 }
+/* ─── Persistent Dock Animation ──────────────── */
+.entry-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  background: transparent;
+  pointer-events: none;
+  transition: background 0.8s ease;
+}
+
+.entry-overlay.solid {
+  background: #E8E5E0; /* or adjust to transparent if graph is always loaded */
+  pointer-events: none; /* Let clicks pass to graph */
+}
+
+.entry-card-wrapper {
+  position: absolute;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 100%;
+  max-width: 820px;
+  z-index: 101;
+  pointer-events: auto;
+  transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  padding: 0 20px;
+}
+
+.entry-card-wrapper.docked {
+  /* It just stays exactly there, no shrinking */
+}
+
+.entry-card {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(212, 209, 204, 0.8);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.08);
+  transition: all 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.entry-chrome {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #F7F6F3;
+  border-bottom: 1px solid #E8E5E0;
+}
+
+.traffic-lights { display: flex; gap: 7px; }
+.dot { width: 12px; height: 12px; border-radius: 50%; }
+.dot.red { background: #FF5F57; }
+.dot.yellow { background: #FEBC2E; }
+.dot.green { background: #28C840; }
+.entry-label { font-size: 11px; color: #a3a3a3; font-weight: 500; }
+
+.entry-body {
+  padding: 24px 20px;
+}
+
+.entry-query {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #0a0a0a;
+}
+
+.entry-footer {
+  padding: 12px 16px;
+  border-top: 1px solid #EDEAE6;
+}
+
+.entry-status {
+  font-size: 12px;
+  color: #117dff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.spin-icon {
+  display: inline-block;
+  animation: spinning 0.8s linear infinite;
+}
+
+@keyframes spinning {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.layout-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 12px;
+  margin-right: -6px; /* center it over the border */
+  z-index: 100;
+  cursor: col-resize;
+  background: transparent;
+}
+
+.layout-resizer:hover, .layout-resizer:active {
+  background: rgba(0,0,0,0.05); /* Highlight on grab */
+}
+
 </style>

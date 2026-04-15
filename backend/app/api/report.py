@@ -91,12 +91,7 @@ def generate_report():
                 "error": f"项目不存在: {state.project_id}"
             }), 404
         
-        graph_id = state.graph_id or project.graph_id
-        if not graph_id:
-            return jsonify({
-                "success": False,
-                "error": "缺少图谱ID，请确保已构建图谱"
-            }), 400
+        graph_id = state.graph_id or project.graph_id or ""
         
         simulation_requirement = project.simulation_requirement
         if not simulation_requirement:
@@ -527,12 +522,7 @@ def chat_with_report_agent():
                 "error": f"项目不存在: {state.project_id}"
             }), 404
         
-        graph_id = state.graph_id or project.graph_id
-        if not graph_id:
-            return jsonify({
-                "success": False,
-                "error": "缺少图谱ID"
-            }), 400
+        graph_id = state.graph_id or project.graph_id or ""
         
         simulation_requirement = project.simulation_requirement or ""
         
@@ -600,6 +590,19 @@ def get_report_progress(report_id: str):
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+@report_bp.route('/<report_id>/golden-trail', methods=['GET'])
+def get_golden_trail(report_id: str):
+    """Get the golden evidence trail for a report — artifact IDs cited in the final report."""
+    try:
+        report = ReportManager.get_report(report_id)
+        if not report:
+            return jsonify({"success": False, "error": f"Report not found: {report_id}"}), 404
+        return jsonify({"success": True, "data": report.golden_trail or {}})
+    except Exception as e:
+        logger.error(f"Failed to get golden trail: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @report_bp.route('/<report_id>/sections', methods=['GET'])

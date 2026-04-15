@@ -49,21 +49,108 @@ else:
 
 import re
 
+from action_logger import PlatformActionLogger
+
+
+# 动作过滤列表（不需要记录的动作）
+FILTERED_ACTIONS = {'refresh', 'sign_up'}
+
+# 动作类型映射表（数据库中的名称 -> 标准名称）
+ACTION_TYPE_MAP = {
+    'create_post': 'CREATE_POST',
+    'like_post': 'LIKE_POST',
+    'dislike_post': 'DISLIKE_POST',
+    'repost': 'REPOST',
+    'quote_post': 'QUOTE_POST',
+    'follow': 'FOLLOW',
+    'mute': 'MUTE',
+    'create_comment': 'CREATE_COMMENT',
+    'like_comment': 'LIKE_COMMENT',
+    'dislike_comment': 'DISLIKE_COMMENT',
+    'search_posts': 'SEARCH_POSTS',
+    'search_user': 'SEARCH_USER',
+    'trend': 'TREND',
+    'do_nothing': 'DO_NOTHING',
+    'interview': 'INTERVIEW',
+}
+
+
+def _get_agent_names_from_config(config: Dict[str, Any]) -> Dict[int, str]:
+    """从配置中获取 agent_id -> entity_name 映射"""
+    agent_names: Dict[int, str] = {}
+    for agent_config in config.get("agent_configs", []):
+        agent_id = agent_config.get("agent_id")
+        entity_name = agent_config.get("entity_name", f"Agent_{agent_id}")
+        if agent_id is not None:
+            agent_names[agent_id] = entity_name
+    return agent_names
+
+
+def _fetch_new_actions_from_db(
+    db_path: str,
+    last_rowid: int,
+    agent_names: Dict[int, str],
+) -> tuple:
+    """
+    从数据库中获取新的动作记录
+
+    Returns:
+        (actions_list, new_last_rowid)
+    """
+    actions: List[Dict[str, Any]] = []
+    new_last_rowid = last_rowid
+
+    if not os.path.exists(db_path):
+        return actions, new_last_rowid
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT rowid, user_id, action, info FROM trace WHERE rowid > ? ORDER BY rowid ASC",
+            (last_rowid,),
+        )
+        for rowid, user_id, action, info_json in cursor.fetchall():
+            new_last_rowid = rowid
+            if action in FILTERED_ACTIONS:
+                continue
+            try:
+                action_args = json.loads(info_json) if info_json else {}
+            except json.JSONDecodeError:
+                action_args = {}
+            simplified_args: Dict[str, Any] = {}
+            for key in ('content', 'post_id', 'comment_id', 'quoted_id',
+                        'new_post_id', 'follow_id', 'query', 'like_id', 'dislike_id'):
+                if key in action_args:
+                    simplified_args[key] = action_args[key]
+            action_type = ACTION_TYPE_MAP.get(action, action.upper())
+            actions.append({
+                'agent_id': user_id,
+                'agent_name': agent_names.get(user_id, f'Agent_{user_id}'),
+                'action_type': action_type,
+                'action_args': simplified_args,
+            })
+        conn.close()
+    except Exception as e:
+        print(f"读取数据库动作失败: {e}")
+
+    return actions, new_last_rowid
+
 
 class UnicodeFormatter(logging.Formatter):
     """自定义格式化器，将 Unicode 转义序列转换为可读字符"""
-    
+
     UNICODE_ESCAPE_PATTERN = re.compile(r'\\u([0-9a-fA-F]{4})')
-    
+
     def format(self, record):
         result = super().format(record)
-        
+
         def replace_unicode(match):
             try:
                 return chr(int(match.group(1), 16))
             except (ValueError, OverflowError):
                 return match.group(0)
-        
+
         return self.UNICODE_ESCAPE_PATTERN.sub(replace_unicode, result)
 
 
@@ -467,8 +554,8 @@ class RedditSimulationRunner:
         )
     
     def _get_active_agents_for_round(
-        self, 
-        env, 
+        self,
+        env,
         current_hour: int,
         round_num: int
     ) -> List:
@@ -477,17 +564,23 @@ class RedditSimulationRunner:
         """
         time_config = self.config.get("time_config", {})
         agent_configs = self.config.get("agent_configs", [])
-        
+
         base_min = time_config.get("agents_per_hour_min", 5)
         base_max = time_config.get("agents_per_hour_max", 20)
-        
-        peak_hours = time_config.get("peak_hours", [9, 10, 11, 14, 15, 20, 21, 22])
+
+        peak_hours = time_config.get("peak_hours", [19, 20, 21, 22])
         off_peak_hours = time_config.get("off_peak_hours", [0, 1, 2, 3, 4, 5])
-        
+        morning_hours = time_config.get("morning_hours", [6, 7, 8])
+        work_hours = time_config.get("work_hours", list(range(9, 19)))
+
         if current_hour in peak_hours:
             multiplier = time_config.get("peak_activity_multiplier", 1.5)
         elif current_hour in off_peak_hours:
-            multiplier = time_config.get("off_peak_activity_multiplier", 0.3)
+            multiplier = time_config.get("off_peak_activity_multiplier", 0.05)
+        elif current_hour in morning_hours:
+            multiplier = time_config.get("morning_activity_multiplier", 0.4)
+        elif current_hour in work_hours:
+            multiplier = time_config.get("work_activity_multiplier", 0.7)
         else:
             multiplier = 1.0
         
@@ -522,7 +615,7 @@ class RedditSimulationRunner:
     
     async def run(self, max_rounds: int = None):
         """运行Reddit模拟
-        
+
         Args:
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
         """
@@ -532,19 +625,19 @@ class RedditSimulationRunner:
         print(f"模拟ID: {self.config.get('simulation_id', 'unknown')}")
         print(f"等待命令模式: {'启用' if self.wait_for_commands else '禁用'}")
         print("=" * 60)
-        
+
         time_config = self.config.get("time_config", {})
         total_hours = time_config.get("total_simulation_hours", 72)
         minutes_per_round = time_config.get("minutes_per_round", 30)
         total_rounds = (total_hours * 60) // minutes_per_round
-        
+
         # 如果指定了最大轮数，则截断
         if max_rounds is not None and max_rounds > 0:
             original_rounds = total_rounds
             total_rounds = min(total_rounds, max_rounds)
             if total_rounds < original_rounds:
                 print(f"\n轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
-        
+
         print(f"\n模拟参数:")
         print(f"  - 总模拟时长: {total_hours}小时")
         print(f"  - 每轮时间: {minutes_per_round}分钟")
@@ -552,27 +645,38 @@ class RedditSimulationRunner:
         if max_rounds:
             print(f"  - 最大轮数限制: {max_rounds}")
         print(f"  - Agent数量: {len(self.config.get('agent_configs', []))}")
-        
+
+        # 创建动作日志记录器（写入 reddit/actions.jsonl 供后端监控读取）
+        action_logger = PlatformActionLogger("reddit", self.simulation_dir)
+
+        # 构建 agent_id -> entity_name 映射
+        agent_names = _get_agent_names_from_config(self.config)
+
         print("\n初始化LLM模型...")
         model = self._create_model()
-        
+
         print("加载Agent Profile...")
         profile_path = self._get_profile_path()
         if not os.path.exists(profile_path):
             print(f"错误: Profile文件不存在: {profile_path}")
             return
-        
+
         self.agent_graph = await generate_reddit_agent_graph(
             profile_path=profile_path,
             model=model,
             available_actions=self.AVAILABLE_ACTIONS,
         )
-        
+
+        # 补充 agent_names 中缺失的映射（使用 OASIS 默认名称）
+        for agent_id, agent in self.agent_graph.get_agents():
+            if agent_id not in agent_names:
+                agent_names[agent_id] = getattr(agent, 'name', f'Agent_{agent_id}')
+
         db_path = self._get_db_path()
         if os.path.exists(db_path):
             os.remove(db_path)
             print(f"已删除旧数据库: {db_path}")
-        
+
         print("创建OASIS环境...")
         self.env = oasis.make(
             agent_graph=self.agent_graph,
@@ -580,18 +684,28 @@ class RedditSimulationRunner:
             database_path=db_path,
             semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
         )
-        
+
         await self.env.reset()
         print("环境初始化完成\n")
-        
+
         # 初始化IPC处理器
         self.ipc_handler = IPCHandler(self.simulation_dir, self.env, self.agent_graph)
         self.ipc_handler.update_status("running")
-        
+
+        # 记录模拟开始
+        action_logger.log_simulation_start(self.config)
+
+        total_actions = 0
+        last_rowid = 0  # 跟踪数据库中最后处理的行号
+
         # 执行初始事件
         event_config = self.config.get("event_config", {})
         initial_posts = event_config.get("initial_posts", [])
-        
+
+        # 记录 round 0 开始（初始事件阶段）
+        action_logger.log_round_start(0, 0)
+
+        initial_action_count = 0
         if initial_posts:
             print(f"执行初始事件 ({len(initial_posts)}条初始帖子)...")
             initial_actions = {}
@@ -612,36 +726,80 @@ class RedditSimulationRunner:
                             action_type=ActionType.CREATE_POST,
                             action_args={"content": content}
                         )
+                    action_logger.log_action(
+                        round_num=0,
+                        agent_id=agent_id,
+                        agent_name=agent_names.get(agent_id, f"Agent_{agent_id}"),
+                        action_type="CREATE_POST",
+                        action_args={"content": content},
+                    )
+                    total_actions += 1
+                    initial_action_count += 1
                 except Exception as e:
                     print(f"  警告: 无法为Agent {agent_id}创建初始帖子: {e}")
-            
+
             if initial_actions:
                 await self.env.step(initial_actions)
                 print(f"  已发布 {len(initial_actions)} 条初始帖子")
-        
+
+        # 记录 round 0 结束
+        action_logger.log_round_end(0, initial_action_count)
+
         # 主模拟循环
         print("\n开始模拟循环...")
         start_time = datetime.now()
-        
+        start_hour = time_config.get("start_hour", 9)
+
         for round_num in range(total_rounds):
+            # 检查是否收到退出信号
+            if _shutdown_event and _shutdown_event.is_set():
+                print(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
+                break
+
             simulated_minutes = round_num * minutes_per_round
-            simulated_hour = (simulated_minutes // 60) % 24
-            simulated_day = simulated_minutes // (60 * 24) + 1
-            
+            simulated_hour = (start_hour + simulated_minutes // 60) % 24
+            simulated_day = (start_hour * 60 + simulated_minutes) // (60 * 24) + 1
+            simulated_total_hours = simulated_minutes // 60
+
             active_agents = self._get_active_agents_for_round(
                 self.env, simulated_hour, round_num
             )
-            
+
+            # 记录 round 开始（无论是否有活跃 agent）
+            action_logger.log_round_start(round_num + 1, simulated_hour)
+
             if not active_agents:
+                # 没有活跃 agent 时也记录 round 结束
+                action_logger.log_round_end(round_num + 1, 0, simulated_hours=simulated_total_hours)
                 continue
-            
+
             actions = {
                 agent: LLMAction()
                 for _, agent in active_agents
             }
-            
+
             await self.env.step(actions)
-            
+
+            # 从数据库获取实际执行的动作并记录
+            actual_actions, last_rowid = _fetch_new_actions_from_db(
+                db_path, last_rowid, agent_names
+            )
+
+            round_action_count = 0
+            for action_data in actual_actions:
+                action_logger.log_action(
+                    round_num=round_num + 1,
+                    agent_id=action_data['agent_id'],
+                    agent_name=action_data['agent_name'],
+                    action_type=action_data['action_type'],
+                    action_args=action_data['action_args'],
+                )
+                total_actions += 1
+                round_action_count += 1
+
+            # 记录 round 结束
+            action_logger.log_round_end(round_num + 1, round_action_count, simulated_hours=simulated_total_hours)
+
             if (round_num + 1) % 10 == 0 or round_num == 0:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 progress = (round_num + 1) / total_rounds * 100
@@ -649,10 +807,14 @@ class RedditSimulationRunner:
                       f"Round {round_num + 1}/{total_rounds} ({progress:.1f}%) "
                       f"- {len(active_agents)} agents active "
                       f"- elapsed: {elapsed:.1f}s")
-        
+
+        # 记录模拟结束
+        action_logger.log_simulation_end(total_rounds, total_actions)
+
         total_elapsed = (datetime.now() - start_time).total_seconds()
         print(f"\n模拟循环完成!")
         print(f"  - 总耗时: {total_elapsed:.1f}秒")
+        print(f"  - 总动作数: {total_actions}")
         print(f"  - 数据库: {db_path}")
         
         # 是否进入等待命令模式

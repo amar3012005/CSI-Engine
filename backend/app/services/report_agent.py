@@ -10,6 +10,7 @@ Report Agent服务
 """
 
 import os
+import re
 import json
 import time
 import re
@@ -384,6 +385,14 @@ class ReportConsoleLogger:
         """析构时确保关闭文件处理器"""
         self.close()
 
+    def log_tool_call(self, tool_name: str, parameters: Dict[str, Any]) -> None:
+        """记录工具调用到控制台风格日志。"""
+        logger.info("执行工具: %s, 参数: %s", tool_name, parameters)
+
+    def log_tool_result(self, tool_name: str, result: str) -> None:
+        """记录工具返回结果摘要到控制台风格日志。"""
+        logger.info("工具 %s 执行完成，结果长度: %s", tool_name, len(result or ""))
+
 
 class ReportStatus(str, Enum):
     """报告状态"""
@@ -399,6 +408,13 @@ class ReportSection:
     """报告章节"""
     title: str
     content: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ReportSection":
+        return cls(
+            title=str(data.get("title", "")).strip(),
+            content=str(data.get("content", data.get("description", ""))).strip(),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -420,6 +436,20 @@ class ReportOutline:
     title: str
     summary: str
     sections: List[ReportSection]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ReportOutline":
+        sections_data = data.get("sections", []) or []
+        sections = [
+            ReportSection.from_dict(section)
+            for section in sections_data
+            if isinstance(section, dict) and str(section.get("title", "")).strip()
+        ]
+        return cls(
+            title=str(data.get("title", "")).strip(),
+            summary=str(data.get("summary", "")).strip(),
+            sections=sections,
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -447,9 +477,12 @@ class Report:
     status: ReportStatus
     outline: Optional[ReportOutline] = None
     markdown_content: str = ""
+    report_type: str = "standard"
     created_at: str = ""
     completed_at: str = ""
     error: Optional[str] = None
+    # Golden Evidence Trail: claim/trial IDs cited during report generation
+    golden_trail: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -460,9 +493,11 @@ class Report:
             "status": self.status.value,
             "outline": self.outline.to_dict() if self.outline else None,
             "markdown_content": self.markdown_content,
+            "report_type": self.report_type,
             "created_at": self.created_at,
             "completed_at": self.completed_at,
-            "error": self.error
+            "error": self.error,
+            "golden_trail": self.golden_trail or {}
         }
 
 
@@ -546,249 +581,236 @@ TOOL_DESC_INTERVIEW_AGENTS = """\
 
 【重要】需要OASIS模拟环境正在运行才能使用此功能！"""
 
+REPORT_WRITING_STYLE_GUIDE = """\
+## Writing quality bar
+- Write like a sharp human analyst, not a generic assistant or marketing model
+- Preserve meaning and evidence density, but make the prose sound lived-in and deliberate
+- Vary sentence length and rhythm naturally; avoid uniformly polished paragraph cadence
+- Use specific claims, sources, dates, actors, and mechanisms instead of vague abstractions
+- Acknowledge uncertainty when the evidence is mixed or contested
+- Use simple constructions when they are clearer: is, are, has, shows, found
+
+## Patterns to avoid
+- Inflated significance: pivotal moment, vital role, enduring testament, broader landscape, key turning point
+- Superficial -ing clauses: highlighting, underscoring, showcasing, fostering, contributing to
+- Promotional tone: vibrant, groundbreaking, rich heritage, profound, seamless, powerful
+- Vague attribution: experts say, observers noted, industry reports, some critics argue
+- Copula avoidance: serves as, stands as, marks, represents, boasts, features heavily
+- Mechanical rhetoric: rule-of-three lists, not just X but Y, at its core, the real question is
+- Tutorial signposting: let's dive in, here's what you need to know, now let's explore
+- Generic upbeat endings and filler phrases
+- Em dash overuse, boldface abuse, and title-case headline style
+
+## Final pass before responding
+- Silently ask: what still sounds obviously AI-generated here?
+- Revise those lines before you answer
+- Only revise narrative prose; do not remove or rewrite required citation brackets, artifact IDs, verdict labels, confidence fields, or the literal Final Answer control phrase
+- Do not mention this audit in the output
+"""
+
+REPORT_CONSUMER_RESEARCH_GUIDE = """\
+## Consumer-level research discipline
+- Cover the whole question, not just the most obvious angle
+- Include mainstream findings, dissenting views, and unresolved gaps when they matter
+- Prefer practical implications, comparisons, timelines, and concrete examples over abstract framing
+- Treat shallow-but-relevant evidence as a lead to deepen, not as finished evidence
+- Preserve unique details from tool results instead of flattening them into generic summary language
+- Make it clear what a non-expert reader should take away from each section
+
+## Perspective expansion to use when relevant
+- Comparative view: alternatives, trade-offs, who is stronger or weaker and why
+- Timeline view: what changed over time, what is new, what appears durable
+- Risk view: what could fail, what remains uncertain, what evidence is missing
+- Public response view: how different stakeholders or communities interpret the issue
+- Technical detail view: exact claims, parameters, mechanisms, and source-backed specifics
+"""
+
 # ── 大纲规划 prompt ──
 
 PLAN_SYSTEM_PROMPT = """\
-你是一个「未来预测报告」的撰写专家，拥有对模拟世界的「上帝视角」——你可以洞察模拟中每一位Agent的行为、言论和互动。
+You are a senior analyst composing an authoritative **Deep Research Report** powered by Cognitive Swarm Intelligence (CSI).
 
-【核心理念】
-我们构建了一个模拟世界，并向其中注入了特定的「模拟需求」作为变量。模拟世界的演化结果，就是对未来可能发生情况的预测。你正在观察的不是"实验数据"，而是"未来的预演"。
+You have a god-level view of a multi-agent simulation whose swarm of specialist nodes conducted
+systematic web research, proposed claims, engaged in peer review, and reached emergent consensus —
+mirroring the AgentScope Deep Research architecture of Task Decomposition + Deep Search + Self-Reflection + Synthesis.
 
-【你的任务】
-撰写一份「未来预测报告」，回答：
-1. 在我们设定的条件下，未来发生了什么？
-2. 各类Agent（人群）是如何反应和行动？
-3. 这个模拟揭示了哪些值得关注的未来趋势和风险？
+## Role
+- Evidence-first: every section must be anchored in peer-reviewed CSI Claims, Trials, and Source provenance
+- Structured like an analytical intelligence brief, NOT a social media digest
+- 4 to 6 sections; each section title is a crisp analytical headline
+- Summary = one sharp thesis sentence capturing the core CSI swarm finding
 
-【报告定位】
-- ✅ 这是一份基于模拟的未来预测报告，揭示"如果这样，未来会怎样"
-- ✅ 聚焦于预测结果：事件走向、群体反应、涌现现象、潜在风险
-- ✅ 模拟世界中的Agent言行就是对未来人群行为的预测
-- ❌ 不是对现实世界现状的分析
-- ❌ 不是泛泛而谈的舆情综述
+{writing_style_guide}
+ 
+ {consumer_research_guide}
 
-【章节数量限制】
-- 最少2个章节，最多5个章节
-- 不需要子章节，每个章节直接撰写完整内容
-- 内容要精炼，聚焦于核心预测发现
-- 章节结构由你根据预测结果自主设计
+## Outline writing rules
+- Section titles must be specific, restrained, and in sentence case
+- Avoid inflated or cinematic headings like "A pivotal moment", "The evolving landscape", or "Future outlook"
+- Prefer concrete analytical frames such as evidence gaps, consensus patterns, contradictory claims, causal drivers, source provenance, institutional response
+- The summary sentence should sound like a human analyst wrote it, not a press release
+ - Design sections that would be useful to a smart non-expert reader, not just an internal researcher
+ - Make room for at least one section that handles contradiction, uncertainty, comparison, or practical implications when the evidence supports it
 
-请输出JSON格式的报告大纲，格式如下：
-{
-    "title": "报告标题",
-    "summary": "报告摘要（一句话概括核心预测发现）",
+## Recommended Section Types:
+1. **State of the Simulation Landscape** — scope, agents, sources ingested, evidence density
+2. **Agent Dynamics and Knowledge Construction** — search strategy, claim proposal, debate, revision
+3. **Emergent Consensus** — high-confidence findings independently endorsed by multiple agents
+4. **Divergent Narratives & Contradictions** — contested claims, agent disagreements, unresolved disputes
+5. **Evidence Trail & Source Provenance** — tracing key claims back to web sources with citation IDs
+6. **Risk Assessment & Future Trends** — structured risk taxonomy with prevention/mitigation strategies
+
+Output JSON in EXACTLY this format:
+{{
+    "title": "Deep Research Report: Cognitive Swarm Intelligence Analysis of <Topic>",
+    "summary": "One-sentence thesis capturing the core CSI finding",
     "sections": [
-        {
-            "title": "章节标题",
-            "description": "章节内容描述"
-        }
+        {{
+            "title": "Section headline",
+            "description": "What this section covers and which CSI tools to prioritize"
+        }}
     ]
-}
+}}
 
-注意：sections数组最少2个，最多5个元素！"""
+IMPORTANT: sections must be 4 to 6 elements. Fewer than 4 is insufficient depth."""
 
 PLAN_USER_PROMPT_TEMPLATE = """\
-【预测场景设定】
-我们向模拟世界注入的变量（模拟需求）：{simulation_requirement}
+## Research Objective
+{simulation_requirement}
 
-【模拟世界规模】
-- 参与模拟的实体数量: {total_nodes}
-- 实体间产生的关系数量: {total_edges}
-- 实体类型分布: {entity_types}
-- 活跃Agent数量: {total_entities}
+## Simulation Scale (CSI Swarm Parameters)
+- Total entities in simulation graph: {total_nodes}
+- Total relationship / knowledge edges: {total_edges}
+- Entity type distribution: {entity_types}
+- Active specialist agent nodes: {total_entities}
 
-【模拟预测到的部分未来事实样本】
+## Sample CSI Claims (partial — from the swarm's research output)
 {related_facts_json}
 
-请以「上帝视角」审视这个未来预演：
-1. 在我们设定的条件下，未来呈现出了什么样的状态？
-2. 各类人群（Agent）是如何反应和行动的？
-3. 这个模拟揭示了哪些值得关注的未来趋势？
+## Your Task
+Design the optimal analytical outline for this Deep Research Report. Consider:
+1. What core knowledge and event chains did the CSI swarm uncover?
+2. Where did agents reach high-confidence consensus vs. contested disagreement?
+3. What structured risk taxonomy and future trend analysis would be most valuable?
 
-根据预测结果，设计最合适的报告章节结构。
-
-【再次提醒】报告章节数量：最少2个，最多5个，内容要精炼聚焦于核心预测发现。"""
+REMINDER: You MUST output 4 to 6 sections. Fewer is insufficient depth."""
 
 # ── 章节生成 prompt ──
 
 SECTION_SYSTEM_PROMPT_TEMPLATE = """\
-你是一个「未来预测报告」的撰写专家，正在撰写报告的一个章节。
+You are a senior analyst writing one section of an authoritative **Deep Research Report** powered by Cognitive Swarm Intelligence (CSI).
 
-报告标题: {report_title}
-报告摘要: {report_summary}
-预测场景（模拟需求）: {simulation_requirement}
-
-当前要撰写的章节: {section_title}
-
-═══════════════════════════════════════════════════════════════
-【核心理念】
-═══════════════════════════════════════════════════════════════
-
-模拟世界是对未来的预演。我们向模拟世界注入了特定条件（模拟需求），
-模拟中Agent的行为和互动，就是对未来人群行为的预测。
-
-你的任务是：
-- 揭示在设定条件下，未来发生了什么
-- 预测各类人群（Agent）是如何反应和行动的
-- 发现值得关注的未来趋势、风险和机会
-
-❌ 不要写成对现实世界现状的分析
-✅ 要聚焦于"未来会怎样"——模拟结果就是预测的未来
+Report: {report_title}
+Summary: {report_summary}
+Research Objective: {simulation_requirement}
+Current Section: {section_title}
 
 ═══════════════════════════════════════════════════════════════
-【最重要的规则 - 必须遵守】
+## CORE PRINCIPLE
 ═══════════════════════════════════════════════════════════════
 
-1. 【必须调用工具观察模拟世界】
-   - 你正在以「上帝视角」观察未来的预演
-   - 所有内容必须来自模拟世界中发生的事件和Agent言行
-   - 禁止使用你自己的知识来编写报告内容
-   - 每个章节至少调用3次工具（最多5次）来观察模拟的世界，它代表了未来
+This report is generated from a Cognitive Swarm Intelligence (CSI) simulation.
+A swarm of specialized expert nodes performed deep web research, proposed evidence-grounded claims,
+conducted peer review trials, and formed emergent consensus — identical to the AgentScope Deep Research pipeline.
 
-2. 【必须引用Agent的原始言行】
-   - Agent的发言和行为是对未来人群行为的预测
-   - 在报告中使用引用格式展示这些预测，例如：
-     > "某类人群会表示：原文内容..."
-   - 这些引用是模拟预测的核心证据
+Your task:
+- Extract and synthesize the swarm's most valuable findings for this section
+- Cite specific Claim IDs, Trial verdicts, and source provenance — making findings 100% traceable
+- Write at the quality bar of a professional analytical intelligence report
 
-3. 【语言一致性 - 引用内容必须翻译为报告语言】
-   - 工具返回的内容可能包含英文或中英文混杂的表述
-   - 如果模拟需求和材料原文是中文的，报告必须全部使用中文撰写
-   - 当你引用工具返回的英文或中英混杂内容时，必须将其翻译为流畅的中文后再写入报告
-   - 翻译时保持原意不变，确保表述自然通顺
-   - 这一规则同时适用于正文和引用块（> 格式）中的内容
+❌ Do NOT write like a news broadcast or social media digest
+✅ Write like: a McKinsey research brief, an intelligence assessment, or a systematic review
 
-4. 【忠实呈现预测结果】
-   - 报告内容必须反映模拟世界中的代表未来的模拟结果
-   - 不要添加模拟中不存在的信息
-   - 如果某方面信息不足，如实说明
+{writing_style_guide}
+ 
+ {consumer_research_guide}
 
 ═══════════════════════════════════════════════════════════════
-【⚠️ 格式规范 - 极其重要！】
+## MANDATORY RULES
 ═══════════════════════════════════════════════════════════════
 
-【一个章节 = 最小内容单位】
-- 每个章节是报告的最小分块单位
-- ❌ 禁止在章节内使用任何 Markdown 标题（#、##、###、#### 等）
-- ❌ 禁止在内容开头添加章节主标题
-- ✅ 章节标题由系统自动添加，你只需撰写纯正文内容
-- ✅ 使用**粗体**、段落分隔、引用、列表来组织内容，但不要用标题
+1. **MUST call CSI tools 3-5 times per section** to retrieve verified swarm findings
+   - Prioritize: query_claims, query_consensus, query_contradictions, trace_provenance
+   - All content must come from tool results — no fabrication
 
-【正确示例】
-```
-本章节分析了事件的舆论传播态势。通过对模拟数据的深入分析，我们发现...
+2. **MUST cite artifact IDs inline**
+   - Format: `[Claim: csi_claim_XXXX | confidence: 0.92]` after each cited finding
+   - Format: `[Trial: trial_XXXX | verdict: supports]` for peer review evidence
+   - This creates the golden evidence trail for graph visualization
+    - These bracketed citations are machine-readable. Keep the format exact and do not "humanize" them.
 
-**首发引爆阶段**
+3. **MUST include structured analysis elements:**
+   - **Key Finding** boxes for high-confidence consensus items
+   - Blockquote citations for direct agent claim text: > "claim text..." — [Agent: Name | Claim ID]
+   - Risk items formatted as numbered lists with severity labels when in Risk sections
+   - Evidence provenance section at the end: "This finding is supported by N sources, traced via claim_id"
 
-微博作为舆情的第一现场，承担了信息首发的核心功能：
+4. **Language**: Write in the language of the research objective. Keep technical IDs (claim_id, trial_id) in English.
 
-> "微博贡献了68%的首发声量..."
+5. **High information density**: Every paragraph must add new factual content — no padding
 
-**情绪放大阶段**
-
-抖音平台进一步放大了事件影响力：
-
-- 视觉冲击力强
-- 情绪共鸣度高
-```
-
-【错误示例】
-```
-## 执行摘要          ← 错误！不要添加任何标题
-### 一、首发阶段     ← 错误！不要用###分小节
-#### 1.1 详细分析   ← 错误！不要用####细分
-
-本章节分析了...
-```
-
-═══════════════════════════════════════════════════════════════
-【可用检索工具】（每章节调用3-5次）
-═══════════════════════════════════════════════════════════════
-
-{tools_description}
-
-【工具使用建议 - 请混合使用不同工具，不要只用一种】
-- insight_forge: 深度洞察分析，自动分解问题并多维度检索事实和关系
-- panorama_search: 广角全景搜索，了解事件全貌、时间线和演变过程
-- quick_search: 快速验证某个具体信息点
-- interview_agents: 采访模拟Agent，获取不同角色的第一人称观点和真实反应
+6. **Native prose quality**:
+    - Default to precise, direct sentences over dramatic framing
+    - Use first-person sparingly and only when it clarifies judgment in synthesis sections
+    - When evidence is contested, say so plainly instead of smoothing it into false consensus
+    - Avoid stock transition phrases and formulaic section closers
+ 
+ 7. **Consumer usefulness**:
+    - Do not stop at raw findings; explain what they mean in practical terms
+    - If one source hints at something important but remains shallow, retrieve more evidence before finalizing
+    - Preserve one-off but important details from tool results instead of compressing them away
+    - Compare competing interpretations when the simulation contains disagreement or mixed support
+    - If evidence is insufficient, say what is missing instead of padding with generic synthesis
 
 ═══════════════════════════════════════════════════════════════
-【工作流程】
+## FORMAT RULES
 ═══════════════════════════════════════════════════════════════
 
-每次回复你只能做以下两件事之一（不可同时做）：
-
-选项A - 调用工具：
-输出你的思考，然后用以下格式调用一个工具：
-<tool_call>
-{{"name": "工具名称", "parameters": {{"参数名": "参数值"}}}}
-</tool_call>
-系统会执行工具并把结果返回给你。你不需要也不能自己编写工具返回结果。
-
-选项B - 输出最终内容：
-当你已通过工具获取了足够信息，以 "Final Answer:" 开头输出章节内容。
-
-⚠️ 严格禁止：
-- 禁止在一次回复中同时包含工具调用和 Final Answer
-- 禁止自己编造工具返回结果（Observation），所有工具结果由系统注入
-- 每次回复最多调用一个工具
+- NO markdown headings (#, ##, ###) — section title is added by system
+- USE **bold**, blockquotes (>), numbered/bullet lists, horizontal rules (---) to organize
+- Each section should be 400-800 words of dense, analytical prose
+- End each section with: "**Evidence Trail**: N claims cited | M trials referenced | K sources"
 
 ═══════════════════════════════════════════════════════════════
-【章节内容要求】
+## PREVIOUS SECTIONS (context)
 ═══════════════════════════════════════════════════════════════
-
-1. 内容必须基于工具检索到的模拟数据
-2. 大量引用原文来展示模拟效果
-3. 使用Markdown格式（但禁止使用标题）：
-   - 使用 **粗体文字** 标记重点（代替子标题）
-   - 使用列表（-或1.2.3.）组织要点
-   - 使用空行分隔不同段落
-   - ❌ 禁止使用 #、##、###、#### 等任何标题语法
-4. 【引用格式规范 - 必须单独成段】
-   引用必须独立成段，前后各有一个空行，不能混在段落中：
-
-   ✅ 正确格式：
-   ```
-   校方的回应被认为缺乏实质内容。
-
-   > "校方的应对模式在瞬息万变的社交媒体环境中显得僵化和迟缓。"
-
-   这一评价反映了公众的普遍不满。
-   ```
-
-   ❌ 错误格式：
-   ```
-   校方的回应被认为缺乏实质内容。> "校方的应对模式..." 这一评价反映了...
-   ```
-5. 保持与其他章节的逻辑连贯性
-6. 【避免重复】仔细阅读下方已完成的章节内容，不要重复描述相同的信息
-7. 【再次强调】不要添加任何标题！用**粗体**代替小节标题"""
-
-SECTION_USER_PROMPT_TEMPLATE = """\
-已完成的章节内容（请仔细阅读，避免重复）：
 {previous_content}
 
 ═══════════════════════════════════════════════════════════════
-【当前任务】撰写章节: {section_title}
+## AVAILABLE CSI TOOLS
+═══════════════════════════════════════════════════════════════
+{tools_description}
+
+**Priority order**: query_consensus → query_claims → query_contradictions → trace_provenance → query_trials
+
+═══════════════════════════════════════════════════════════════
+## WORKFLOW
 ═══════════════════════════════════════════════════════════════
 
-【重要提醒】
-1. 仔细阅读上方已完成的章节，避免重复相同的内容！
-2. 开始前必须先调用工具获取模拟数据
-3. 请混合使用不同工具，不要只用一种
-4. 报告内容必须来自检索结果，不要使用自己的知识
+Each reply must do ONLY ONE of:
 
-【⚠️ 格式警告 - 必须遵守】
-- ❌ 不要写任何标题（#、##、###、####都不行）
-- ❌ 不要写"{section_title}"作为开头
-- ✅ 章节标题由系统自动添加
-- ✅ 直接写正文，用**粗体**代替小节标题
+Option A — Call a tool:
+<execute_tool>
+{{"name": "tool_name", "parameters": {{"param": "value"}}}}
+</execute_tool>
 
-请开始：
-1. 首先思考（Thought）这个章节需要什么信息
-2. 然后调用工具（Action）获取模拟数据
-3. 收集足够信息后输出 Final Answer（纯正文，无任何标题）"""
+Option B — Output final content (when you have enough evidence):
+Start with "Final Answer:" then write the section content.
+
+⚠️ NEVER mix tool calls and Final Answer in the same reply.
+⚠️ NEVER fabricate tool results.
+⚠️ Before any Final Answer, do one silent anti-AI pass and revise only the prose around the evidence.
+⚠️ Keep `Final Answer:` exactly as written when you are done gathering evidence.
+═══════════════════════════════════════════════════════════════"""
+
+SECTION_USER_PROMPT_TEMPLATE = """\
+Write the section: **{section_title}**
+
+Previous sections:
+{previous_content}
+
+Ground every claim in CSI tool results. Include inline citations [Claim: ID | confidence: X.XX].
+End with the Evidence Trail summary line."""
 
 # ── ReACT 循环内消息模板 ──
 
@@ -800,6 +822,8 @@ Observation（检索结果）:
 
 ═══════════════════════════════════════════════════════════════
 已调用工具 {tool_calls_count}/{max_tool_calls} 次（已用: {used_tools_str}）{unused_hint}
+- 如果当前结果与章节目标高度相关，但信息仍然偏浅、只给出线索、缺少细节或缺少对立证据，请继续调用工具深入，而不是用泛化语言补齐
+- 如果当前结果已经足够支撑一个明确发现，请输出 Final Answer，并保留具体细节、来源和分歧点
 - 如果信息充分：以 "Final Answer:" 开头输出章节内容（必须引用上述原文）
 - 如果需要更多信息：调用一个工具继续检索
 ═══════════════════════════════════════════════════════════════"""
@@ -844,9 +868,9 @@ CHAT_SYSTEM_PROMPT_TEMPLATE = """\
 {tools_description}
 
 【工具调用格式】
-<tool_call>
+<execute_tool>
 {{"name": "工具名称", "parameters": {{"参数名": "参数值"}}}}
-</tool_call>
+</execute_tool>
 
 【回答风格】
 - 简洁直接，不要长篇大论
@@ -871,7 +895,27 @@ class ReportAgent:
     3. 反思阶段：检查内容完整性和准确性
     """
     
-    # 最大工具调用次数（每个章节）
+    # ── Golden Evidence Trail helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _extract_artifact_ids(text: str) -> Dict[str, List[str]]:
+        """Extract CSI artifact IDs referenced in the generated text.
+
+        Matches patterns like:
+          csi_claim_XXXX, claim_id, trial_XXXX,
+          csi_source_web_XXXX, source_id
+        Returns dict with keys: claim_ids, trial_ids, source_ids
+        """
+        claim_ids = list(set(re.findall(r'csi_claim_[a-zA-Z0-9_]+', text)))
+        trial_ids = list(set(re.findall(r'(?:trial_|csi_trial_)[a-zA-Z0-9_]+', text)))
+        source_ids = list(set(re.findall(r'csi_source_(?:web_|)[a-zA-Z0-9_]+', text)))
+        return {
+            "claim_ids": claim_ids,
+            "trial_ids": trial_ids,
+            "source_ids": source_ids,
+        }
+
+    # Comms / constants
     MAX_TOOL_CALLS_PER_SECTION = 5
     
     # 最大反思轮数
@@ -902,7 +946,7 @@ class ReportAgent:
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
         
-        self.llm = llm_client or LLMClient()
+        self.llm = llm_client or LLMClient(usage_scope=self.simulation_id)
         self.zep_tools = zep_tools or ZepToolsService()
         
         # 工具定义
@@ -916,33 +960,53 @@ class ReportAgent:
         logger.info(f"ReportAgent 初始化完成: graph_id={graph_id}, simulation_id={simulation_id}")
     
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
-        """定义可用工具"""
-        return {
-            "insight_forge": {
+        """定义可用工具。
+
+        When Zep is disabled (local-only mode), the graph search tools
+        (insight_forge, panorama_search, quick_search) return empty results.
+        In that case we only expose the CSI store tools so the LLM doesn't
+        waste iterations on empty searches.
+        """
+        # Check if CSI artifacts exist for this simulation
+        has_csi = False
+        try:
+            from .simulation_csi_local import SimulationCSILocalStore
+            _store = SimulationCSILocalStore()
+            has_csi = _store.has_artifacts(self.simulation_id)
+        except Exception:
+            pass
+
+        zep_enabled = getattr(self.zep_tools, '_zep_enabled', True)
+
+        tools: Dict[str, Dict[str, Any]] = {}
+
+        # Only include graph search tools when Zep is enabled OR no CSI artifacts
+        if zep_enabled or not has_csi:
+            tools["insight_forge"] = {
                 "name": "insight_forge",
                 "description": TOOL_DESC_INSIGHT_FORGE,
                 "parameters": {
                     "query": "你想深入分析的问题或话题",
                     "report_context": "当前报告章节的上下文（可选，有助于生成更精准的子问题）"
                 }
-            },
-            "panorama_search": {
+            }
+            tools["panorama_search"] = {
                 "name": "panorama_search",
                 "description": TOOL_DESC_PANORAMA_SEARCH,
                 "parameters": {
                     "query": "搜索查询，用于相关性排序",
                     "include_expired": "是否包含过期/历史内容（默认True）"
                 }
-            },
-            "quick_search": {
+            }
+            tools["quick_search"] = {
                 "name": "quick_search",
                 "description": TOOL_DESC_QUICK_SEARCH,
                 "parameters": {
                     "query": "搜索查询字符串",
                     "limit": "返回结果数量（可选，默认10）"
                 }
-            },
-            "interview_agents": {
+            }
+            tools["interview_agents"] = {
                 "name": "interview_agents",
                 "description": TOOL_DESC_INTERVIEW_AGENTS,
                 "parameters": {
@@ -950,7 +1014,63 @@ class ReportAgent:
                     "max_agents": "最多采访的Agent数量（可选，默认5，最大10）"
                 }
             }
+        # CSI store tools — always available
+        tools["query_claims"] = {
+            "name": "query_claims",
+            "description": (
+                "Search claims produced by simulation agents. Claims are evidence-grounded "
+                "findings proposed, peer-reviewed, and revised during the simulation. "
+                "Filter by status (proposed/revised/synthesized), minimum confidence, or specific agent."
+            ),
+            "parameters": {
+                "status": "Filter by claim status: proposed, revised, synthesized (optional)",
+                "min_confidence": "Minimum confidence threshold 0.0-1.0 (optional, default 0.0)",
+                "agent_name": "Filter by specific agent name (optional)",
+                "limit": "Max results (optional, default 20)"
+            }
         }
+        tools["query_trials"] = {
+            "name": "query_trials",
+            "description": (
+                "Search peer review trials where agents evaluated each other's claims. "
+                "Each trial has a verdict (supports/contradicts/needs_revision) with reasoning."
+            ),
+            "parameters": {
+                "verdict": "Filter by verdict: supports, contradicts, needs_revision (optional)",
+                "claim_id": "Get trials for a specific claim (optional)",
+                "limit": "Max results (optional, default 20)"
+            }
+        }
+        tools["query_consensus"] = {
+            "name": "query_consensus",
+            "description": (
+                "Find high-confidence findings — claims that multiple agents independently "
+                "endorsed. These are the strongest conclusions from the simulation."
+            ),
+            "parameters": {
+                "min_supporting_trials": "Minimum number of supporting trials (default 2)"
+            }
+        }
+        tools["query_contradictions"] = {
+            "name": "query_contradictions",
+            "description": (
+                "Find contested points — claim pairs where agents disagreed. "
+                "Important for balanced reporting."
+            ),
+            "parameters": {}
+        }
+        tools["trace_provenance"] = {
+            "name": "trace_provenance",
+            "description": (
+                "Trace a specific claim back to its source evidence, peer reviews, and "
+                "revision history. Use for deep-dive into a specific finding."
+            ),
+            "parameters": {
+                "claim_id": "The claim ID to trace"
+            }
+        }
+
+        return tools
     
     def _execute_tool(self, tool_name: str, parameters: Dict[str, Any], report_context: str = "") -> str:
         """
@@ -1019,6 +1139,44 @@ class ReportAgent:
                 )
                 return result.to_text()
             
+            # ========== CSI local store tools ==========
+
+            elif tool_name == "query_claims":
+                return self.zep_tools.query_csi_claims(
+                    simulation_id=self.simulation_id,
+                    status=parameters.get("status"),
+                    min_confidence=float(parameters.get("min_confidence", 0.0)),
+                    agent_name=parameters.get("agent_name"),
+                    limit=int(parameters.get("limit", 20)),
+                )
+
+            elif tool_name == "query_trials":
+                return self.zep_tools.query_csi_trials(
+                    simulation_id=self.simulation_id,
+                    verdict=parameters.get("verdict"),
+                    claim_id=parameters.get("claim_id"),
+                    limit=int(parameters.get("limit", 20)),
+                )
+
+            elif tool_name == "query_consensus":
+                min_trials = int(parameters.get("min_supporting_trials", 2))
+                return self.zep_tools.query_csi_consensus(
+                    simulation_id=self.simulation_id,
+                    min_supporting_trials=min_trials,
+                )
+
+            elif tool_name == "query_contradictions":
+                return self.zep_tools.query_csi_contradictions(
+                    simulation_id=self.simulation_id,
+                )
+
+            elif tool_name == "trace_provenance":
+                claim_id = parameters.get("claim_id", "")
+                return self.zep_tools.trace_csi_provenance(
+                    simulation_id=self.simulation_id,
+                    claim_id=claim_id,
+                )
+
             # ========== 向后兼容的旧工具（内部重定向到新工具） ==========
             
             elif tool_name == "search_graph":
@@ -1054,38 +1212,92 @@ class ReportAgent:
                 return json.dumps(result, ensure_ascii=False, indent=2)
             
             else:
-                return f"未知工具: {tool_name}。请使用以下工具之一: insight_forge, panorama_search, quick_search"
+                return (
+                    f"未知工具: {tool_name}。请使用以下工具之一: "
+                    "insight_forge, panorama_search, quick_search, "
+                    "query_claims, query_trials, query_consensus, query_contradictions, trace_provenance"
+                )
                 
         except Exception as e:
             logger.error(f"工具执行失败: {tool_name}, 错误: {str(e)}")
-            return f"工具执行失败: {str(e)}"
-    
+            return (
+                f"工具 {tool_name} 执行失败: {str(e)}\n"
+                "请不要再调用此工具，直接根据你已有的信息输出 Final Answer。"
+            )
+
     # 合法的工具名称集合，用于裸 JSON 兜底解析时校验
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+    VALID_TOOL_NAMES = {
+        "insight_forge", "panorama_search", "quick_search", "interview_agents",
+        "query_claims", "query_trials", "query_consensus", "query_contradictions",
+        "trace_provenance",
+    }
+
+    def _normalize_tool_name(self, tool_name: Optional[str]) -> str:
+        """Normalize prefixed tool names emitted by providers/models."""
+        normalized = str(tool_name or "").strip()
+        if normalized.startswith("tool_"):
+            normalized = normalized.replace("tool_", "", 1)
+        for prefix in ("tool.", "repo."):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+        return normalized
+
+    def _extract_action_call_from_string(self, raw_arguments: str) -> Optional[Dict[str, Any]]:
+        """Parse textual native tool-call payloads such as assistant Action/Action Input."""
+        if not raw_arguments:
+            return None
+
+        action_match = re.search(r"Action:\s*([^\n\r]+)", raw_arguments)
+        if not action_match:
+            return None
+
+        tool_name = self._normalize_tool_name(action_match.group(1))
+        if tool_name not in self.VALID_TOOL_NAMES:
+            return None
+
+        parameters: Dict[str, Any] = {}
+        action_input_match = re.search(r"Action Input:\s*(\{[\s\S]*?\})", raw_arguments)
+        if action_input_match:
+            input_str = action_input_match.group(1).strip()
+            try:
+                parameters = json.loads(input_str)
+            except json.JSONDecodeError:
+                cleaned = input_str.split("</execute_tool>", 1)[0].strip()
+                cleaned = cleaned.rstrip("}\n\r\t ") + "}"
+                try:
+                    parameters = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    logger.warning("无法从字符串 Action Input 解析 JSON: %s", input_str)
+
+        return {
+            "name": tool_name,
+            "parameters": parameters,
+        }
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
         从LLM响应中解析工具调用
 
         支持的格式（按优先级）：
-        1. <tool_call>{"name": "tool_name", "parameters": {...}}</tool_call>
+        1. <execute_tool>{"name": "tool_name", "parameters": {...}}</execute_tool>
         2. 裸 JSON（响应整体或单行就是一个工具调用 JSON）
         """
         tool_calls = []
 
         # 格式1: XML风格（标准格式）
-        xml_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+        xml_pattern = r'<execute_tool>\s*(\{.*?\})\s*</execute_tool>'
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
                 call_data = json.loads(match.group(1))
-                tool_calls.append(call_data)
+                if self._is_valid_tool_call(call_data):
+                    tool_calls.append(call_data)
             except json.JSONDecodeError:
                 pass
 
         if tool_calls:
             return tool_calls
 
-        # 格式2: 兜底 - LLM 直接输出裸 JSON（没包 <tool_call> 标签）
+        # 格式2: 兜底 - LLM 直接输出裸 JSON（没包 <execute_tool> 标签）
         # 只在格式1未匹配时尝试，避免误匹配正文中的 JSON
         stripped = response.strip()
         if stripped.startswith('{') and stripped.endswith('}'):
@@ -1112,12 +1324,42 @@ class ReportAgent:
 
     def _is_valid_tool_call(self, data: dict) -> bool:
         """校验解析出的 JSON 是否是合法的工具调用"""
+        if not isinstance(data, dict):
+            return False
+
+        # Handle native tool call extraction format from LLMClient
+        if "arguments" in data and isinstance(data["arguments"], dict):
+            args = data["arguments"]
+            # case: {"name": "tool_call", "arguments": {"name":"...","parameters":{...}}}
+            if data.get("name") == "tool_call" and "name" in args:
+                data["name"] = args.get("name")
+                data["parameters"] = args.get("parameters", {})
+            # case: {"name": "tool_query_claims", "arguments": {"status":"...","min_confidence":...}}
+            elif str(data.get("name", "")).startswith("tool_"):
+                data["name"] = data["name"].replace("tool_", "", 1)
+                data["parameters"] = args
+            elif str(data.get("name", "")).startswith(("tool.", "repo.")):
+                data["name"] = self._normalize_tool_name(data.get("name"))
+                data["parameters"] = args
+            # case: {"name": "query_claims", "arguments": {"name":"query_claims","parameters":{...}}}
+            elif data.get("name") in self.VALID_TOOL_NAMES and "name" in args and "parameters" in args:
+                data["name"] = args["name"]
+                data["parameters"] = args["parameters"]
+            # case: {"name": "query_claims", "arguments": {"status":"...", ...}}
+            elif data.get("name") in self.VALID_TOOL_NAMES:
+                data["parameters"] = args
+        elif isinstance(data.get("arguments"), str):
+            extracted = self._extract_action_call_from_string(data["arguments"])
+            if extracted:
+                data.update(extracted)
+
         # 支持 {"name": ..., "parameters": ...} 和 {"tool": ..., "params": ...} 两种键名
-        tool_name = data.get("name") or data.get("tool")
+        tool_name = self._normalize_tool_name(data.get("name") or data.get("tool"))
         if tool_name and tool_name in self.VALID_TOOL_NAMES:
             # 统一键名为 name / parameters
             if "tool" in data:
-                data["name"] = data.pop("tool")
+                data.pop("tool")
+            data["name"] = tool_name
             if "params" in data and "parameters" not in data:
                 data["parameters"] = data.pop("params")
             return True
@@ -1158,11 +1400,18 @@ class ReportAgent:
             graph_id=self.graph_id,
             simulation_requirement=self.simulation_requirement
         )
-        
+
+        # Get CSI summary for claims/trials awareness during planning
+        csi_summary = self.zep_tools.get_csi_summary(self.simulation_id)
+
         if progress_callback:
             progress_callback("planning", 30, "正在生成报告大纲...")
-        
+
         system_prompt = PLAN_SYSTEM_PROMPT
+        system_prompt = system_prompt.format(
+            writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
+            consumer_research_guide=REPORT_CONSUMER_RESEARCH_GUIDE,
+        )
         user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
             simulation_requirement=self.simulation_requirement,
             total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
@@ -1171,6 +1420,10 @@ class ReportAgent:
             total_entities=context.get('total_entities', 0),
             related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
         )
+
+        # Append CSI summary so the LLM knows what claims/trials exist
+        if csi_summary and "No CSI artifacts" not in csi_summary:
+            user_prompt += f"\n\n【模拟CSI研究成果概览】\n{csi_summary}"
 
         try:
             response = self.llm.chat_json(
@@ -1206,12 +1459,13 @@ class ReportAgent:
             
         except Exception as e:
             logger.error(f"大纲规划失败: {str(e)}")
-            # 返回默认大纲（3个章节，作为fallback）
+            # 返回默认大纲（4个章节，作为fallback）
             return ReportOutline(
                 title="未来预测报告",
                 summary="基于模拟预测的未来趋势与风险分析",
                 sections=[
                     ReportSection(title="预测场景与核心发现"),
+                    ReportSection(title="关键证据与论点演化"),
                     ReportSection(title="人群行为预测分析"),
                     ReportSection(title="趋势展望与风险提示")
                 ]
@@ -1250,15 +1504,7 @@ class ReportAgent:
         # 记录章节开始日志
         if self.report_logger:
             self.report_logger.log_section_start(section.title, section_index)
-        
-        system_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE.format(
-            report_title=outline.title,
-            report_summary=outline.summary,
-            simulation_requirement=self.simulation_requirement,
-            section_title=section.title,
-            tools_description=self._get_tools_description(),
-        )
-
+            
         # 构建用户prompt - 每个已完成章节各传入最大4000字
         if previous_sections:
             previous_parts = []
@@ -1269,6 +1515,17 @@ class ReportAgent:
             previous_content = "\n\n---\n\n".join(previous_parts)
         else:
             previous_content = "（这是第一个章节）"
+        
+        system_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE.format(
+            report_title=outline.title,
+            report_summary=outline.summary,
+            simulation_requirement=self.simulation_requirement,
+            section_title=section.title,
+            tools_description=self._get_tools_description(),
+            previous_content=previous_content,
+            writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
+            consumer_research_guide=REPORT_CONSUMER_RESEARCH_GUIDE,
+        )
         
         user_prompt = SECTION_USER_PROMPT_TEMPLATE.format(
             previous_content=previous_content,
@@ -1283,10 +1540,13 @@ class ReportAgent:
         # ReACT循环
         tool_calls_count = 0
         max_iterations = 5  # 最大迭代轮数
-        min_tool_calls = 3  # 最少工具调用次数
+        # When Zep is disabled, tools only return local data which may be sparse.
+        # Lower the minimum tool call requirement so the agent can finish faster
+        # instead of looping on empty results.
+        min_tool_calls = 1 if not self.zep_tools._zep_enabled else 3
         conflict_retries = 0  # 工具调用与Final Answer同时出现的连续冲突次数
         used_tools = set()  # 记录已调用过的工具名
-        all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+        all_tools = set(self.tools.keys())
 
         # 报告上下文，用于InsightForge的子问题生成
         report_context = f"章节标题: {section.title}\n模拟需求: {self.simulation_requirement}"
@@ -1340,8 +1600,8 @@ class ReportAgent:
                         "content": (
                             "【格式错误】你在一次回复中同时包含了工具调用和 Final Answer，这是不允许的。\n"
                             "每次回复只能做以下两件事之一：\n"
-                            "- 调用一个工具（输出一个 <tool_call> 块，不要写 Final Answer）\n"
-                            "- 输出最终内容（以 'Final Answer:' 开头，不要包含 <tool_call>）\n"
+                            "- 调用一个工具（输出一个 <execute_tool> 块，不要写 Final Answer）\n"
+                            "- 输出最终内容（以 'Final Answer:' 开头，不要包含 <execute_tool>）\n"
                             "请重新回复，只做其中一件事。"
                         ),
                     })
@@ -1352,9 +1612,9 @@ class ReportAgent:
                         f"章节 {section.title}: 连续 {conflict_retries} 次冲突，"
                         "降级为截断执行第一个工具调用"
                     )
-                    first_tool_end = response.find('</tool_call>')
+                    first_tool_end = response.find('</execute_tool>')
                     if first_tool_end != -1:
-                        response = response[:first_tool_end + len('</tool_call>')]
+                        response = response[:first_tool_end + len('</execute_tool>')]
                         tool_calls = self._parse_tool_calls(response)
                         has_tool_calls = bool(tool_calls)
                     has_final_answer = False
@@ -1389,7 +1649,10 @@ class ReportAgent:
                     continue
 
                 # 正常结束
-                final_answer = response.split("Final Answer:")[-1].strip()
+                final_answer = self._finalize_section_content(
+                    response.split("Final Answer:")[-1].strip(),
+                    section.title,
+                )
                 logger.info(f"章节 {section.title} 生成完成（工具调用: {tool_calls_count}次）")
 
                 if self.report_logger:
@@ -1488,7 +1751,7 @@ class ReportAgent:
             # 工具调用已足够，LLM 输出了内容但没带 "Final Answer:" 前缀
             # 直接将这段内容作为最终答案，不再空转
             logger.info(f"章节 {section.title} 未检测到 'Final Answer:' 前缀，直接采纳LLM输出作为最终内容（工具调用: {tool_calls_count}次）")
-            final_answer = response.strip()
+            final_answer = self._finalize_section_content(response.strip(), section.title)
 
             if self.report_logger:
                 self.report_logger.log_section_content(
@@ -1514,9 +1777,12 @@ class ReportAgent:
             logger.error(f"章节 {section.title} 强制收尾时 LLM 返回 None，使用默认错误提示")
             final_answer = f"（本章节生成失败：LLM 返回空响应，请稍后重试）"
         elif "Final Answer:" in response:
-            final_answer = response.split("Final Answer:")[-1].strip()
+            final_answer = self._finalize_section_content(
+                response.split("Final Answer:")[-1].strip(),
+                section.title,
+            )
         else:
-            final_answer = response
+            final_answer = self._finalize_section_content(response, section.title)
         
         # 记录章节内容生成完成日志
         if self.report_logger:
@@ -1528,6 +1794,49 @@ class ReportAgent:
             )
         
         return final_answer
+
+    def _finalize_section_content(self, content: Optional[str], section_title: str) -> str:
+        """Remove ReACT/tool leakage before persisting section prose."""
+        cleaned = self._strip_react_markup(content)
+        if cleaned:
+            return cleaned
+
+        logger.warning(f"章节 {section_title} 未生成可用正文，写入占位提示")
+        return "(This section did not converge to final prose and needs regeneration.)"
+
+    @staticmethod
+    def _strip_react_markup(content: Optional[str]) -> str:
+        """Strip tool-call scaffolding and return only user-facing markdown."""
+        if not content:
+            return ""
+
+        cleaned = content.strip()
+
+        cleaned = re.sub(
+            r"<execute_tool>.*?</execute_tool>",
+            "",
+            cleaned,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^\s*Final Answer:\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^\s*(Thought|Action|Action Input|Observation|Partial Draft):.*$",
+            "",
+            cleaned,
+            flags=re.MULTILINE,
+        )
+
+        fenced_match = re.match(r"^```(?:markdown|md)?\s*(.*?)\s*```$", cleaned, flags=re.DOTALL)
+        if fenced_match:
+            cleaned = fenced_match.group(1).strip()
+
+        cleaned_lines = [line.rstrip() for line in cleaned.splitlines()]
+        while cleaned_lines and not cleaned_lines[0].strip():
+            cleaned_lines.pop(0)
+        while cleaned_lines and not cleaned_lines[-1].strip():
+            cleaned_lines.pop()
+
+        return "\n".join(cleaned_lines).strip()
     
     def generate_report(
         self, 
@@ -1607,10 +1916,19 @@ class ReportAgent:
             
             if progress_callback:
                 progress_callback("planning", 0, "开始规划报告大纲...")
+
+            def _forward_progress(
+                stage: str,
+                progress: int,
+                message: str,
+                **_: Any,
+            ) -> None:
+                if progress_callback:
+                    progress_callback(stage, progress, message)
             
             outline = self.plan_outline(
-                progress_callback=lambda stage, prog, msg: 
-                    progress_callback(stage, prog // 5, msg) if progress_callback else None
+                progress_callback=lambda stage, prog, msg, **kwargs:
+                    _forward_progress(stage, prog // 5, msg, **kwargs)
             )
             report.outline = outline
             
@@ -1632,6 +1950,11 @@ class ReportAgent:
             
             total_sections = len(outline.sections)
             generated_sections = []  # 保存内容用于上下文
+
+            # Golden trail sets — accumulate artifact IDs cited in report
+            all_claim_ids: set = set()
+            all_trial_ids: set = set()
+            all_source_ids: set = set()
             
             for i, section in enumerate(outline.sections):
                 section_num = i + 1
@@ -1657,17 +1980,24 @@ class ReportAgent:
                     section=section,
                     outline=outline,
                     previous_sections=generated_sections,
-                    progress_callback=lambda stage, prog, msg:
-                        progress_callback(
+                    progress_callback=lambda stage, prog, msg, **kwargs:
+                        _forward_progress(
                             stage, 
                             base_progress + int(prog * 0.7 / total_sections),
-                            msg
-                        ) if progress_callback else None,
+                            msg,
+                            **kwargs,
+                        ),
                     section_index=section_num
                 )
                 
                 section.content = section_content
                 generated_sections.append(f"## {section.title}\n\n{section_content}")
+
+                # Accumulate golden evidence trail
+                section_artifacts = self._extract_artifact_ids(section_content)
+                all_claim_ids.update(section_artifacts["claim_ids"])
+                all_trial_ids.update(section_artifacts["trial_ids"])
+                all_source_ids.update(section_artifacts["source_ids"])
 
                 # 保存章节
                 ReportManager.save_section(report_id, section_num, section)
@@ -1718,6 +2048,14 @@ class ReportAgent:
                     total_time_seconds=total_time_seconds
                 )
             
+            # Finalize golden trail
+            report.golden_trail = {
+                "claim_ids": sorted(all_claim_ids),
+                "trial_ids": sorted(all_trial_ids),
+                "source_ids": sorted(all_source_ids),
+                "total_artifacts": len(all_claim_ids) + len(all_trial_ids) + len(all_source_ids),
+            }
+
             # 保存最终报告
             ReportManager.save_report(report)
             ReportManager.update_progress(
@@ -1834,7 +2172,7 @@ class ReportAgent:
             
             if not tool_calls:
                 # 没有工具调用，直接返回响应
-                clean_response = re.sub(r'<tool_call>.*?</tool_call>', '', response, flags=re.DOTALL)
+                clean_response = re.sub(r'<execute_tool>.*?</execute_tool>', '', response, flags=re.DOTALL)
                 clean_response = re.sub(r'\[TOOL_CALL\].*?\)', '', clean_response)
                 
                 return {
@@ -1870,7 +2208,7 @@ class ReportAgent:
         )
         
         # 清理响应
-        clean_response = re.sub(r'<tool_call>.*?</tool_call>', '', final_response, flags=re.DOTALL)
+        clean_response = re.sub(r'<execute_tool>.*?</execute_tool>', '', final_response, flags=re.DOTALL)
         clean_response = re.sub(r'\[TOOL_CALL\].*?\)', '', clean_response)
         
         return {
@@ -2147,7 +2485,12 @@ class ReportManager:
         if not content:
             return content
         
+        content = ReportAgent._strip_react_markup(content)
         content = content.strip()
+
+        if not content:
+            return ""
+
         lines = content.split('\n')
         cleaned_lines = []
         skip_next_empty = False
@@ -2490,6 +2833,7 @@ class ReportManager:
             status=ReportStatus(data['status']),
             outline=outline,
             markdown_content=markdown_content,
+            report_type=data.get('report_type', 'standard'),
             created_at=data.get('created_at', ''),
             completed_at=data.get('completed_at', ''),
             error=data.get('error')
@@ -2499,22 +2843,27 @@ class ReportManager:
     def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
         """根据模拟ID获取报告"""
         cls._ensure_reports_dir()
-        
+
+        matches = []
         for item in os.listdir(cls.REPORTS_DIR):
             item_path = os.path.join(cls.REPORTS_DIR, item)
             # 新格式：文件夹
             if os.path.isdir(item_path):
                 report = cls.get_report(item)
                 if report and report.simulation_id == simulation_id:
-                    return report
+                    matches.append(report)
             # 兼容旧格式：JSON文件
             elif item.endswith('.json'):
                 report_id = item[:-5]
                 report = cls.get_report(report_id)
                 if report and report.simulation_id == simulation_id:
-                    return report
-        
-        return None
+                    matches.append(report)
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda report: report.created_at or "", reverse=True)
+        return matches[0]
     
     @classmethod
     def list_reports(cls, simulation_id: Optional[str] = None, limit: int = 50) -> List[Report]:

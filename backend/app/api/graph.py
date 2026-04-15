@@ -3,9 +3,13 @@
 采用项目上下文机制，服务端持久化状态
 """
 
+import html
 import os
+import re
 import traceback
 import threading
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from flask import request, jsonify
 
 from . import graph_bp
@@ -13,6 +17,7 @@ from ..config import Config
 from ..services.ontology_generator import OntologyGenerator
 from ..services.graph_builder import GraphBuilderService
 from ..services.text_processor import TextProcessor
+from ..services.web_search_client import WebSearchClient
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
 from ..models.task import TaskManager, TaskStatus
@@ -28,6 +33,87 @@ def allowed_file(filename: str) -> bool:
         return False
     ext = os.path.splitext(filename)[1].lower().lstrip('.')
     return ext in Config.ALLOWED_EXTENSIONS
+
+
+def _normalize_urls(raw_urls: list[str]) -> list[str]:
+    """标准化表单中的 URL 输入。"""
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for raw_url in raw_urls:
+        for candidate in re.split(r'[\r\n]+', raw_url or ''):
+            clean_url = candidate.strip().strip('"\'')
+            clean_url = clean_url.rstrip('),.;!?')
+            if not clean_url:
+                continue
+
+            parsed = urlparse(clean_url)
+            if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+                continue
+
+            if clean_url not in seen:
+                seen.add(clean_url)
+                normalized.append(clean_url)
+
+    return normalized
+
+
+def _safe_url_filename(url: str, default_ext: str) -> str:
+    """为 URL 来源生成稳定的文件名。"""
+    parsed = urlparse(url)
+    basename = os.path.basename(parsed.path) or parsed.netloc or 'source'
+    basename = re.sub(r'[^A-Za-z0-9._-]+', '_', basename).strip('._') or 'source'
+    name, ext = os.path.splitext(basename)
+    if ext:
+        return basename
+    return f"{name}{default_ext}"
+
+
+def _extract_text_from_html(raw_html: str) -> tuple[str, str]:
+    """提取 HTML 标题和正文纯文本。"""
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', raw_html, flags=re.IGNORECASE | re.DOTALL)
+    title = ''
+    if title_match:
+        title = re.sub(r'\s+', ' ', html.unescape(title_match.group(1))).strip()
+
+    text = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', raw_html, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return title, text
+
+
+def _fetch_url_source(url: str) -> dict[str, object]:
+    """直接抓取 URL 内容，支持 HTML 和 PDF。"""
+    request_obj = Request(
+        url,
+        headers={
+            'User-Agent': 'Mozilla/5.0 (compatible; MiroFish/1.0; +https://mirofish.ai)'
+        },
+    )
+
+    with urlopen(request_obj, timeout=20) as response:
+        content_type = (response.headers.get('Content-Type') or '').lower()
+        payload = response.read(min(Config.MAX_CONTENT_LENGTH, 10 * 1024 * 1024))
+        charset = response.headers.get_content_charset() or 'utf-8'
+
+    is_pdf = 'application/pdf' in content_type or url.lower().endswith('.pdf')
+    if is_pdf:
+        return {
+            'mode': 'file',
+            'content': payload,
+            'filename': _safe_url_filename(url, '.pdf'),
+            'title': _safe_url_filename(url, '.pdf'),
+        }
+
+    decoded = payload.decode(charset, errors='ignore')
+    title, text = _extract_text_from_html(decoded)
+    return {
+        'mode': 'text',
+        'content': text,
+        'filename': _safe_url_filename(url, '.txt'),
+        'title': title or urlparse(url).netloc,
+    }
 
 
 # ============== 项目管理接口 ==============
@@ -121,12 +207,13 @@ def reset_project(project_id: str):
 @graph_bp.route('/ontology/generate', methods=['POST'])
 def generate_ontology():
     """
-    接口1：上传文件，分析生成本体定义
+    接口1：上传文件或 URL，分析生成本体定义
     
     请求方式：multipart/form-data
     
     参数：
         files: 上传的文件（PDF/MD/TXT），可多个
+        urls: URL 种子，可多个
         simulation_requirement: 模拟需求描述（必填）
         project_name: 项目名称（可选）
         additional_context: 额外说明（可选）
@@ -163,12 +250,14 @@ def generate_ontology():
                 "error": "请提供模拟需求描述 (simulation_requirement)"
             }), 400
         
-        # 获取上传的文件
+        # 获取上传的文件和 URL
         uploaded_files = request.files.getlist('files')
-        if not uploaded_files or all(not f.filename for f in uploaded_files):
+        requested_urls = _normalize_urls(request.form.getlist('urls'))
+
+        if (not uploaded_files or all(not f.filename for f in uploaded_files)) and not requested_urls:
             return jsonify({
                 "success": False,
-                "error": "请至少上传一个文档文件"
+                "error": "请至少上传一个文档文件或提供一个 URL"
             }), 400
         
         # 创建项目
@@ -179,6 +268,7 @@ def generate_ontology():
         # 保存文件并提取文本
         document_texts = []
         all_text = ""
+        failed_urls = []
         
         for file in uploaded_files:
             if file and file.filename and allowed_file(file.filename):
@@ -198,12 +288,76 @@ def generate_ontology():
                 text = TextProcessor.preprocess_text(text)
                 document_texts.append(text)
                 all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+
+        if requested_urls:
+            web_search_client = WebSearchClient()
+            extracted_sources = {
+                item.get('url', ''): item
+                for item in web_search_client.extract(requested_urls)
+                if item.get('url')
+            }
+
+            for url in requested_urls:
+                try:
+                    source = extracted_sources.get(url)
+                    if source and source.get('content'):
+                        source_title = source.get('title') or urlparse(url).netloc or url
+                        text = TextProcessor.preprocess_text(str(source.get('content', '')))
+                        if text:
+                            project.files.append({
+                                "filename": source_title,
+                                "size": len(text.encode('utf-8')),
+                                "source_url": url,
+                                "source_type": "url"
+                            })
+                            document_texts.append(text)
+                            all_text += f"\n\n=== {source_title} ({url}) ===\n{text}"
+                            continue
+
+                    fetched_source = _fetch_url_source(url)
+                    if fetched_source['mode'] == 'file':
+                        file_info = ProjectManager.save_bytes_to_project(
+                            project.project_id,
+                            fetched_source['content'],
+                            str(fetched_source['filename']),
+                        )
+                        text = FileParser.extract_text(file_info['path'])
+                        text = TextProcessor.preprocess_text(text)
+                        if text:
+                            project.files.append({
+                                "filename": file_info['original_filename'],
+                                "size": file_info['size'],
+                                "source_url": url,
+                                "source_type": "url"
+                            })
+                            document_texts.append(text)
+                            all_text += f"\n\n=== {file_info['original_filename']} ({url}) ===\n{text}"
+                            continue
+                    else:
+                        text = TextProcessor.preprocess_text(str(fetched_source['content']))
+                        if text:
+                            source_title = str(fetched_source['title']) or url
+                            project.files.append({
+                                "filename": source_title,
+                                "size": len(text.encode('utf-8')),
+                                "source_url": url,
+                                "source_type": "url"
+                            })
+                            document_texts.append(text)
+                            all_text += f"\n\n=== {source_title} ({url}) ===\n{text}"
+                            continue
+
+                    failed_urls.append({"url": url, "error": "未提取到可用文本"})
+                except Exception as exc:
+                    logger.warning("URL ingestion failed for %s: %s", url, exc)
+                    failed_urls.append({"url": url, "error": str(exc)})
         
         if not document_texts:
             ProjectManager.delete_project(project.project_id)
             return jsonify({
                 "success": False,
-                "error": "没有成功处理任何文档，请检查文件格式"
+                "error": "没有成功处理任何文档或 URL，请检查输入内容",
+                "failed_urls": failed_urls
             }), 400
         
         # 保存提取的文本
@@ -242,7 +396,8 @@ def generate_ontology():
                 "ontology": project.ontology,
                 "analysis_summary": project.analysis_summary,
                 "files": project.files,
-                "total_text_length": project.total_text_length
+                "total_text_length": project.total_text_length,
+                "failed_urls": failed_urls
             }
         })
         
@@ -284,8 +439,13 @@ def build_graph():
         
         # 检查配置
         errors = []
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_PROVIDER == 'zep' and Config.zep_enabled() and not Config.ZEP_API_KEY:
             errors.append("ZEP_API_KEY未配置")
+        if Config.GRAPH_PROVIDER == 'hivemind':
+            if not Config.HIVEMIND_API_URL:
+                errors.append("HIVEMIND_API_URL未配置")
+            if not Config.HIVEMIND_API_KEY:
+                errors.append("HIVEMIND_API_KEY未配置")
         if errors:
             logger.error(f"配置错误: {errors}")
             return jsonify({
@@ -400,7 +560,7 @@ def build_graph():
                 # 创建图谱
                 task_manager.update_task(
                     task_id,
-                    message="创建Zep图谱...",
+                    message="创建图谱...",
                     progress=10
                 )
                 graph_id = builder.create_graph(name=graph_name)
@@ -439,10 +599,10 @@ def build_graph():
                     progress_callback=add_progress_callback
                 )
                 
-                # 等待Zep处理完成（查询每个episode的processed状态）
+                # 等待处理完成（Zep模式会等待，HIVEMIND模式跳过）
                 task_manager.update_task(
                     task_id,
-                    message="等待Zep处理数据...",
+                    message="等待图谱处理数据...",
                     progress=55
                 )
                 
@@ -534,6 +694,39 @@ def get_task(task_id: str):
     task = TaskManager().get_task(task_id)
     
     if not task:
+        # 兼容后端重启后的场景：TaskManager 为内存态，任务可能丢失，
+        # 但项目状态已进入 graph_completed。此时返回一个合成完成状态，
+        # 避免前端无限轮询 404。
+        for project in ProjectManager.list_projects(limit=200):
+            if project.graph_build_task_id == task_id:
+                if project.status == ProjectStatus.GRAPH_COMPLETED and project.graph_id:
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "task_id": task_id,
+                            "task_type": "graph_build",
+                            "status": "completed",
+                            "progress": 100,
+                            "message": "图谱构建完成（任务记录已过期）",
+                            "result": {
+                                "project_id": project.project_id,
+                                "graph_id": project.graph_id
+                            }
+                        }
+                    })
+                if project.status == ProjectStatus.FAILED:
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "task_id": task_id,
+                            "task_type": "graph_build",
+                            "status": "failed",
+                            "progress": 100,
+                            "message": "图谱构建失败（任务记录已过期）",
+                            "error": project.error or "unknown error"
+                        }
+                    })
+
         return jsonify({
             "success": False,
             "error": f"任务不存在: {task_id}"
@@ -567,20 +760,25 @@ def get_graph_data(graph_id: str):
     获取图谱数据（节点和边）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_PROVIDER == 'zep' and Config.zep_enabled() and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
             }), 500
-        
+        if Config.GRAPH_PROVIDER == 'hivemind' and (not Config.HIVEMIND_API_URL or not Config.HIVEMIND_API_KEY):
+            return jsonify({
+                "success": False,
+                "error": "HIVEMIND_API_URL/HIVEMIND_API_KEY未配置"
+            }), 500
+
         builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
         graph_data = builder.get_graph_data(graph_id)
-        
+
         return jsonify({
             "success": True,
             "data": graph_data
         })
-        
+
     except Exception as e:
         return jsonify({
             "success": False,
@@ -595,10 +793,15 @@ def delete_graph(graph_id: str):
     删除Zep图谱
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if Config.GRAPH_PROVIDER == 'zep' and Config.zep_enabled() and not Config.ZEP_API_KEY:
             return jsonify({
                 "success": False,
                 "error": "ZEP_API_KEY未配置"
+            }), 500
+        if Config.GRAPH_PROVIDER == 'hivemind' and (not Config.HIVEMIND_API_URL or not Config.HIVEMIND_API_KEY):
+            return jsonify({
+                "success": False,
+                "error": "HIVEMIND_API_URL/HIVEMIND_API_KEY未配置"
             }), 500
         
         builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)

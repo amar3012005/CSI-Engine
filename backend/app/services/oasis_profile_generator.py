@@ -20,6 +20,7 @@ from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
+from ..utils.token_usage_tracker import TokenUsageTracker
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
 logger = get_logger('mirofish.oasis_profile')
@@ -50,6 +51,9 @@ class OasisAgentProfile:
     country: Optional[str] = None
     profession: Optional[str] = None
     interested_topics: List[str] = field(default_factory=list)
+    role: Optional[str] = None
+    skills: List[str] = field(default_factory=list)
+    qualification_score: float = 0.0
     
     # 来源实体信息
     source_entity_uuid: Optional[str] = None
@@ -82,6 +86,12 @@ class OasisAgentProfile:
             profile["profession"] = self.profession
         if self.interested_topics:
             profile["interested_topics"] = self.interested_topics
+        if self.role:
+            profile["role"] = self.role
+        if self.skills:
+            profile["skills"] = self.skills
+        if self.qualification_score:
+            profile["qualification_score"] = self.qualification_score
         
         return profile
     
@@ -112,6 +122,12 @@ class OasisAgentProfile:
             profile["profession"] = self.profession
         if self.interested_topics:
             profile["interested_topics"] = self.interested_topics
+        if self.role:
+            profile["role"] = self.role
+        if self.skills:
+            profile["skills"] = self.skills
+        if self.qualification_score:
+            profile["qualification_score"] = self.qualification_score
         
         return profile
     
@@ -133,6 +149,9 @@ class OasisAgentProfile:
             "country": self.country,
             "profession": self.profession,
             "interested_topics": self.interested_topics,
+            "role": self.role,
+            "skills": self.skills,
+            "qualification_score": self.qualification_score,
             "source_entity_uuid": self.source_entity_uuid,
             "source_entity_type": self.source_entity_type,
             "created_at": self.created_at,
@@ -176,6 +195,67 @@ class OasisProfileGenerator:
         "university", "governmentagency", "organization", "ngo", 
         "mediaoutlet", "company", "institution", "group", "community"
     ]
+
+    ROLE_SKILL_MAP = {
+        "student": ("Student Observer", ["campus culture", "peer sentiment", "trend spotting"]),
+        "alumni": ("Alumni Commentator", ["institutional memory", "networking", "reputation analysis"]),
+        "professor": ("Subject Matter Expert", ["domain analysis", "critical reasoning", "evidence synthesis"]),
+        "person": ("Citizen Witness", ["local observation", "public opinion", "social commentary"]),
+        "publicfigure": ("Public Narrative Leader", ["agenda setting", "media framing", "influence analysis"]),
+        "expert": ("Technical Analyst", ["technical evaluation", "fact checking", "risk assessment"]),
+        "faculty": ("Academic Reviewer", ["methodology review", "source validation", "structured critique"]),
+        "official": ("Policy Voice", ["policy interpretation", "official communication", "stakeholder alignment"]),
+        "journalist": ("Investigative Reporter", ["source verification", "interview synthesis", "narrative building"]),
+        "activist": ("Advocacy Mobilizer", ["campaign framing", "grassroots signal detection", "issue amplification"]),
+        "university": ("Institutional Account", ["public communication", "education policy", "community outreach"]),
+        "governmentagency": ("Regulatory Account", ["policy clarification", "compliance guidance", "crisis communication"]),
+        "organization": ("Organizational Spokesaccount", ["position statements", "stakeholder updates", "coordination"]),
+        "ngo": ("Civil Society Account", ["impact storytelling", "public engagement", "resource coordination"]),
+        "mediaoutlet": ("Media Desk", ["news synthesis", "headline framing", "source triangulation"]),
+        "company": ("Corporate Account", ["brand communication", "product context", "risk messaging"]),
+        "institution": ("Institution Account", ["official updates", "public affairs", "information hygiene"]),
+        "group": ("Community Moderator", ["discussion facilitation", "norm enforcement", "signal aggregation"]),
+        "community": ("Community Organizer", ["member engagement", "topic curation", "conflict de-escalation"]),
+        # Ontology-priority scientific entity types
+        "physicist": ("Theoretical/Applied Physicist", ["electrodynamics", "mathematical modeling", "theory critique"]),
+        "researcher": ("Research Analyst", ["literature synthesis", "hypothesis testing", "evidence evaluation"]),
+        "scienceeducator": ("Science Educator", ["pedagogy", "concept simplification", "public science communication"]),
+        "physicsstudent": ("Physics Graduate Student", ["problem solving", "paper reading", "lab interpretation"]),
+        "physicsprofessor": ("Physics Professor", ["advanced theory", "peer review", "research supervision"]),
+        "physicsjournal": ("Academic Journal Editor", ["publication standards", "review triage", "methodology scrutiny"]),
+        "sciencemagazine": ("Science Magazine Correspondent", ["science storytelling", "fact verification", "trend reporting"]),
+        "node": ("Discardable Generic Node", ["none"]),
+    }
+
+    FAMOUS_PERSONA_OVERRIDES = {
+        "albert einstein": {
+            "profession": "Theoretical Physicist",
+            "country": "Germany",
+            "mbti": "INTP",
+            "role": "Foundational Physics Expert",
+            "skills": ["relativity", "theoretical modeling", "scientific critique", "physics communication"],
+            "interested_topics": ["Relativity", "Quantum Mechanics", "Field Theory"],
+            "bio": "Albert Einstein was a theoretical physicist known for relativity and foundational contributions to modern physics."
+        },
+        "richard feynman": {
+            "profession": "Theoretical Physicist",
+            "country": "US",
+            "mbti": "ENTP",
+            "role": "Quantum Theory Analyst",
+            "skills": ["quantum electrodynamics", "diagrammatic reasoning", "teaching complex topics"],
+            "interested_topics": ["Quantum Electrodynamics", "Particle Physics", "Scientific Method"],
+            "bio": "Richard Feynman was a theoretical physicist known for quantum electrodynamics and exceptional scientific communication."
+        },
+        "niels bohr": {
+            "profession": "Theoretical Physicist",
+            "country": "Denmark",
+            "mbti": "INTJ",
+            "role": "Quantum Foundations Analyst",
+            "skills": ["atomic theory", "quantum interpretation", "scientific debate"],
+            "interested_topics": ["Quantum Foundations", "Atomic Physics", "Complementarity"],
+            "bio": "Niels Bohr was a pioneer of quantum theory and atomic structure."
+        }
+    }
     
     def __init__(
         self, 
@@ -183,11 +263,13 @@ class OasisProfileGenerator:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         zep_api_key: Optional[str] = None,
-        graph_id: Optional[str] = None
+        graph_id: Optional[str] = None,
+        usage_scope: Optional[str] = None,
     ):
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
+        self.usage_scope = usage_scope
         
         if not self.api_key:
             raise ValueError("LLM_API_KEY 未配置")
@@ -198,21 +280,42 @@ class OasisProfileGenerator:
         )
         
         # Zep客户端用于检索丰富上下文
+        self._zep_enabled = Config.zep_enabled()
         self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
         self.zep_client = None
         self.graph_id = graph_id
-        
-        if self.zep_api_key:
+
+        if self._zep_enabled and self.zep_api_key:
             try:
                 self.zep_client = Zep(api_key=self.zep_api_key)
             except Exception as e:
                 logger.warning(f"Zep客户端初始化失败: {e}")
+
+    def _is_gpt_oss_model(self) -> bool:
+        """Whether current model is Groq-hosted gpt-oss."""
+        return "gpt-oss" in (self.model_name or "").lower()
+
+    def _build_chat_completion_kwargs(self, messages: List[Dict[str, str]], temperature: float) -> Dict[str, Any]:
+        """Build model-safe completion args (gpt-oss doesn't support strict response_format)."""
+        kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+            # Keep JSON outputs bounded to avoid truncation in long prompts.
+            "max_tokens": 2200,
+        }
+        if self._is_gpt_oss_model():
+            kwargs["extra_body"] = {"include_reasoning": False}
+        else:
+            kwargs["response_format"] = {"type": "json_object"}
+        return kwargs
     
     def generate_profile_from_entity(
         self, 
         entity: EntityNode, 
         user_id: int,
-        use_llm: bool = True
+        use_llm: bool = True,
+        profile_seed: Optional[Dict[str, Any]] = None
     ) -> OasisAgentProfile:
         """
         从Zep实体生成OASIS Agent Profile
@@ -241,7 +344,8 @@ class OasisProfileGenerator:
                 entity_type=entity_type,
                 entity_summary=entity.summary,
                 entity_attributes=entity.attributes,
-                context=context
+                context=context,
+                profile_seed=profile_seed
             )
         else:
             # 使用规则生成基础人设
@@ -251,6 +355,14 @@ class OasisProfileGenerator:
                 entity_summary=entity.summary,
                 entity_attributes=entity.attributes
             )
+
+        profile_data = self._ensure_qualified_profile(
+            profile_data=profile_data,
+            entity_name=name,
+            entity_type=entity_type,
+            entity_summary=entity.summary,
+            profile_seed=profile_seed,
+        )
         
         return OasisAgentProfile(
             user_id=user_id,
@@ -268,6 +380,9 @@ class OasisProfileGenerator:
             country=profile_data.get("country"),
             profession=profile_data.get("profession"),
             interested_topics=profile_data.get("interested_topics", []),
+            role=profile_data.get("role"),
+            skills=profile_data.get("skills", []),
+            qualification_score=profile_data.get("qualification_score", 0.0),
             source_entity_uuid=entity.uuid,
             source_entity_type=entity_type,
         )
@@ -499,7 +614,8 @@ class OasisProfileGenerator:
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        profile_seed: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         使用LLM生成非常详细的人设
@@ -513,11 +629,11 @@ class OasisProfileGenerator:
         
         if is_individual:
             prompt = self._build_individual_persona_prompt(
-                entity_name, entity_type, entity_summary, entity_attributes, context
+                entity_name, entity_type, entity_summary, entity_attributes, context, profile_seed
             )
         else:
             prompt = self._build_group_persona_prompt(
-                entity_name, entity_type, entity_summary, entity_attributes, context
+                entity_name, entity_type, entity_summary, entity_attributes, context, profile_seed
             )
 
         # 尝试多次生成，直到成功或达到最大重试次数
@@ -527,15 +643,26 @@ class OasisProfileGenerator:
         for attempt in range(max_attempts):
             try:
                 response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": self._get_system_prompt(is_individual)},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
+                    **self._build_chat_completion_kwargs(
+                        messages=[
+                            {"role": "system", "content": self._get_system_prompt(is_individual)},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7 - (attempt * 0.1)  # 每次重试降低温度
+                    )
                     # 不设置max_tokens，让LLM自由发挥
                 )
+
+                usage = getattr(response, "usage", None)
+                if self.usage_scope and usage:
+                    TokenUsageTracker.record_usage(
+                        scope_id=self.usage_scope,
+                        prompt_tokens=getattr(usage, "prompt_tokens", 0),
+                        completion_tokens=getattr(usage, "completion_tokens", 0),
+                        total_tokens=getattr(usage, "total_tokens", 0),
+                        model=self.model_name,
+                        source="oasis_profile_generator",
+                    )
                 
                 content = response.choices[0].message.content
                 
@@ -554,6 +681,8 @@ class OasisProfileGenerator:
                         result["bio"] = entity_summary[:200] if entity_summary else f"{entity_type}: {entity_name}"
                     if "persona" not in result or not result["persona"]:
                         result["persona"] = entity_summary or f"{entity_name}是一个{entity_type}。"
+                    if "skills" in result and not isinstance(result["skills"], list):
+                        result["skills"] = [str(result["skills"])]
                     
                     return result
                     
@@ -667,10 +796,174 @@ class OasisProfileGenerator:
             "bio": entity_summary[:200] if entity_summary else f"{entity_type}: {entity_name}",
             "persona": entity_summary or f"{entity_name}是一个{entity_type}。"
         }
+
+    def _default_role_skills(self, entity_type: str) -> tuple[str, List[str]]:
+        et = (entity_type or "").lower()
+        if et in self.ROLE_SKILL_MAP:
+            role, skills = self.ROLE_SKILL_MAP[et]
+            return role, list(skills)
+        return "General Social Analyst", ["discussion participation", "basic fact awareness", "opinion expression"]
+
+    def _default_profession_for_type(self, entity_type: str) -> str:
+        et = (entity_type or "").lower()
+        mapping = {
+            "physicist": "Physicist",
+            "researcher": "Research Scientist",
+            "scienceeducator": "Science Educator",
+            "physicsstudent": "Physics Student",
+            "physicsprofessor": "Physics Professor",
+            "physicsjournal": "Journal Editorial Board",
+            "sciencemagazine": "Science Journalist",
+            "journalist": "Science Journalist",
+            "organization": "Research Organization",
+            "person": "Domain Specialist",
+            "node": "Excluded Generic Node",
+        }
+        return mapping.get(et, entity_type or "Research Analyst")
+
+    def _normalize_name_key(self, name: str) -> str:
+        return " ".join((name or "").strip().lower().split())
+
+    def _sanitize_generic_text(self, text: str, fallback: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return fallback
+        banned = [
+            "any natural person",
+            "a participant in social discussions",
+            "unknown profession",
+            "generic",
+        ]
+        tl = t.lower()
+        if any(b in tl for b in banned):
+            return fallback
+        return t
+
+    def _apply_famous_override(self, entity_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        key = self._normalize_name_key(entity_name)
+        override = self.FAMOUS_PERSONA_OVERRIDES.get(key)
+        if not override:
+            return result
+        merged = dict(result)
+        for k, v in override.items():
+            cur = merged.get(k)
+            if k in {"bio", "profession", "role"}:
+                if not cur or "any natural person" in str(cur).lower() or "unknown" in str(cur).lower():
+                    merged[k] = v
+            else:
+                merged[k] = v
+        try:
+            q = float(merged.get("qualification_score", 0))
+        except (TypeError, ValueError):
+            q = 0
+        merged["qualification_score"] = max(q, 0.9)
+        return merged
+
+    def _ensure_qualified_profile(
+        self,
+        profile_data: Dict[str, Any],
+        entity_name: str,
+        entity_type: str,
+        entity_summary: str,
+        profile_seed: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Ensure every generated profile is qualified for simulation:
+        - dedicated role
+        - explicit skills list
+        - qualification score in [0, 1]
+        """
+        result = dict(profile_data or {})
+        result = self._apply_famous_override(entity_name, result)
+        if profile_seed:
+            seed_skills = profile_seed.get("skills") or []
+            if profile_seed.get("role") and not result.get("role"):
+                result["role"] = profile_seed["role"]
+            if seed_skills and not result.get("skills"):
+                result["skills"] = seed_skills
+            if profile_seed.get("profession") and not result.get("profession"):
+                result["profession"] = profile_seed["profession"]
+            if profile_seed.get("interested_topics") and not result.get("interested_topics"):
+                result["interested_topics"] = profile_seed["interested_topics"]
+            if profile_seed.get("qualification_score"):
+                try:
+                    result["qualification_score"] = max(
+                        float(result.get("qualification_score", 0.0) or 0.0),
+                        float(profile_seed["qualification_score"])
+                    )
+                except (TypeError, ValueError):
+                    pass
+        default_role, default_skills = self._default_role_skills(entity_type)
+        default_profession = self._default_profession_for_type(entity_type)
+
+        role = str(result.get("role") or "").strip() or default_role
+        skills = result.get("skills")
+        if isinstance(skills, list):
+            cleaned_skills = [str(s).strip() for s in skills if str(s).strip()]
+        elif isinstance(skills, str):
+            cleaned_skills = [s.strip() for s in skills.split(",") if s.strip()]
+        else:
+            cleaned_skills = []
+        if not cleaned_skills:
+            cleaned_skills = default_skills
+
+        raw_score = result.get("qualification_score")
+        try:
+            qscore = float(raw_score)
+        except (TypeError, ValueError):
+            # heuristic baseline from profile richness
+            richness = len((result.get("persona") or entity_summary or "")) / 1000.0
+            skill_bonus = min(len(cleaned_skills) / 10.0, 0.3)
+            qscore = max(0.55, min(0.95, 0.45 + min(richness, 0.4) + skill_bonus))
+        qscore = max(0.0, min(qscore, 1.0))
+
+        # Harden core fields quality
+        profession = str(result.get("profession") or "").strip()
+        if not profession or profession.lower() in {"unknown", "unknown profession", "none", "null"}:
+            profession = default_profession
+
+        bio = str(result.get("bio") or "").strip()
+        if not bio or bio.lower() in {"none", "null"}:
+            bio = f"{entity_name} is a {default_profession} focused on evidence-based social discourse."
+        bio = self._sanitize_generic_text(
+            bio,
+            f"{entity_name} is a {default_profession} focused on evidence-based social discourse."
+        )
+
+        persona = str(result.get("persona") or "").strip()
+        if not persona or persona.lower() in {"none", "null"}:
+            persona = f"{entity_name} participates as {role}, emphasizing rigorous evidence review and clear communication."
+        persona = self._sanitize_generic_text(
+            persona,
+            f"{entity_name} participates as {role}, emphasizing rigorous evidence review and clear communication."
+        )
+
+        topics = result.get("interested_topics")
+        if isinstance(topics, list):
+            cleaned_topics = [str(t).strip() for t in topics if str(t).strip()]
+        elif isinstance(topics, str):
+            cleaned_topics = [t.strip() for t in topics.split(",") if t.strip()]
+        else:
+            cleaned_topics = []
+        if not cleaned_topics:
+            cleaned_topics = cleaned_skills[:3]
+
+        result["role"] = role
+        result["skills"] = cleaned_skills[:8]
+        result["qualification_score"] = qscore
+        result["profession"] = profession
+        result["bio"] = bio
+        result["persona"] = persona
+        result["interested_topics"] = cleaned_topics[:8]
+        return result
     
     def _get_system_prompt(self, is_individual: bool) -> str:
         """获取系统提示词"""
-        base_prompt = "你是社交媒体用户画像生成专家。生成详细、真实的人设用于舆论模拟,最大程度还原已有现实情况。必须返回有效的JSON格式，所有字符串值不能包含未转义的换行符。使用中文。"
+        base_prompt = (
+            "你是社交媒体用户画像生成专家。生成真实、专业且紧凑的人设用于舆论模拟。"
+            "必须返回有效JSON，禁止Markdown代码块，禁止注释。"
+            "所有字符串值不能包含未转义换行符。使用中文。"
+        )
         return base_prompt
     
     def _build_individual_persona_prompt(
@@ -679,12 +972,14 @@ class OasisProfileGenerator:
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        profile_seed: Optional[Dict[str, Any]] = None
     ) -> str:
         """构建个人实体的详细人设提示词"""
         
         attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
-        context_str = context[:3000] if context else "无额外上下文"
+        context_str = context[:1800] if context else "无额外上下文"
+        seed_str = json.dumps(profile_seed, ensure_ascii=False) if profile_seed else "无"
         
         return f"""为实体生成详细的社交媒体用户人设,最大程度还原已有现实情况。
 
@@ -692,6 +987,7 @@ class OasisProfileGenerator:
 实体类型: {entity_type}
 实体摘要: {entity_summary}
 实体属性: {attrs_str}
+预设Agent种子: {seed_str}
 
 上下文信息:
 {context_str}
@@ -699,7 +995,7 @@ class OasisProfileGenerator:
 请生成JSON，包含以下字段:
 
 1. bio: 社交媒体简介，200字
-2. persona: 详细人设描述（2000字的纯文本），需包含:
+2. persona: 详细人设描述（400-700字纯文本），需包含:
    - 基本信息（年龄、职业、教育背景、所在地）
    - 人物背景（重要经历、与事件的关联、社会关系）
    - 性格特征（MBTI类型、核心性格、情绪表达方式）
@@ -713,13 +1009,19 @@ class OasisProfileGenerator:
 6. country: 国家（使用中文，如"中国"）
 7. profession: 职业
 8. interested_topics: 感兴趣话题数组
+9. role: 该Agent在模拟中的专长角色（简短，如“Investigative Reporter”）
+10. skills: 技能数组（3-8项，突出该角色的专长能力）
+11. qualification_score: 资格评分，0到1之间的小数（建议0.60-0.95）
 
 重要:
 - 所有字段值必须是字符串或数字，不要使用换行符
-- persona必须是一段连贯的文字描述
+- persona必须是一段连贯文字，控制在700字以内
 - 使用中文（除了gender字段必须用英文male/female）
 - 内容要与实体信息保持一致
 - age必须是有效的整数，gender必须是"male"或"female"
+- 如果实体是知名历史/科学人物，不得写成泛化模板（如“Any natural person”），必须给出该人物真实专业背景与研究方向
+- 必须严格依据实体类型生成专业角色（如 Physicist/Researcher/PhysicsProfessor 等），不得降级为泛化角色
+- 如果提供了预设Agent种子，role、skills、qualification_score、interested_topics 必须与种子保持一致或更具体，不得弱化
 """
 
     def _build_group_persona_prompt(
@@ -728,12 +1030,14 @@ class OasisProfileGenerator:
         entity_type: str,
         entity_summary: str,
         entity_attributes: Dict[str, Any],
-        context: str
+        context: str,
+        profile_seed: Optional[Dict[str, Any]] = None
     ) -> str:
         """构建群体/机构实体的详细人设提示词"""
         
         attrs_str = json.dumps(entity_attributes, ensure_ascii=False) if entity_attributes else "无"
-        context_str = context[:3000] if context else "无额外上下文"
+        context_str = context[:1800] if context else "无额外上下文"
+        seed_str = json.dumps(profile_seed, ensure_ascii=False) if profile_seed else "无"
         
         return f"""为机构/群体实体生成详细的社交媒体账号设定,最大程度还原已有现实情况。
 
@@ -741,6 +1045,7 @@ class OasisProfileGenerator:
 实体类型: {entity_type}
 实体摘要: {entity_summary}
 实体属性: {attrs_str}
+预设Agent种子: {seed_str}
 
 上下文信息:
 {context_str}
@@ -748,7 +1053,7 @@ class OasisProfileGenerator:
 请生成JSON，包含以下字段:
 
 1. bio: 官方账号简介，200字，专业得体
-2. persona: 详细账号设定描述（2000字的纯文本），需包含:
+2. persona: 详细账号设定描述（400-700字纯文本），需包含:
    - 机构基本信息（正式名称、机构性质、成立背景、主要职能）
    - 账号定位（账号类型、目标受众、核心功能）
    - 发言风格（语言特点、常用表达、禁忌话题）
@@ -762,10 +1067,13 @@ class OasisProfileGenerator:
 6. country: 国家（使用中文，如"中国"）
 7. profession: 机构职能描述
 8. interested_topics: 关注领域数组
+9. role: 该机构账号在模拟中的角色（简短）
+10. skills: 技能数组（3-8项）
+11. qualification_score: 资格评分，0到1之间的小数（建议0.60-0.95）
 
 重要:
 - 所有字段值必须是字符串或数字，不允许null值
-- persona必须是一段连贯的文字描述，不要使用换行符
+- persona必须是一段连贯文字，不要使用换行符，控制在700字以内
 - 使用中文（除了gender字段必须用英文"other"）
 - age必须是整数30，gender必须是字符串"other"
 - 机构账号发言要符合其身份定位"""
@@ -792,6 +1100,9 @@ class OasisProfileGenerator:
                 "country": random.choice(self.COUNTRIES),
                 "profession": "Student",
                 "interested_topics": ["Education", "Social Issues", "Technology"],
+                "role": "Student Observer",
+                "skills": ["peer sentiment", "campus dynamics", "topic amplification"],
+                "qualification_score": round(random.uniform(0.62, 0.80), 2),
             }
         
         elif entity_type_lower in ["publicfigure", "expert", "faculty"]:
@@ -804,6 +1115,9 @@ class OasisProfileGenerator:
                 "country": random.choice(self.COUNTRIES),
                 "profession": entity_attributes.get("occupation", "Expert"),
                 "interested_topics": ["Politics", "Economics", "Culture & Society"],
+                "role": "Domain Expert",
+                "skills": ["evidence synthesis", "critical review", "public explanation"],
+                "qualification_score": round(random.uniform(0.78, 0.93), 2),
             }
         
         elif entity_type_lower in ["mediaoutlet", "socialmediaplatform"]:
@@ -816,6 +1130,9 @@ class OasisProfileGenerator:
                 "country": "中国",
                 "profession": "Media",
                 "interested_topics": ["General News", "Current Events", "Public Affairs"],
+                "role": "Media Desk",
+                "skills": ["source triangulation", "news framing", "rapid updates"],
+                "qualification_score": round(random.uniform(0.72, 0.90), 2),
             }
         
         elif entity_type_lower in ["university", "governmentagency", "ngo", "organization"]:
@@ -828,6 +1145,9 @@ class OasisProfileGenerator:
                 "country": "中国",
                 "profession": entity_type,
                 "interested_topics": ["Public Policy", "Community", "Official Announcements"],
+                "role": "Institutional Account",
+                "skills": ["policy communication", "stakeholder messaging", "public response management"],
+                "qualification_score": round(random.uniform(0.70, 0.88), 2),
             }
         
         else:
@@ -841,6 +1161,9 @@ class OasisProfileGenerator:
                 "country": random.choice(self.COUNTRIES),
                 "profession": entity_type,
                 "interested_topics": ["General", "Social Issues"],
+                "role": "General Social Analyst",
+                "skills": ["discussion participation", "opinion expression", "context awareness"],
+                "qualification_score": round(random.uniform(0.58, 0.78), 2),
             }
     
     def set_graph_id(self, graph_id: str):
@@ -855,7 +1178,8 @@ class OasisProfileGenerator:
         graph_id: Optional[str] = None,
         parallel_count: int = 5,
         realtime_output_path: Optional[str] = None,
-        output_platform: str = "reddit"
+        output_platform: str = "reddit",
+        agent_seeds: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> List[OasisAgentProfile]:
         """
         批量从实体生成Agent Profile（支持并行生成）
@@ -923,7 +1247,8 @@ class OasisProfileGenerator:
                 profile = self.generate_profile_from_entity(
                     entity=entity,
                     user_id=idx,
-                    use_llm=use_llm
+                    use_llm=use_llm,
+                    profile_seed=(agent_seeds or {}).get(entity.uuid)
                 )
                 
                 # 实时输出生成的人设到控制台和日志
@@ -1005,8 +1330,41 @@ class OasisProfileGenerator:
         print(f"\n{'='*60}")
         print(f"人设生成完成！共生成 {len([p for p in profiles if p])} 个Agent")
         print(f"{'='*60}\n")
-        
-        return profiles
+
+        # Final validation/repair pass (removes generic placeholders and enforces robust fields)
+        repaired_profiles: List[OasisAgentProfile] = []
+        for idx, p in enumerate(profiles):
+            if p is None:
+                continue
+            ent = entities[idx] if idx < len(entities) else None
+            p.bio = self._sanitize_generic_text(
+                p.bio,
+                f"{p.name} is a {p.profession or (ent.get_entity_type() if ent else 'Research Analyst')} focused on evidence-based social discourse."
+            )
+            p.persona = self._sanitize_generic_text(
+                p.persona,
+                f"{p.name} contributes structured, source-grounded analysis in social discussion."
+            )
+            # Re-apply famous override if needed
+            merged = self._apply_famous_override(p.name, p.to_dict())
+            seed = (agent_seeds or {}).get(p.source_entity_uuid or "")
+            if seed:
+                merged.setdefault("role", seed.get("role"))
+                merged.setdefault("profession", seed.get("profession"))
+                merged["skills"] = merged.get("skills") or seed.get("skills") or []
+                merged["qualification_score"] = max(
+                    float(merged.get("qualification_score", p.qualification_score or 0.0) or 0.0),
+                    float(seed.get("qualification_score", 0.0) or 0.0)
+                )
+                if seed.get("interested_topics") and not merged.get("interested_topics"):
+                    merged["interested_topics"] = seed.get("interested_topics")
+            p.profession = merged.get("profession", p.profession)
+            p.role = merged.get("role", p.role)
+            p.skills = merged.get("skills", p.skills) or ["evidence review", "discussion", "topic analysis"]
+            p.qualification_score = max(float(merged.get("qualification_score", p.qualification_score or 0.0)), 0.78)
+            repaired_profiles.append(p)
+
+        return repaired_profiles
     
     def _print_generated_profile(self, entity_name: str, entity_type: str, profile: OasisAgentProfile):
         """实时输出生成的人设到控制台（完整内容，不截断）"""
@@ -1030,6 +1388,8 @@ class OasisProfileGenerator:
             f"【基本属性】",
             f"年龄: {profile.age} | 性别: {profile.gender} | MBTI: {profile.mbti}",
             f"职业: {profile.profession} | 国家: {profile.country}",
+            f"角色: {profile.role} | 资格评分: {profile.qualification_score}",
+            f"技能: {', '.join(profile.skills) if profile.skills else '无'}",
             f"兴趣话题: {topics_str}",
             separator
         ]
@@ -1179,6 +1539,12 @@ class OasisProfileGenerator:
                 item["profession"] = profile.profession
             if profile.interested_topics:
                 item["interested_topics"] = profile.interested_topics
+            if profile.role:
+                item["role"] = profile.role
+            if profile.skills:
+                item["skills"] = profile.skills
+            if profile.qualification_score:
+                item["qualification_score"] = profile.qualification_score
             
             data.append(item)
         
@@ -1197,4 +1563,3 @@ class OasisProfileGenerator:
         """[已废弃] 请使用 save_profiles() 方法"""
         logger.warning("save_profiles_to_json已废弃，请使用save_profiles方法")
         self.save_profiles(profiles, file_path, platform)
-

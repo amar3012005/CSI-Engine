@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { recordSessionApiUsage } from '../store/tokenUsageSession'
 
 // 创建axios实例
 const service = axios.create({
@@ -12,6 +13,17 @@ const service = axios.create({
 // 请求拦截器
 service.interceptors.request.use(
   config => {
+    if (!config?.skipSessionTokenTracking) {
+      recordSessionApiUsage({
+        direction: 'input',
+        payload: {
+          method: config.method,
+          url: config.url,
+          params: config.params,
+          data: config.data,
+        }
+      })
+    }
     return config
   },
   error => {
@@ -23,6 +35,13 @@ service.interceptors.request.use(
 // 响应拦截器（容错重试机制）
 service.interceptors.response.use(
   response => {
+    if (!response?.config?.skipSessionTokenTracking) {
+      recordSessionApiUsage({
+        direction: 'output',
+        payload: response.data,
+      })
+    }
+
     const res = response.data
     
     // 如果返回的状态码不是success，则抛出错误
@@ -34,18 +53,28 @@ service.interceptors.response.use(
     return res
   },
   error => {
+    if (error?.response?.data && !error?.config?.skipSessionTokenTracking) {
+      recordSessionApiUsage({
+        direction: 'output',
+        payload: error.response.data,
+      })
+    }
+
+    // Suppress 404 noise — callers handle these gracefully
+    if (error?.response?.status === 404) {
+      return Promise.reject(error)
+    }
+
     console.error('Response error:', error)
-    
-    // 处理超时
+
     if (error.code === 'ECONNABORTED' && error.message.includes('timeout')) {
       console.error('Request timeout')
     }
-    
-    // 处理网络错误
+
     if (error.message === 'Network Error') {
       console.error('Network error - please check your connection')
     }
-    
+
     return Promise.reject(error)
   }
 )

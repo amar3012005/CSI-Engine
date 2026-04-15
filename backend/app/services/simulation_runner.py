@@ -21,6 +21,7 @@ from queue import Queue
 from ..config import Config
 from ..utils.logger import get_logger
 from .zep_graph_memory_updater import ZepGraphMemoryManager
+from .simulation_csi_local import SimulationCSILocalStore
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
 
 logger = get_logger('mirofish.simulation_runner')
@@ -124,7 +125,14 @@ class SimulationRunState:
     # 平台完成状态（通过检测 actions.jsonl 中的 simulation_end 事件）
     twitter_completed: bool = False
     reddit_completed: bool = False
-    
+
+    # CSI research phase status (deepresearch mode)
+    csi_research_running: bool = False
+    csi_research_completed: bool = False
+    csi_research_current_round: int = 0
+    csi_research_total_rounds: int = 0
+    csi_research_error: Optional[str] = None
+
     # 每轮摘要
     rounds: List[RoundSummary] = field(default_factory=list)
     
@@ -177,6 +185,12 @@ class SimulationRunState:
             "twitter_actions_count": self.twitter_actions_count,
             "reddit_actions_count": self.reddit_actions_count,
             "total_actions_count": self.twitter_actions_count + self.reddit_actions_count,
+            # CSI research phase
+            "csi_research_running": self.csi_research_running,
+            "csi_research_completed": self.csi_research_completed,
+            "csi_research_current_round": self.csi_research_current_round,
+            "csi_research_total_rounds": self.csi_research_total_rounds,
+            "csi_research_error": self.csi_research_error,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "completed_at": self.completed_at,
@@ -225,6 +239,107 @@ class SimulationRunner:
     
     # 图谱记忆更新配置
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
+
+    @classmethod
+    def _get_local_csi_store(cls) -> SimulationCSILocalStore:
+        return SimulationCSILocalStore()
+
+    @classmethod
+    def _has_local_csi_artifacts(cls, simulation_id: str) -> bool:
+        try:
+            return cls._get_local_csi_store().has_artifacts(simulation_id)
+        except Exception:
+            return False
+
+    @classmethod
+    def _append_local_csi_runtime_action(cls, simulation_id: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not cls._has_local_csi_artifacts(simulation_id):
+            return None
+        try:
+            return cls._get_local_csi_store().record_runtime_action(simulation_id, payload)
+        except Exception as exc:
+            logger.warning(f"写入本地CSI runtime action失败: {simulation_id}, error={exc}")
+            return None
+
+    @classmethod
+    def _append_local_csi_interview(cls, simulation_id: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not cls._has_local_csi_artifacts(simulation_id):
+            return None
+        try:
+            return cls._get_local_csi_store().record_runtime_interview(simulation_id, payload)
+        except Exception as exc:
+            logger.warning(f"写入本地CSI interview失败: {simulation_id}, error={exc}")
+            return None
+
+    @classmethod
+    def _ingest_local_csi_interview_result(
+        cls,
+        simulation_id: str,
+        interview: Dict[str, Any],
+        response_result: Any,
+        default_platform: Optional[str] = None,
+    ) -> None:
+        if not cls._has_local_csi_artifacts(simulation_id):
+            return
+
+        store = cls._get_local_csi_store()
+        agent_id = interview.get("agent_id")
+        agent_name = interview.get("agent_name")
+        prompt = interview.get("prompt") or ""
+        if not prompt:
+            return
+
+        def record_one(platform_name: Optional[str], payload_result: Any) -> None:
+            if isinstance(payload_result, dict):
+                response_text = (
+                    payload_result.get("response")
+                    or payload_result.get("answer")
+                    or payload_result.get("content")
+                    or payload_result.get("text")
+                    or json.dumps(payload_result, ensure_ascii=False)
+                )
+            else:
+                response_text = payload_result
+
+            store.record_runtime_interview(
+                simulation_id,
+                {
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "prompt": prompt,
+                    "platform": platform_name or interview.get("platform") or default_platform,
+                    "response": response_text,
+                    "result": payload_result,
+                    "round_num": interview.get("round_num", 0) or 0,
+                    "claim_status": "interview_response",
+                    "trial_kind": "interview",
+                    "target_agent_id": interview.get("target_agent_id"),
+                    "target_agent_name": interview.get("target_agent_name"),
+                }
+            )
+
+        if isinstance(response_result, dict) and "platforms" in response_result and isinstance(response_result["platforms"], dict):
+            for platform_name, platform_result in response_result["platforms"].items():
+                record_one(platform_name, platform_result)
+            return
+
+        if isinstance(response_result, dict) and "results" in response_result and isinstance(response_result["results"], dict):
+            matched_any = False
+            for key, item in response_result["results"].items():
+                platform_name = None
+                if isinstance(item, dict):
+                    platform_name = item.get("platform")
+                if not platform_name and isinstance(key, str) and "_" in key:
+                    platform_name = key.split("_", 1)[0]
+                item_agent_id = item.get("agent_id") if isinstance(item, dict) else None
+                if agent_id is not None and item_agent_id is not None and int(item_agent_id) != int(agent_id):
+                    continue
+                record_one(platform_name, item)
+                matched_any = True
+            if matched_any:
+                return
+
+        record_one(interview.get("platform") or default_platform, response_result)
     
     @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
@@ -267,6 +382,12 @@ class SimulationRunner:
                 reddit_completed=data.get("reddit_completed", False),
                 twitter_actions_count=data.get("twitter_actions_count", 0),
                 reddit_actions_count=data.get("reddit_actions_count", 0),
+                # CSI research phase
+                csi_research_running=data.get("csi_research_running", False),
+                csi_research_completed=data.get("csi_research_completed", False),
+                csi_research_current_round=data.get("csi_research_current_round", 0),
+                csi_research_total_rounds=data.get("csi_research_total_rounds", 0),
+                csi_research_error=data.get("csi_research_error"),
                 started_at=data.get("started_at"),
                 updated_at=data.get("updated_at", datetime.now().isoformat()),
                 completed_at=data.get("completed_at"),
@@ -307,6 +428,17 @@ class SimulationRunner:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         cls._run_states[state.simulation_id] = state
+
+    @classmethod
+    def reset_run_state(cls, simulation_id: str) -> None:
+        """Clear cached and persisted run state so a continuation starts cleanly."""
+        cls._run_states.pop(simulation_id, None)
+        state_file = os.path.join(cls.RUN_STATE_DIR, simulation_id, "run_state.json")
+        if os.path.exists(state_file):
+            try:
+                os.remove(state_file)
+            except OSError:
+                logger.warning("删除运行状态文件失败: %s", state_file)
     
     @classmethod
     def start_simulation(
@@ -365,14 +497,37 @@ class SimulationRunner:
             total_simulation_hours=total_hours,
             started_at=datetime.now().isoformat(),
         )
-        
+
         cls._save_run_state(state)
-        
+
+        # ── Check config_mode: deepresearch / web_research skip OASIS entirely ──
+        config_mode = (config.get("config_mode") or "social").strip().lower()
+        if config_mode in {"deepresearch", "csi", "web_research"}:
+            logger.info(
+                "config_mode=%s — skipping OASIS social simulation, "
+                "launching CSI research rounds directly for %s",
+                config_mode, simulation_id,
+            )
+            state.runner_status = RunnerStatus.RUNNING
+            cls._run_states[simulation_id] = state
+            cls._save_run_state(state)
+
+            # Launch CSI research phase directly in a background thread
+            csi_thread = threading.Thread(
+                target=cls._run_csi_research_phase,
+                args=(state,),
+                daemon=True,
+            )
+            csi_thread.start()
+            return state
+
+        # ── Social simulation mode: launch OASIS subprocess ──
+
         # 如果启用图谱记忆更新，创建更新器
         if enable_graph_memory_update:
             if not graph_id:
                 raise ValueError("启用图谱记忆更新时必须提供 graph_id")
-            
+
             try:
                 ZepGraphMemoryManager.create_updater(simulation_id, graph_id)
                 cls._graph_memory_enabled[simulation_id] = True
@@ -382,7 +537,7 @@ class SimulationRunner:
                 cls._graph_memory_enabled[simulation_id] = False
         else:
             cls._graph_memory_enabled[simulation_id] = False
-        
+
         # 确定运行哪个脚本（脚本位于 backend/scripts/ 目录）
         if platform == "twitter":
             script_name = "run_twitter_simulation.py"
@@ -520,8 +675,7 @@ class SimulationRunner:
             exit_code = process.returncode
             
             if exit_code == 0:
-                state.runner_status = RunnerStatus.COMPLETED
-                state.completed_at = datetime.now().isoformat()
+                cls._handle_social_sim_completed(state)
                 logger.info(f"模拟完成: {simulation_id}")
             else:
                 state.runner_status = RunnerStatus.FAILED
@@ -630,8 +784,7 @@ class SimulationRunner:
                                     # 如果运行了两个平台，需要两个都完成
                                     all_completed = cls._check_all_platforms_completed(state)
                                     if all_completed:
-                                        state.runner_status = RunnerStatus.COMPLETED
-                                        state.completed_at = datetime.now().isoformat()
+                                        cls._handle_social_sim_completed(state)
                                         logger.info(f"所有平台模拟已完成: {state.simulation_id}")
                                 
                                 # 更新轮次信息（从 round_end 事件）
@@ -654,6 +807,15 @@ class SimulationRunner:
                                         state.current_round = round_num
                                     # 总体时间取两个平台的最大值
                                     state.simulated_hours = max(state.twitter_simulated_hours, state.reddit_simulated_hours)
+                                    if round_num and cls._has_local_csi_artifacts(state.simulation_id):
+                                        try:
+                                            cls._get_local_csi_store().advance_round_count(
+                                                state.simulation_id,
+                                                round_num,
+                                                source=f"action_log:{platform}:round_end",
+                                            )
+                                        except Exception as exc:
+                                            logger.warning(f"更新本地CSI轮次失败: {state.simulation_id}, error={exc}")
                                 
                                 continue
                             
@@ -669,10 +831,29 @@ class SimulationRunner:
                                 success=action_data.get("success", True),
                             )
                             state.add_action(action)
+                            if cls._has_local_csi_artifacts(state.simulation_id):
+                                runtime_payload = dict(action_data)
+                                runtime_payload.setdefault("platform", platform)
+                                runtime_payload.setdefault("round_num", action.round_num)
+                                runtime_payload.setdefault("agent_id", action.agent_id)
+                                runtime_payload.setdefault("agent_name", action.agent_name)
+                                try:
+                                    cls._append_local_csi_runtime_action(state.simulation_id, runtime_payload)
+                                except Exception as exc:
+                                    logger.warning(f"同步本地CSI runtime action失败: {state.simulation_id}, error={exc}")
                             
                             # 更新轮次
                             if action.round_num and action.round_num > state.current_round:
                                 state.current_round = action.round_num
+                                if cls._has_local_csi_artifacts(state.simulation_id):
+                                    try:
+                                        cls._get_local_csi_store().advance_round_count(
+                                            state.simulation_id,
+                                            action.round_num,
+                                            source=f"action_log:{platform}:action",
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(f"推进本地CSI轮次失败: {state.simulation_id}, error={exc}")
                             
                             # 如果启用了图谱记忆更新，将活动发送到Zep
                             if graph_updater:
@@ -709,9 +890,261 @@ class SimulationRunner:
         if reddit_enabled and not state.reddit_completed:
             return False
         
-        # 至少有一个平台被启用且已完成
+        # 至少有���个平台���启用且已完成
         return twitter_enabled or reddit_enabled
-    
+
+    # ------------------------------------------------------------------
+    # CSI Research Phase (deepresearch mode)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _load_simulation_config(cls, simulation_id: str) -> Dict[str, Any]:
+        """Load the simulation_config.json for the given simulation."""
+        config_path = os.path.join(
+            cls.RUN_STATE_DIR, simulation_id, "simulation_config.json"
+        )
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        with open(config_path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    @classmethod
+    def _load_agent_roster(cls, simulation_id: str) -> List[Dict[str, Any]]:
+        """Load agent roster for CSI research.
+
+        Merges profile data (name, bio, persona, skills) from
+        ``profiles_snapshot.json`` with research assignment data
+        (research_role, responsibility, evidence_priority) from
+        ``research_workflow_config.agent_assignments``.
+        """
+        sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
+
+        # 1. Load profiles snapshot
+        profiles: List[Dict[str, Any]] = []
+        profiles_path = os.path.join(sim_dir, "csi", "profiles_snapshot.json")
+        if os.path.exists(profiles_path):
+            try:
+                with open(profiles_path, "r", encoding="utf-8") as fh:
+                    profiles = json.load(fh)
+                if not isinstance(profiles, list):
+                    profiles = []
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load CSI profiles_snapshot.json: %s", exc,
+                )
+
+        # 2. Load agent_assignments from research_workflow_config
+        assignments: List[Dict[str, Any]] = []
+        try:
+            config = cls._load_simulation_config(simulation_id)
+            rwc = config.get("research_workflow_config") or {}
+            assignments = rwc.get("agent_assignments") or []
+        except FileNotFoundError:
+            pass
+
+        # 3. Build lookup: entity_uuid → assignment
+        assign_by_uuid: Dict[str, Dict[str, Any]] = {}
+        assign_by_name: Dict[str, Dict[str, Any]] = {}
+        for a in assignments:
+            if a.get("entity_uuid"):
+                assign_by_uuid[a["entity_uuid"]] = a
+            if a.get("entity_name"):
+                assign_by_name[a["entity_name"].lower()] = a
+
+        # 4. Merge profiles with assignments
+        merged: List[Dict[str, Any]] = []
+        for idx, profile in enumerate(profiles):
+            # Normalize profile field names
+            agent = dict(profile)
+            agent.setdefault("agent_id", agent.get("user_id", idx))
+            agent.setdefault("agent_name", agent.get("name") or agent.get("user_name") or f"Agent_{idx}")
+            agent.setdefault("entity_uuid", agent.get("source_entity_uuid"))
+            agent.setdefault("entity_name", agent.get("name"))
+            agent.setdefault("entity_type", agent.get("source_entity_type"))
+
+            # Find matching assignment
+            assign = (
+                assign_by_uuid.get(agent.get("entity_uuid") or "")
+                or assign_by_name.get((agent.get("entity_name") or "").lower())
+                or (assignments[idx] if idx < len(assignments) else {})
+            )
+
+            # Merge research fields from assignment
+            for field in ("research_role", "responsibility", "evidence_priority",
+                          "challenge_targets", "output_types"):
+                if field not in agent or not agent[field]:
+                    agent[field] = assign.get(field)
+
+            merged.append(agent)
+
+        if merged:
+            return merged
+
+        # 5. Fallback: just assignments (if no profiles exist)
+        if assignments:
+            for a in assignments:
+                a.setdefault("agent_name", a.get("entity_name"))
+            return assignments
+
+        # 2. research_workflow_config.agent_assignments
+        try:
+            config = cls._load_simulation_config(simulation_id)
+            rwc = config.get("research_workflow_config") or {}
+            assignments = rwc.get("agent_assignments")
+            if isinstance(assignments, list) and assignments:
+                return assignments
+            # 3. Fallback to agent_configs
+            agent_configs = config.get("agent_configs")
+            if isinstance(agent_configs, list) and agent_configs:
+                return agent_configs
+        except FileNotFoundError:
+            pass
+
+        return []
+
+    @classmethod
+    def _handle_social_sim_completed(cls, state: SimulationRunState) -> None:
+        """Called when the social simulation finishes.
+
+        If the simulation is in *deepresearch* mode, launches the CSI
+        research phase in a background thread instead of immediately
+        marking the run as completed.
+        """
+        simulation_id = state.simulation_id
+        try:
+            config = cls._load_simulation_config(simulation_id)
+        except FileNotFoundError:
+            config = {}
+
+        config_mode = (config.get("config_mode") or "social").strip().lower()
+        if config_mode in {"deepresearch", "csi"}:
+            config_mode = "deepresearch"
+
+        if config_mode == "deepresearch":
+            logger.info(
+                "Social simulation completed for %s — launching CSI research phase",
+                simulation_id,
+            )
+            # Launch the CSI phase in a daemon thread so the monitor
+            # thread can finish its clean-up without blocking.
+            csi_thread = threading.Thread(
+                target=cls._run_csi_research_phase,
+                args=(state,),
+                daemon=True,
+            )
+            csi_thread.start()
+        else:
+            # Normal social-only mode: mark completed immediately.
+            state.runner_status = RunnerStatus.COMPLETED
+            state.completed_at = datetime.now().isoformat()
+            cls._save_run_state(state)
+
+    @classmethod
+    def _run_csi_research_phase(cls, state: SimulationRunState) -> None:
+        """Run CSI research rounds using the research engine.
+
+        This runs in a background thread after the social simulation
+        completes.  It updates *state* in-place and persists progress
+        so the frontend can poll ``GET /api/simulation/<id>/run-status``.
+        """
+        simulation_id = state.simulation_id
+        logger.info("Starting CSI research phase for %s", simulation_id)
+
+        try:
+            # Lazy import — the module may not exist yet while the
+            # other agent is building it.
+            from .csi_research_engine import CSIResearchEngine
+            from ..utils.llm_client import LLMClient
+
+            # 1. Load simulation config
+            config = cls._load_simulation_config(simulation_id)
+            research_config: Dict[str, Any] = (
+                config.get("research_workflow_config") or {}
+            )
+
+            # 2. Load CSI store + sources
+            csi_store = cls._get_local_csi_store()
+            snapshot = csi_store.get_snapshot(simulation_id)
+            sources: List[Dict[str, Any]] = (
+                snapshot.get("sources_index", {}).get("sources", [])
+            )
+
+            # 3. Load agent roster
+            roster = cls._load_agent_roster(simulation_id)
+
+            # 4. Determine number of rounds
+            num_rounds: int = research_config.get(
+                "research_rounds_count",
+                len(research_config.get("research_rounds", [])) or 3,
+            )
+            sim_requirement: str = config.get("simulation_requirement", "")
+
+            # 5. Update state — CSI phase starting
+            state.csi_research_running = True
+            state.csi_research_completed = False
+            state.csi_research_total_rounds = num_rounds
+            state.csi_research_current_round = 0
+            state.csi_research_error = None
+            # Keep runner in RUNNING while CSI research is active
+            state.runner_status = RunnerStatus.RUNNING
+            cls._save_run_state(state)
+
+            # 6. Create engine and run
+            engine = CSIResearchEngine(
+                simulation_id=simulation_id,
+                llm_client=LLMClient(usage_scope=simulation_id),
+                csi_store=csi_store,
+                sources=sources,
+                roster=roster,
+                config=research_config,
+            )
+
+            def _on_round_complete(round_idx: int) -> None:
+                """Callback invoked by the engine after each round."""
+                state.csi_research_current_round = round_idx + 1
+                state.updated_at = datetime.now().isoformat()
+                cls._save_run_state(state)
+
+            result = engine.run_research_rounds(
+                num_rounds=num_rounds,
+                simulation_requirement=sim_requirement,
+                on_round_complete=_on_round_complete,
+            )
+
+            # 7. Mark as completed
+            state.csi_research_running = False
+            state.csi_research_completed = True
+            state.csi_research_current_round = num_rounds
+            state.runner_status = RunnerStatus.COMPLETED
+            state.completed_at = datetime.now().isoformat()
+            cls._save_run_state(state)
+
+            logger.info("CSI research phase complete for %s: %s", simulation_id, result)
+
+        except ImportError:
+            # CSIResearchEngine module not yet available — skip gracefully.
+            logger.warning(
+                "csi_research_engine module not available; "
+                "skipping CSI research phase for %s",
+                simulation_id,
+            )
+            state.csi_research_running = False
+            state.csi_research_error = "CSI research engine not available"
+            state.runner_status = RunnerStatus.COMPLETED
+            state.completed_at = datetime.now().isoformat()
+            cls._save_run_state(state)
+
+        except Exception as exc:
+            logger.error(
+                "CSI research phase failed for %s: %s",
+                simulation_id, exc, exc_info=True,
+            )
+            state.csi_research_running = False
+            state.csi_research_error = str(exc)
+            state.runner_status = RunnerStatus.COMPLETED
+            state.completed_at = datetime.now().isoformat()
+            cls._save_run_state(state)
+
     @classmethod
     def _terminate_process(cls, process: subprocess.Popen, simulation_id: str, timeout: int = 10):
         """
@@ -865,19 +1298,20 @@ class SimulationRunner:
                         continue
                     if agent_id is not None and data.get("agent_id") != agent_id:
                         continue
-                    if round_num is not None and data.get("round") != round_num:
+                    if round_num is not None and data.get("round", data.get("round_num")) != round_num:
                         continue
                     
+                    # 支持 CSI 和普通格式
                     actions.append(AgentAction(
-                        round_num=data.get("round", 0),
-                        timestamp=data.get("timestamp", ""),
+                        round_num=data.get("round", data.get("round_num", 0)),
+                        timestamp=data.get("timestamp", data.get("created_at", "")),
                         platform=record_platform,
                         agent_id=data.get("agent_id", 0),
                         agent_name=data.get("agent_name", ""),
                         action_type=data.get("action_type", ""),
-                        action_args=data.get("action_args", {}),
-                        result=data.get("result"),
-                        success=data.get("success", True),
+                        action_args=data.get("action_args", data.get("detail", {})),
+                        result=data.get("result", data.get("detail_text")),
+                        success=data.get("success", data.get("is_success", True)),
                     ))
                     
                 except json.JSONDecodeError:
@@ -935,7 +1369,18 @@ class SimulationRunner:
             actions_log = os.path.join(sim_dir, "actions.jsonl")
             actions = cls._read_actions_from_file(
                 actions_log,
-                default_platform=None,  # 旧格式文件中应该有 platform 字段
+                default_platform=None,
+                platform_filter=platform,
+                agent_id=agent_id,
+                round_num=round_num
+            )
+            
+        # 若仍没有动作，尝试读取 CSI format
+        if not actions:
+            csi_actions_log = os.path.join(sim_dir, "csi", "agent_actions.jsonl")
+            actions = cls._read_actions_from_file(
+                csi_actions_log,
+                default_platform=None,
                 platform_filter=platform,
                 agent_id=agent_id,
                 round_num=round_num
@@ -1467,6 +1912,17 @@ class SimulationRunner:
         )
 
         if response.status.value == "completed":
+            cls._ingest_local_csi_interview_result(
+                simulation_id=simulation_id,
+                interview={
+                    "agent_id": agent_id,
+                    "agent_name": None,
+                    "prompt": prompt,
+                    "platform": platform,
+                },
+                response_result=response.result,
+                default_platform=platform,
+            )
             return {
                 "success": True,
                 "agent_id": agent_id,
@@ -1528,6 +1984,13 @@ class SimulationRunner:
         )
 
         if response.status.value == "completed":
+            for interview in interviews:
+                cls._ingest_local_csi_interview_result(
+                    simulation_id=simulation_id,
+                    interview=interview,
+                    response_result=response.result,
+                    default_platform=platform,
+                )
             return {
                 "success": True,
                 "interviews_count": len(interviews),
@@ -1705,8 +2168,44 @@ class SimulationRunner:
             
         except Exception as e:
             logger.error(f"读取Interview历史失败 ({platform_name}): {e}")
-        
+
         return results
+
+    @classmethod
+    def _get_interview_history_from_local_csi(
+        cls,
+        simulation_id: str,
+        agent_id: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        if not cls._has_local_csi_artifacts(simulation_id):
+            return []
+
+        try:
+            store = cls._get_local_csi_store()
+            snapshot = store.get_snapshot(simulation_id)
+            results: List[Dict[str, Any]] = []
+            for trial in snapshot.get("trials", []):
+                if trial.get("trial_kind", "peer_review") != "interview":
+                    continue
+                if agent_id is not None and int(trial.get("query_agent_id", -1) or -1) != int(agent_id):
+                    continue
+                results.append({
+                    "agent_id": trial.get("query_agent_id"),
+                    "response": trial.get("response", ""),
+                    "prompt": trial.get("query", ""),
+                    "timestamp": trial.get("created_at") or trial.get("updated_at"),
+                    "platform": trial.get("metadata", {}).get("platform", "local_csi"),
+                    "source": "local_csi",
+                })
+
+            results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+            if len(results) > limit:
+                results = results[:limit]
+            return results
+        except Exception as exc:
+            logger.warning(f"读取本地CSI Interview历史失败: {simulation_id}, error={exc}")
+            return []
 
     @classmethod
     def get_interview_history(
@@ -1751,6 +2250,14 @@ class SimulationRunner:
                 limit=limit
             )
             results.extend(platform_results)
+
+        results.extend(
+            cls._get_interview_history_from_local_csi(
+                simulation_id=simulation_id,
+                agent_id=agent_id,
+                limit=limit,
+            )
+        )
         
         # 按时间降序排序
         results.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -1760,4 +2267,3 @@ class SimulationRunner:
             results = results[:limit]
         
         return results
-

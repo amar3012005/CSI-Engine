@@ -9,6 +9,14 @@ export const generateReport = (data) => {
 }
 
 /**
+ * 开始 IEEE 风格论文生成
+ * @param {Object} data - { simulation_id, force_regenerate? }
+ */
+export const generatePaperReport = (data) => {
+  return requestWithRetry(() => service.post('/api/paper-report/generate', data), 3, 1000)
+}
+
+/**
  * 获取报告生成状态
  * @param {string} reportId
  */
@@ -40,6 +48,18 @@ export const getConsoleLog = (reportId, fromLine = 0) => {
  */
 export const getReport = (reportId) => {
   return service.get(`/api/report/${reportId}`)
+}
+
+export const getReportBySimulation = (simulationId) => {
+  return service.get(`/api/report/by-simulation/${simulationId}`)
+}
+
+export const getPaperReportBySimulation = (simulationId) => {
+  return service.get(`/api/paper-report/by-simulation/${simulationId}`)
+}
+
+export const getGoldenTrail = (reportId) => {
+  return service.get(`/api/report/${reportId}/golden-trail`)
 }
 
 /**
