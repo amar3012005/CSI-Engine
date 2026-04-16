@@ -61,8 +61,9 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
         }
+        model_name = (self.model or "").lower()
         
-        # Groq reasoning models are stricter on token params.
+        # Use Groq reasoning models are stricter on token params.
         if "gpt-oss" in (self.model or ""):
             kwargs["max_completion_tokens"] = max_tokens
             kwargs["extra_body"] = {"include_reasoning": False}
@@ -71,6 +72,49 @@ class LLMClient:
             kwargs["temperature"] = temperature
             kwargs["max_tokens"] = max_tokens
         
+        # Groq Compound tool registration:
+        # If we are using a compound model, we must provide the tools in the API call
+        # to avoid 'Tool choice is auto, but no tools are provided' or 'failed_generation' errors.
+        if "compound" in model_name and model_name != "groq/compound":
+            kwargs["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search the web for real-time information and news.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "queries": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "List of search queries"
+                                }
+                            },
+                            "required": ["queries"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "visit_website",
+                        "description": "Visit a specific URL to extract full content.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string", "description": "The URL to visit"}
+                            },
+                            "required": ["url"]
+                        }
+                    }
+                }
+            ]
+            # Groq Compound models handle search NATIVELY and sometimes reject 
+            # explicit tool definitions. However, if 'tool_choice' is 'auto',
+            # it triggers a search cycle. Let's try simplified tool_choice.
+            kwargs["tool_choice"] = "auto"
+
         if response_format:
             kwargs["response_format"] = response_format
 
@@ -151,6 +195,18 @@ class LLMClient:
         if not content and response.choices and getattr(response.choices[0], "message", None):
             # Defensive fallback for providers that return empty content with reasoning traces.
             content = getattr(response.choices[0].message, "reasoning", "") or ""
+        
+        # Groq/Compound Native Search Extraction:
+        # If content is empty but executed_tools contains search results, we wrap them
+        # so they can be ingested by the CSI engine.
+        msg = response.choices[0].message
+        if not content and hasattr(msg, 'executed_tools') and msg.executed_tools:
+            for tool in msg.executed_tools:
+                if tool.type == 'search' and hasattr(tool, 'search_results') and tool.search_results:
+                    # Format as a mock tool call for the engine parser
+                    content = f"<execute_tool>\n{{\"name\": \"web_search\", \"parameters\": {json.dumps(tool.search_results)}}}\n</execute_tool>"
+                    break
+
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content

@@ -2,11 +2,8 @@
   <div class="app-shell">
     <AppSidebar
       :collapsed="sidebarCollapsed"
-      :sessions="recentSessions"
       @toggle="sidebarCollapsed = !sidebarCollapsed"
       @go-home="handleNewChat"
-      @select-session="(simId) => navigateToSession({ simulationId: simId })"
-      @delete-session="handleDeleteSession"
     />
 
     <main class="main-area">
@@ -118,72 +115,7 @@
       </div>
     </main>
 
-    <!-- HIVEMIND Auth Modal -->
-    <Teleport to="body">
-      <Transition name="modal">
-        <div v-if="showAuthModal" class="modal-overlay" @click.self="showAuthModal = false">
-          <div class="auth-modal">
-            <div class="modal-header">
-              <div class="modal-title-row">
-                <span class="modal-icon">&#9889;</span>
-                <h3 class="modal-title">Connect to HIVEMIND</h3>
-              </div>
-              <button class="modal-close" @click="showAuthModal = false">&times;</button>
-            </div>
-
-            <div class="modal-body">
-              <p class="modal-desc">
-                Connect your HIVEMIND account to sync research sessions, access memory graph, and use advanced features.
-              </p>
-
-              <!-- Google OAuth -->
-              <button class="auth-option google" @click="connectGoogle" :disabled="authLoading">
-                <svg class="google-icon" viewBox="0 0 24 24" width="18" height="18">
-                  <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/>
-                  <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
-                  <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
-                  <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
-                </svg>
-                <span>Continue with Google</span>
-              </button>
-
-              <!-- Divider -->
-              <div class="auth-divider">
-                <span>or</span>
-              </div>
-
-              <!-- API Key -->
-              <div class="apikey-section">
-                <label class="apikey-label">HIVEMIND API Key</label>
-                <div class="apikey-input-row">
-                  <input
-                    v-model="apiKeyInput"
-                    type="password"
-                    class="apikey-input"
-                    placeholder="hmk_live_..."
-                    :disabled="authLoading"
-                    @keydown.enter="connectApiKey"
-                  />
-                  <button class="apikey-submit" @click="connectApiKey" :disabled="!apiKeyInput.trim() || authLoading">
-                    Connect
-                  </button>
-                </div>
-                <p class="apikey-hint">
-                  Get your API key from <a :href="hivemindUrl + '/hivemind/settings'" target="_blank" class="apikey-link">HIVEMIND Settings</a>
-                </p>
-              </div>
-
-              <!-- Status -->
-              <div v-if="authError" class="auth-error">{{ authError }}</div>
-              <div v-if="hivemindUser" class="auth-success">
-                Connected as {{ hivemindUser.displayName || hivemindUser.email }}
-                <button class="disconnect-btn" @click="disconnectHivemind">Disconnect</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </Transition>
-    </Teleport>
+    <!-- HIVEMIND Auth Modal was previously here, now fully delegated to AppSidebar -->
   </div>
 </template>
 
@@ -234,123 +166,6 @@ const handleSubmitQuery = () => {
 }
 const error = ref('')
 
-// HIVEMIND Auth
-const hivemindUrl = ref(import.meta.env.VITE_HIVEMIND_CONTROL_PLANE_URL || 'https://api.hivemind.davinciai.eu:8040')
-const showAuthModal = ref(false)
-const authLoading = ref(false)
-const authError = ref('')
-const apiKeyInput = ref('')
-const hivemindUser = ref(null)
-
-// Load saved auth on mount
-const loadSavedAuth = () => {
-  try {
-    const saved = localStorage.getItem('hivemind_auth')
-    if (saved) {
-      const parsed = JSON.parse(saved)
-      hivemindUser.value = parsed.user || null
-    }
-  } catch { /* ignore */ }
-}
-
-const connectGoogle = () => {
-  authError.value = ''
-  // Open HIVEMIND Google OAuth in a popup
-  // Use the same pattern as HIVEMIND's frontend: /auth/google with return_to
-  const returnUrl = encodeURIComponent(window.location.origin + '/?hivemind_auth=callback')
-  const authUrl = `${hivemindUrl.value}/auth/google?return_to=${returnUrl}`
-  const popup = window.open(authUrl, 'hivemind_auth', 'width=500,height=600,popup=yes')
-
-  // Listen for the popup to close and check for auth
-  const timer = setInterval(async () => {
-    if (popup?.closed) {
-      clearInterval(timer)
-      await checkHivemindSession()
-    }
-  }, 500)
-}
-
-const checkHivemindSession = async () => {
-  authLoading.value = true
-  authError.value = ''
-  try {
-    const res = await fetch(`${hivemindUrl.value}/v1/bootstrap`, {
-      credentials: 'include',
-    })
-    if (res.ok) {
-      const data = await res.json()
-      if (data.user) {
-        const u = data.user
-        hivemindUser.value = {
-          id: u.id,
-          email: u.email,
-          displayName: u.display_name || u.displayName || u.email,
-          avatarUrl: u.avatar_url || u.avatarUrl || null,
-          role: u.role,
-          org: data.organization,
-        }
-        localStorage.setItem('hivemind_auth', JSON.stringify({ user: hivemindUser.value, method: 'google' }))
-        showAuthModal.value = false
-      }
-    }
-  } catch (err) {
-    authError.value = 'Could not reach HIVEMIND. Is it running?'
-  } finally {
-    authLoading.value = false
-  }
-}
-
-const connectApiKey = async () => {
-  const key = apiKeyInput.value.trim()
-  if (!key) return
-  authLoading.value = true
-  authError.value = ''
-  try {
-    // Validate the API key by calling bootstrap with it
-    const res = await fetch(`${hivemindUrl.value}/v1/bootstrap`, {
-      headers: { 'X-API-Key': key },
-    })
-    if (res.ok) {
-      const data = await res.json()
-      if (data.user) {
-        const u = data.user
-        hivemindUser.value = {
-          id: u.id,
-          email: u.email,
-          displayName: u.display_name || u.displayName || u.email,
-          avatarUrl: u.avatar_url || u.avatarUrl || null,
-          role: u.role,
-          org: data.organization,
-        }
-        localStorage.setItem('hivemind_auth', JSON.stringify({
-          user: hivemindUser.value,
-          method: 'api_key',
-          apiKey: key,
-        }))
-        showAuthModal.value = false
-        apiKeyInput.value = ''
-      } else {
-        authError.value = 'API key is valid but no user found'
-      }
-    } else if (res.status === 401) {
-      authError.value = 'Invalid API key'
-    } else {
-      authError.value = `HIVEMIND returned ${res.status}`
-    }
-  } catch (err) {
-    authError.value = 'Could not reach HIVEMIND. Is it running?'
-  } finally {
-    authLoading.value = false
-  }
-}
-
-const disconnectHivemind = () => {
-  hivemindUser.value = null
-  localStorage.removeItem('hivemind_auth')
-  apiKeyInput.value = ''
-  authError.value = ''
-}
-
 const URL_PATTERN = /(https?:\/\/[^\s]+)/gi
 
 const extractUrls = (text) => {
@@ -362,13 +177,10 @@ const canSubmit = computed(() => {
   return formData.value.simulationRequirement.trim().length >= 5
 })
 
-// Load auth + history on mount
+// Load history on mount
 onMounted(async () => {
-  loadSavedAuth()
-
-  // Check for OAuth callback
+  // Check for OAuth callback if any old auth logic remains in URL
   if (window.location.search.includes('hivemind_auth=callback')) {
-    await checkHivemindSession()
     window.history.replaceState({}, '', window.location.pathname)
   }
 

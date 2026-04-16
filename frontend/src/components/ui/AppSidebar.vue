@@ -29,54 +29,7 @@
         </a>
       </div>
 
-      <!-- Current session (only when activeSession is provided) -->
-      <div v-if="activeSession" class="sb-nav-section">
-        <span class="sb-section-label">Current Session</span>
-        <div class="sb-session-card active">
-          <span class="sb-session-text">{{ activeSession.title }}</span>
-          <span class="sb-session-id">{{ activeSession.id }}</span>
-        </div>
-        <div v-if="activeSession.checkpoints?.length" class="sb-checkpoint-list">
-          <div
-            v-for="checkpoint in activeSession.checkpoints"
-            :key="checkpoint.id"
-            class="sb-checkpoint-item"
-          >
-            <div class="sb-checkpoint-rail">
-              <span class="sb-checkpoint-dot"></span>
-              <span class="sb-checkpoint-line"></span>
-            </div>
-            <div class="sb-checkpoint-body">
-              <span class="sb-checkpoint-id">{{ checkpoint.id }}</span>
-              <span class="sb-checkpoint-query">{{ checkpoint.query || 'Untitled checkpoint' }}</span>
-              <span class="sb-checkpoint-meta">
-                {{ checkpoint.round_reached || 0 }} rounds · {{ checkpoint.artifact_summary?.claims || 0 }} claims
-              </span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Past sessions -->
-      <div class="sb-nav-section">
-        <span class="sb-section-label">Past Sessions</span>
-        <div
-          v-for="item in sessions"
-          :key="item.id"
-          class="sb-session-row"
-          :class="{ active: item.simulationId === activeSession?.id }"
-        >
-          <a class="sb-nav-item history" @click="$emit('select-session', item.simulationId)">
-            <span class="sb-nav-label">{{ item.label }}</span>
-          </a>
-          <button
-            class="sb-delete-btn"
-            title="Delete session"
-            @click.stop="$emit('delete-session', item.simulationId)"
-          >&times;</button>
-        </div>
-        <span v-if="sessions.length === 0" class="sb-empty">No past sessions</span>
-      </div>
+      <!-- Sessions section removed - using API key auth instead -->
     </nav>
 
     <!-- Collapsed icons -->
@@ -87,17 +40,48 @@
 
     <!-- Connect to HIVEMIND Footer -->
     <div class="sb-profile-footer" :class="{ connected: !!userProfile }">
-      <button v-if="!userProfile" class="sb-connect-btn" @click="handleConnectHIVEMIND">
-        <span class="sb-connect-icon">&#x2B21;</span>
-        <span v-if="!collapsed" class="sb-connect-label">Connect to HIVEMIND</span>
-      </button>
-      <div v-else class="sb-profile-box" :title="userProfile.display_name">
-        <img :src="userProfile.avatar_url" class="sb-avatar" :alt="userProfile.display_name" />
-        <div v-if="!collapsed" class="sb-profile-meta">
-          <span class="sb-user-name">{{ userProfile.display_name }}</span>
-          <span class="sb-user-role">{{ userProfile.role }} · {{ userProfile.organisation_id }}</span>
+      <!-- Not connected: show key input -->
+      <div v-if="!userProfile && !collapsed" class="sb-key-connect">
+        <div v-if="!showKeyInput" class="sb-connect-row">
+          <button class="sb-connect-btn" @click="showKeyInput = true">
+            <span class="sb-connect-icon">&#x2B21;</span>
+            <span class="sb-connect-label">Connect HIVEMIND</span>
+          </button>
+        </div>
+        <div v-else class="sb-key-form">
+          <input
+            v-model="apiKeyInput"
+            type="password"
+            class="sb-key-input"
+            placeholder="Paste API key..."
+            @keydown.enter="handleConnectWithKey"
+            @keydown.esc="showKeyInput = false"
+          />
+          <div class="sb-key-actions">
+            <button class="sb-key-cancel" @click="showKeyInput = false; apiKeyInput = ''">Cancel</button>
+            <button class="sb-key-submit" :disabled="!apiKeyInput.trim() || connecting" @click="handleConnectWithKey">
+              {{ connecting ? '...' : 'Connect' }}
+            </button>
+          </div>
+          <span class="sb-key-hint">Get your key from <a href="https://hivemind.davinciai.eu/hivemind/app/keys" target="_blank">HIVEMIND Dashboard</a></span>
         </div>
       </div>
+      <!-- Collapsed: just icon -->
+      <button v-if="!userProfile && collapsed" class="sb-connect-btn" @click="showKeyInput = true; $emit('toggle')">
+        <span class="sb-connect-icon">&#x2B21;</span>
+      </button>
+      <!-- Connected: show profile -->
+      <div v-if="userProfile" class="sb-profile-box" :title="userProfile.display_name">
+        <img :src="userProfile.avatar_url" class="sb-avatar" :alt="userProfile.display_name" />
+        <div v-if="!collapsed" class="sb-profile-meta">
+          <div class="sb-meta-top">
+            <span class="sb-user-name">{{ userProfile.display_name }}</span>
+            <button class="sb-logout-icon" @click="handleLogout" title="Disconnect">&#x23FB;</button>
+          </div>
+          <span class="sb-user-role">{{ userProfile.organisation_id || 'Connected' }}</span>
+        </div>
+      </div>
+      <div v-if="error && !collapsed" class="sb-error-text">{{ error }}</div>
     </div>
   </aside>
 </template>
@@ -107,40 +91,164 @@ import { ref, onMounted } from 'vue';
 import { authService } from '../../utils/auth';
 
 const userProfile = ref(null);
+const connecting = ref(false);
+const error = ref('');
+const showKeyInput = ref(false);
+const apiKeyInput = ref('');
 
 defineProps({
   collapsed: {
     type: Boolean,
     default: false
-  },
-  activeSession: {
-    type: Object,
-    default: null
-  },
-  sessions: {
-    type: Array,
-    default: () => []
   }
 })
 
-const emit = defineEmits(['toggle', 'go-home', 'select-session', 'delete-session'])
+const emit = defineEmits(['toggle', 'go-home'])
 
 onMounted(() => {
-  userProfile.value = authService.getProfile();
-});
+  // Load existing profile from API key authentication
+  try {
+    userProfile.value = authService.getProfile()
+  } catch {
+    userProfile.value = null
+  }
+})
 
-const handleConnectHIVEMIND = async () => {
-    try {
-        // Unified Identity & Profile Extraction Handshake
-        const mockToken = "hm_jwt_test_token_8a7b6c";
-        userProfile.value = await authService.syncProfile(mockToken);
-    } catch (e) {
-        console.error("Connect to HIVEMIND failed", e);
-    }
+const handleConnectWithKey = async () => {
+  const key = apiKeyInput.value.trim()
+  if (!key) return
+  connecting.value = true
+  error.value = ''
+  try {
+    userProfile.value = await authService.connectWithKey(key)
+    showKeyInput.value = false
+    apiKeyInput.value = ''
+  } catch (e) {
+    error.value = e?.response?.data?.error || 'Invalid key'
+  } finally {
+    connecting.value = false
+  }
+}
+
+const handleLogout = () => {
+  authService.logout();
+  userProfile.value = null;
 };
 </script>
 
 <style scoped>
+.sb-error-text {
+  color: #ef4444;
+  font-size: 11px;
+  margin-top: 5px;
+  padding: 0 5px;
+}
+
+/* Key input form */
+.sb-key-connect {
+  width: 100%;
+}
+
+.sb-connect-row {
+  width: 100%;
+}
+
+.sb-key-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.sb-key-input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid #e3e0db;
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  background: #fff;
+  color: #0a0a0a;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.sb-key-input:focus {
+  border-color: #117dff;
+}
+
+.sb-key-input::placeholder {
+  color: #a3a3a3;
+}
+
+.sb-key-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.sb-key-cancel {
+  flex: 1;
+  padding: 5px;
+  border: 1px solid #e3e0db;
+  border-radius: 6px;
+  background: #fff;
+  color: #525252;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+.sb-key-cancel:hover {
+  background: #faf9f4;
+}
+
+.sb-key-submit {
+  flex: 1;
+  padding: 5px;
+  border: none;
+  border-radius: 6px;
+  background: #117dff;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+.sb-key-submit:hover:not(:disabled) {
+  background: #0d5fcc;
+}
+
+.sb-key-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sb-key-hint {
+  font-size: 10px;
+  color: #a3a3a3;
+  text-align: center;
+}
+
+.sb-key-hint a {
+  color: #117dff;
+  text-decoration: none;
+}
+
+.sb-key-hint a:hover {
+  text-decoration: underline;
+}
+
+.sb-spin {
+  animation: sb-spin-keyframes 1s linear infinite;
+}
+
+@keyframes sb-spin-keyframes {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .sb-profile-footer {
   margin-top: auto;
   padding: 1rem;
@@ -556,5 +664,28 @@ const handleConnectHIVEMIND = async () => {
 .sb-icon-btn.active {
   background: #f3f1ec;
   color: #0a0a0a;
+}
+
+.sb-logout-icon {
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: #a3a3a3;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sb-logout-icon:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+}
+
+.sb-meta-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
 }
 </style>

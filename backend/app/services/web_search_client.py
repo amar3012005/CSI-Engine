@@ -91,13 +91,16 @@ def _validate_source_quality(
         }
     
     reasons = []
+    normalized_title = (title or "").strip()
+    normalized_content = (content or "").strip()
+    combined_text = f"{normalized_title}\n{normalized_content}".strip()
     
     # 1. Content length validation
-    if len(content.strip()) < config["min_content_length"]:
+    if len(combined_text) < config["min_content_length"]:
         reasons.append("content_too_short")
     
     # 2. Title validation
-    if len(title.strip()) < config["min_title_length"]:
+    if len(normalized_title) < config["min_title_length"]:
         reasons.append("title_too_short")
     
     # 3. URL validation
@@ -121,7 +124,7 @@ def _validate_source_quality(
             reasons.append("suspicious_domain")
     
     # 5. Content quality indicators
-    content_lower = content.lower()
+    content_lower = combined_text.lower()
     
     # Check for excessive ads/promotional content
     ad_indicators = ['buy now', 'click here', 'subscribe', 'newsletter', 'advertisement']
@@ -142,8 +145,8 @@ def _validate_source_quality(
     
     # 6. Language detection
     if config["english_only"]:
-        english_chars = sum(1 for c in content if c.isascii())
-        total_chars = len(content)
+        english_chars = sum(1 for c in combined_text if c.isascii())
+        total_chars = len(combined_text)
         if total_chars > 50 and (english_chars / total_chars) < 0.8:
             reasons.append("non_english_content")
     
@@ -152,13 +155,13 @@ def _validate_source_quality(
         reasons.append("low_search_score")
     
     # 8. Duplicate content detection (basic)
-    words = content.split()
-    if len(words) > 50:
+    words = combined_text.split()
+    if len(words) > 200:
         word_freq = {}
         for word in words:
             word_freq[word] = word_freq.get(word, 0) + 1
         max_freq = max(word_freq.values()) if word_freq else 0
-        if max_freq > len(words) * 0.05:
+        if max_freq > len(words) * 0.08:
             reasons.append("repetitive_content")
     
     return {
@@ -177,6 +180,8 @@ class WebSearchClient:
     # Class-level rate-limit state (shared across all instances in one process)
     _last_search_ts: float = 0.0
     _MIN_SEARCH_GAP: float = 2.0  # light guard; 429 retry handles overflow
+    _core_quota_exhausted: bool = False
+    _core_quota_exhausted_logged: bool = False
 
     def __init__(self, api_key: str | None = None, quality_config: Dict[str, Any] | None = None) -> None:
         self._api_key: str = api_key or os.environ.get("TAVILY_API_KEY", "")
@@ -293,6 +298,12 @@ class WebSearchClient:
         Handles 429 rate-limits with exponential backoff (server allows 10/min,
         60/hour, 50/day).  On 0 results, retries once with a simplified query.
         """
+        if WebSearchClient._core_quota_exhausted:
+            if not WebSearchClient._core_quota_exhausted_logged:
+                logger.error("HIVEMIND Core search disabled: daily quota exhausted")
+                WebSearchClient._core_quota_exhausted_logged = True
+            return []
+
         logger.info("Falling back to HIVEMIND Core API for query: '%s'", query)
         try:
             import requests
@@ -325,6 +336,14 @@ class WebSearchClient:
                             logger.info("Retrying with simplified query: '%s'", simple_q)
                             results = self._poll_hivemind_search(url, simple_q, max_results, headers)
                     return results
+                except RuntimeError as exc:
+                    if "quota_exceeded" in str(exc):
+                        WebSearchClient._core_quota_exhausted = True
+                        WebSearchClient._core_quota_exhausted_logged = True
+                        logger.error("HIVEMIND Core search quota exhausted; skipping further Core retries")
+                        return []
+                    logger.warning("HIVEMIND Core fallback via %s failed: %s", url, exc)
+                    last_exc = exc
                 except Exception as exc:
                     logger.warning("HIVEMIND Core fallback via %s failed: %s", url, exc)
                     last_exc = exc
@@ -369,6 +388,14 @@ class WebSearchClient:
                 headers=headers,
                 timeout=15,
             )
+            if submit_resp.status_code in {401, 402, 403, 429}:
+                try:
+                    err_payload = submit_resp.json()
+                except Exception:
+                    err_payload = {}
+                err_code = str(err_payload.get("code") or err_payload.get("error") or "")
+                if "quota_exceeded" in err_code:
+                    raise RuntimeError(f"quota_exceeded: {err_payload}")
             if submit_resp.status_code == 429:
                 retry_after = int(submit_resp.headers.get("Retry-After", backoff))
                 wait = max(retry_after, backoff)
@@ -463,6 +490,39 @@ class WebSearchClient:
         
         sources: List[Dict[str, Any]] = []
         quality_stats = {"total": len(raw_results), "accepted": 0, "rejected": 0, "reasons": {}}
+        relaxed_config = {
+            **self._quality_config,
+            "min_content_length": min(int(self._quality_config.get("min_content_length", 100)), 50),
+            "min_title_length": min(int(self._quality_config.get("min_title_length", 5)), 3),
+            "min_search_score": min(float(self._quality_config.get("min_search_score", 0.3)), 0.1),
+            "strict_domain_filter": False,
+            "max_ad_indicators": max(int(self._quality_config.get("max_ad_indicators", 3)), 5),
+        }
+        deferred_results: List[Dict[str, Any]] = []
+
+        def _append_source(result: Dict[str, Any], quality_check: Dict[str, Any]) -> None:
+            content = result.get("content", "")
+            title = result.get("title", "")
+            url = result.get("url", "")
+            source_id = f"csi_source_web_{_content_hash(url, content)}"
+            sources.append({
+                "source_id": source_id,
+                "source_type": "web",
+                "title": title,
+                "url": url,
+                "content": content,
+                "summary": content[:500],
+                "origin": "web_search",
+                "priority": quality_check["quality_score"],
+                "keywords": _tokenize_keywords(f"{title} {content}"),
+                "metadata": {
+                    "discovered_by": agent_name,
+                    "search_query": query,
+                    "round_num": round_num,
+                    "quality_check": quality_check,
+                    "search_score": float(result.get("score", 0.5) or 0.5),
+                },
+            })
         
         for result in raw_results:
             content = result.get("content", "")
@@ -480,6 +540,7 @@ class WebSearchClient:
                 quality_stats["rejected"] += 1
                 for reason in quality_check["reasons"]:
                     quality_stats["reasons"][reason] = quality_stats["reasons"].get(reason, 0) + 1
+                deferred_results.append(result)
             
             # Only include high-quality sources
             if not quality_check["valid"]:
@@ -488,30 +549,36 @@ class WebSearchClient:
                     title[:50], url, ", ".join(quality_check["reasons"])
                 )
                 continue
-            
-            source_id = f"csi_source_web_{_content_hash(url, content)}"
-            sources.append({
-                "source_id": source_id,
-                "source_type": "web",
-                "title": title,
-                "url": url,
-                "content": content,
-                "summary": content[:500],
-                "origin": "web_search",
-                "priority": quality_check["quality_score"],  # Use adjusted quality score
-                "keywords": _tokenize_keywords(f"{title} {content}"),
-                "metadata": {
-                    "discovered_by": agent_name,
-                    "search_query": query,
-                    "round_num": round_num,
-                    "quality_check": quality_check,
-                    "search_score": score,
-                },
-            })
+
+            _append_source(result, quality_check)
+
+        if not sources and deferred_results:
+            logger.info(
+                "Web search relaxed fallback engaged for query '%s' after 0/%d strict matches",
+                query[:80],
+                len(raw_results),
+            )
+            for result in deferred_results:
+                relaxed_check = _validate_source_quality(
+                    result.get("title", ""),
+                    result.get("url", ""),
+                    result.get("content", ""),
+                    float(result.get("score", 0.5) or 0.5),
+                    relaxed_config,
+                )
+                if relaxed_check["valid"]:
+                    _append_source(result, relaxed_check)
+                    if len(sources) >= max_results:
+                        break
         
         logger.info(
-            "Web search quality filter: %d/%d sources accepted for query '%s' (agent: %s)",
-            quality_stats["accepted"], quality_stats["total"], query[:50], agent_name
+            "Web search quality filter: %d/%d strict matches for query '%s' (agent: %s, top_rejections=%s, final_sources=%d)",
+            quality_stats["accepted"],
+            quality_stats["total"],
+            query[:50],
+            agent_name,
+            quality_stats["reasons"],
+            len(sources),
         )
         
         # Return only the requested number of high-quality sources

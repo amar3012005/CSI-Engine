@@ -1055,6 +1055,7 @@ class SimulationRunner:
             # other agent is building it.
             from .csi_research_engine import CSIResearchEngine
             from ..utils.llm_client import LLMClient
+            from .simulation_manager import SimulationManager
 
             # 1. Load simulation config
             config = cls._load_simulation_config(simulation_id)
@@ -1065,9 +1066,15 @@ class SimulationRunner:
             # 2. Load CSI store + sources
             csi_store = cls._get_local_csi_store()
             snapshot = csi_store.get_snapshot(simulation_id)
-            sources: List[Dict[str, Any]] = (
-                snapshot.get("sources_index", {}).get("sources", [])
-            )
+            
+            # Use cached csi_result from SimulationManager if it exists (for Round 1 visibility)
+            cached_result = SimulationManager._get_csi_result(simulation_id)
+            if cached_result and "sources" in cached_result:
+                sources = cached_result["sources"]
+                logger.info("Using cached CSI result from SimulationManager for %s (%d sources)", simulation_id, len(sources))
+            else:
+                sources = snapshot.get("sources_index", {}).get("sources", [])
+                logger.debug("No cached CSI result found for %s, using snapshot (%d sources)", simulation_id, len(sources))
 
             # 3. Load agent roster
             roster = cls._load_agent_roster(simulation_id)

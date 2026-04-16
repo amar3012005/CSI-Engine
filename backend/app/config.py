@@ -75,6 +75,11 @@ class Config:
     # Tavily Web Search配置（可选 — CSI Research Engine web exploration）
     TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
 
+    # HIVEMIND Connect 配置
+    HIVEMIND_CONTROL_PLANE_URL = os.environ.get('HIVEMIND_CONTROL_PLANE_URL', 'https://api.hivemind.davinciai.eu')
+    HIVEMIND_CORE_API_URL = os.environ.get('HIVEMIND_CORE_API_URL', 'https://core.hivemind.davinciai.eu')
+    HIVEMIND_API_KEY = os.environ.get('HIVEMIND_API_KEY', '')
+
     # Report Agent配置
     REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
     REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))

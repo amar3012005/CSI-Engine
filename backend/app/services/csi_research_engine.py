@@ -120,8 +120,11 @@ def _build_propose_messages(
     evidence_priority = agent.get("evidence_priority") or "balanced"
 
     system_msg = (
-        f"You are {agent_name}, a {research_role} with responsibility: "
-        f"{responsibility}.\nYour evidence priority is: {evidence_priority}."
+        f"You are {agent_name}, a {research_role} and professional {agent.get('profession', 'expert')}. "
+        f"Your bio: {agent.get('bio', 'Expert investigator')}.\n"
+        f"Your responsibility: {responsibility}.\n"
+        f"Your expertise skills: {', '.join(agent.get('skills', []))}.\n"
+        f"Your evidence priority: {evidence_priority}."
     )
     user_msg = (
         "Based on these source materials, propose a specific, evidence-grounded "
@@ -133,20 +136,20 @@ def _build_propose_messages(
         
     user_msg += (
         "If you have strong evidence, construct a factual claim. "
-        "If you explicitly LACK the evidence to verify a truth, you MUST instead search the web to fill your knowledge gap.\n\n"
+        "IMPORTANT: You have NATIVE ACCESS to the web. If you explicitly LACK the evidence to verify a truth, you MUST perform a RECURSIVE SEARCH to fill your gap.\n\n"
         "Respond with ONLY a raw JSON object choosing ONE of these two actions:\n\n"
-        "Action 1 (Propose a Claim):\n"
+        "Action 1 (PROPOSE_CLAIM):\n"
         "{\n"
         '  "action": "propose_claim",\n'
-        '  "claim": "Your specific finding/claim (2-4 sentences)",\n'
+        '  "claim": "Your specific finding (2-4 sentences, matching your profession\'s tone)",\n'
         '  "confidence": 0.95,\n'
-        '  "evidence": "Which specific parts of the sources support this"\n'
+        '  "evidence": "Which specific sources support this"\n'
         "}\n\n"
-        "Action 2 (Search the Web):\n"
+        "Action 2 (SEARCH_WEB):\n"
         "{\n"
         '  "action": "search_web",\n'
-        '  "search_query": "specific highly targeted keyword phrase",\n'
-        '  "reasoning": "I need evidence about [X] before making a claim"\n'
+        '  "search_query": "highly technical keyword phrase based on your profession",\n'
+        '  "reasoning": "I need evidence about [X] from a [Profession] perspective"\n'
         "}"
     )
     return [
@@ -169,12 +172,13 @@ def _build_review_messages(
     proposer_role = proposer.get("research_role") or proposer.get("role") or "proposer"
 
     system_msg = (
-        f"You are {reviewer_name}, a {reviewer_role} with responsibility: "
-        f"{reviewer_resp}.\n"
-        f"You are adversarial and rigorous. You are reviewing a claim by {proposer_name} ({proposer_role})."
+        f"You are {reviewer_name}, a {reviewer_role} and {reviewer.get('profession', 'expert')}.\n"
+        f"Your bio: {reviewer.get('bio', 'Expert reviewer')}.\n"
+        f"You are adversarial and rigorous. You are reviewing a claim by {proposer_name} ({proposer_role}).\n"
+        f"Use your specialized skills: {', '.join(reviewer.get('skills', []))} to CHALLENGE this claim."
     )
     user_msg = (
-        "Review this claim against the available evidence. If the evidence is lacking, YOU MUST search for counter-evidence yourself:\n\n"
+        "Review this claim against available evidence. If it is weak from a [Profession] standpoint, CHALLENGE IT.\n\n"
         f"CLAIM: {claim_text}\n"
         f"SOURCES CITED: {source_snippets}\n\n"
     )
@@ -183,16 +187,17 @@ def _build_review_messages(
         
     user_msg += (
         "Respond with ONLY a raw JSON object choosing ONE of these two actions:\n\n"
-        "Action 1 (Submit Verdict):\n"
+        "Action 1 (CHALLENGE_CLAIM / VERIFY):\n"
         "{\n"
         '  "action": "peer_review",\n'
         '  "verdict": "supports" OR "contradicts" OR "needs_revision",\n'
-        '  "reasoning": "Why this verdict (2-3 sentences)"\n'
+        '  "reasoning": "Scientific/Profession-driven reasoning (2-3 sentences)",\n'
+        '  "critique": "Specific flaws or missing context identified"\n'
         "}\n\n"
-        "Action 2 (Search the Web to prove or debunk):\n"
+        "Action 2 (Search the Web to DEBUNK or VALIDATE):\n"
         "{\n"
         '  "action": "search_web",\n'
-        '  "search_query": "specific context or counter-argument needed",\n'
+        '  "search_query": "specific context or counter-argument needed from your profession\'s angle",\n'
         '  "reasoning": "I need to verify this specific fact before ruling"\n'
         "}"
     )
@@ -230,6 +235,60 @@ def _build_revise_messages(
     ]
 
 
+    async def _run_synthesis_phase(
+        self,
+        agent: Dict[str, Any],
+        claims: List[Dict[str, Any]],
+        simulation_requirement: str,
+        round_num: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Synthesize multiple claims into a consolidated finding for an agent."""
+        if not claims:
+            return None
+
+        # Build list of claim texts
+        claims_text = "\n".join([f"- {c['text']}" for c in claims])
+
+        messages = self._build_synthesis_messages(agent, claims_text, simulation_requirement)
+
+        try:
+            raw = self.llm.chat(messages=messages, temperature=0.3, max_tokens=1024)
+            claim_text = _extract_field(raw, "CLAIM") or raw.strip()
+            confidence = _extract_confidence(raw)
+            evidence = _extract_field(raw, "EVIDENCE")
+        except Exception as exc:
+            logger.warning("Synthesis failed: %s", exc)
+            return None
+
+        # Record as a new claim of kind 'synthesis'
+        synth_record = self.store.record_claim(self.simulation_id, {
+            "agent_id": agent.get("agent_id"),
+            "agent_name": agent.get("agent_name"),
+            "entity_uuid": agent.get("entity_uuid"),
+            "entity_name": agent.get("entity_name"),
+            "entity_type": agent.get("entity_type"),
+            "role": agent.get("role"),
+            "text": claim_text,
+            "source_ids": [], # Combined sources from original claims usually
+            "confidence": confidence,
+            "status": "synthesized",
+            "round_num": round_num,
+            "metadata": {"evidence_summary": evidence}
+        })
+
+        # Link to constituent claims
+        for sc in claims:
+            self.store.record_relation(self.simulation_id, {
+                "relation_type": "synthesized_from",
+                "from_id": synth_record.get("claim_id"),
+                "to_id": sc.get("claim_id"),
+            })
+
+        with self._claims_lock:
+            self._claims.append(synth_record)
+        return synth_record
+
+
 def _build_synthesis_messages(
     agent: Dict[str, Any],
     claims_text: str,
@@ -239,17 +298,18 @@ def _build_synthesis_messages(
     research_role = agent.get("research_role") or agent.get("role") or "investigator"
 
     system_msg = (
-        f"You are {agent_name}, a {research_role}. "
-        "Synthesize the following related claims into a consolidated finding."
+        f"You are {agent_name}, a {research_role} and {agent.get('profession', 'expert')}.\n"
+        f"Your bio: {agent.get('bio', 'Expert investigator')}.\n"
+        "Synthesize these related claims into a consolidated finding."
     )
     user_msg = (
-        "Synthesize these related claims into one consolidated finding relevant to: "
+        "Task: Synthesize these related claims into one consolidated finding relevant to: "
         f'"{simulation_requirement}"\n\n'
-        f"Claims:\n{claims_text}\n\n"
-        "Respond with:\n"
+        f"Claims Data:\n{claims_text}\n\n"
+        "This is a low-latency logistics turn. Respond with:\n"
         "1. CLAIM: Your consolidated finding (2-4 sentences)\n"
         "2. CONFIDENCE: 0.0-1.0\n"
-        "3. EVIDENCE: Key supporting evidence"
+        "3. EVIDENCE: Key supporting evidence identifiers"
     )
     return [
         {"role": "system", "content": system_msg},
@@ -257,9 +317,49 @@ def _build_synthesis_messages(
     ]
 
 
-# ---------------------------------------------------------------------------
-# Prompt builder: web search query generation
-# ---------------------------------------------------------------------------
+def _build_search_query_messages(
+    agent: Dict[str, Any],
+    simulation_requirement: str,
+    round_num: int,
+) -> List[Dict[str, str]]:
+    """Build messages for generating web search queries from an agent's perspective."""
+    agent_name = agent.get("agent_name") or agent.get("entity_name") or "Agent"
+    research_role = agent.get("research_role") or agent.get("role") or "investigator"
+    responsibility = agent.get("responsibility") or "investigate claims"
+    evidence_priority = agent.get("evidence_priority") or "facts and data"
+
+    counter_hint = ""
+    if round_num >= 2:
+        counter_hint = (
+            '\nThis is a later round — focus on finding COUNTER-EVIDENCE, '
+            'alternative viewpoints, or verification of previous findings.'
+        )
+
+    system_msg = (
+        f"You are {agent_name}, a {research_role}. "
+        f"Your specific responsibility in this investigation is: {responsibility}. "
+        f"Your evidence gathering prioritizes: {evidence_priority}.\n"
+        "You use a Deep Research Task Decomposition approach: identify knowledge gaps, draft a working plan, and then output explicit search queries."
+    )
+    user_msg = (
+        "Generate a research strategy to help securely answer the main research question: "
+        f'"{simulation_requirement}"\n\n'
+        "Include relevant keywords like current year, 'latest', or specific entity names to ensure up-to-date and highly accurate results.\n"
+        "Do NOT just copy the main research question. Focus deeply on your unique area of expertise.\n"
+        f"{counter_hint}\n"
+        "Respond with ONLY a raw JSON object containing three keys: 'knowledge_gaps' (list of strings), 'working_plan' (list of steps), and 'search_queries' (list of 2-3 highly specific search strings).\n"
+        "Format precisely:\n"
+        "{\n"
+        '  "knowledge_gaps": ["gap 1"],\n'
+        '  "working_plan": ["step 1"],\n'
+        '  "search_queries": ["query 1"]\n'
+        "}"
+    )
+    return [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+
 
 def _build_search_query_messages(
     agent: Dict[str, Any],
@@ -361,6 +461,85 @@ class CSIResearchEngine:
     """Runs LLM-powered CSI research rounds: investigate, propose, review,
     revise, and synthesize claims using an existing LLMClient and CSI store."""
 
+    def _run_synthesis_phase(
+        self,
+        round_num: int,
+        agent: Dict[str, Any],
+        claims: List[Dict[str, Any]],
+        simulation_requirement: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Agent synthesizes multiple claims into a single consolidated finding."""
+        claims_text = "\n".join(
+            f"- {c.get('text')} (Confidence: {c.get('confidence', 'N/A')})"
+            for c in claims
+        )
+        messages = self._build_synthesis_messages(agent, claims_text, simulation_requirement)
+
+        try:
+            raw = self.llm.chat(messages=messages, temperature=0.3, max_tokens=1024)
+            claim_text = _extract_field(raw, "CLAIM") or raw.strip()
+            confidence = _extract_confidence(raw)
+            evidence = _extract_field(raw, "EVIDENCE")
+        except Exception as exc:
+            logger.warning("Synthesis failed: %s", exc)
+            return None
+
+        # Record as a new claim of kind 'synthesis'
+        synth_record = self.store.record_claim(self.simulation_id, {
+            "agent_id": agent.get("agent_id"),
+            "agent_name": agent.get("agent_name"),
+            "entity_uuid": agent.get("entity_uuid"),
+            "entity_name": agent.get("entity_name"),
+            "entity_type": agent.get("entity_type"),
+            "role": agent.get("role"),
+            "text": claim_text,
+            "source_ids": [], # Combined sources from original claims usually
+            "confidence": confidence,
+            "status": "synthesized",
+            "round_num": round_num,
+            "metadata": {"evidence_summary": evidence}
+        })
+
+        # Link to constituent claims
+        for sc in claims:
+            self.store.record_relation(self.simulation_id, {
+                "relation_type": "synthesized_from",
+                "from_id": synth_record.get("claim_id"),
+                "to_id": sc.get("claim_id"),
+            })
+
+        with self._claims_lock:
+            self._claims.append(synth_record)
+        return synth_record
+
+    def _build_synthesis_messages(
+        self,
+        agent: Dict[str, Any],
+        claims_text: str,
+        simulation_requirement: str,
+    ) -> List[Dict[str, str]]:
+        agent_name = agent.get("agent_name") or agent.get("entity_name") or "Agent"
+        research_role = agent.get("research_role") or agent.get("role") or "investigator"
+
+        system_msg = (
+            f"You are {agent_name}, a {research_role} and {agent.get('profession', 'expert')}.\n"
+            f"Your bio: {agent.get('bio', 'Expert investigator')}.\n"
+            "Synthesize these related claims into a consolidated finding."
+        )
+        user_msg = (
+            "Task: Synthesize these related claims into one consolidated finding relevant to: "
+            f'"{simulation_requirement}"\n\n'
+            f"Claims Data:\n{claims_text}\n\n"
+            "This is a low-latency logistics turn. Respond with:\n"
+            "1. CLAIM: Your consolidated finding (2-4 sentences)\n"
+            "2. CONFIDENCE: 0.0-1.0\n"
+            "3. EVIDENCE: Key supporting evidence identifiers"
+        )
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
     def __init__(
         self,
         simulation_id: str,
@@ -379,11 +558,11 @@ class CSIResearchEngine:
         self.config = config
         self.quality_config = quality_config or {
             "min_content_length": 50,   # HIVEMIND Core returns shorter snippets
-            "min_title_length": 5,
-            "min_search_score": 0.3,
+            "min_title_length": 3,
+            "min_search_score": 0.1,
             "require_news_indicators": False,  # Snippets often lack news phrases
-            "strict_domain_filter": True,
-            "max_ad_indicators": 2,
+            "strict_domain_filter": False,
+            "max_ad_indicators": 5,
             "english_only": True,
         }
 
@@ -420,6 +599,15 @@ class CSIResearchEngine:
         self._claims_lock = threading.Lock()
         self._trials_lock = threading.Lock()
         self._sources_lock = threading.Lock()
+
+        # Groq Native Tool Client for 'Native Intelligence' turns
+        self.groq_native = None
+        if "groq" in Config.LLM_MODEL_NAME.lower() or "compound" in Config.LLM_MODEL_NAME.lower():
+            try:
+                from ..utils.groq_native_client import GroqNativeClient
+                self.groq_native = GroqNativeClient()
+            except Exception as e:
+                logger.warning(f"Failed to initialize GroqNativeClient: {e}")
 
     def _load_simulation_config(self) -> Dict[str, Any]:
         try:
@@ -503,6 +691,9 @@ class CSIResearchEngine:
             logger.info("Round %d/%d", round_num, num_rounds)
             round_claims: List[Dict[str, Any]] = []
             round_claims_lock = threading.Lock()
+
+            # Refresh sources list from store to get newly ingested web sources
+            self.sources = self.store._load_sources_index(self.simulation_id).get("sources", [])
 
             # Reset search budget per round
             for agent in self.roster:
@@ -816,7 +1007,46 @@ class CSIResearchEngine:
 
         try:
             raw = self.llm.chat(messages=messages, temperature=0.7, max_tokens=1536)
-            # Parse JSON action
+            
+            # 0. Check for Native Tool Call wrap from LLMClient (Groq Compound path)
+            native_tool_match = re.search(r'<execute_tool>\s*(.*?)\s*</execute_tool>', raw, re.DOTALL)
+            if native_tool_match:
+                try:
+                    native_data = json.loads(native_tool_match.group(1))
+                    if native_data.get("name") == "web_search":
+                        results = native_data.get("parameters", {}).get("results", [])
+                        if results:
+                            # Direct ingest from native search
+                            csi_sources = []
+                            for r in results:
+                                csi_sources.append({
+                                    "title": r.get("title", "Untitled"),
+                                    "url": r.get("url"),
+                                    "content": r.get("content", ""),
+                                    "score": r.get("score", 0.5),
+                                    "source_type": "web"
+                                })
+                            
+                            ingested = self._ingest_web_results(self.simulation_id, csi_sources, agent, round_num)
+                            
+                            # Record the Native Search action
+                            self.store.record_agent_action(self.simulation_id, {
+                                "action_type": "NATIVE_SEARCH",
+                                "agent_id": agent.get("agent_id"),
+                                "agent_name": agent.get("agent_name"),
+                                "entity_uuid": agent.get("entity_uuid"),
+                                "role": agent.get("role"),
+                                "round_num": round_num,
+                                "detail": {
+                                    "ingested_count": len(ingested),
+                                    "intent": "groq_native_compound_search"
+                                },
+                            })
+                            return {"type": "search_result", "ingested_count": len(ingested), "query": "native_groq_search"}
+                except Exception as e:
+                    logger.warning(f"Failed to parse native tool wrap: {e}")
+
+            # 1. Parse JSON action (Existing path)
             action_data = {}
             for pattern in [r'\{[^{}]*\}', r'\{.*\}']:
                 m = re.search(pattern, raw.strip(), re.DOTALL)
@@ -827,9 +1057,25 @@ class CSIResearchEngine:
                     except json.JSONDecodeError:
                         continue
             
-            # Intercept search_web
-            if action_data.get("action") == "search_web":
-                query = action_data.get("search_query")
+            # Intercept search_web or native model tool calls
+            # Check for native Groq 'web_search' or LightPanda 'web.run' or browser.search
+            is_search = (
+                action_data.get("action") == "search_web" or 
+                action_data.get("name") in ("web_search", "web.run", "browser.search")
+            )
+            if is_search:
+                # Extract query from action_data['search_query'], ['query'], or ['arguments']['queries'][0]
+                query = action_data.get("search_query") or action_data.get("query")
+                if not query and "arguments" in action_data:
+                    args = action_data.get("arguments", {})
+                    query = args.get("search_query") or args.get("query")
+                    if not query:
+                        queries = args.get("queries", [])
+                        if isinstance(queries, list) and len(queries) > 0:
+                            query = queries[0]
+                        elif isinstance(queries, str):
+                            query = queries
+                
                 if query and self._agent_has_action(agent, "SEARCH_WEB"):
                     web_client = self._get_web_client()
                     if web_client:
@@ -838,6 +1084,18 @@ class CSIResearchEngine:
                             query=query, agent_name=agent.get("agent_name"), round_num=round_num, max_results=3, search_depth="basic"
                         )
                         ingested = self._ingest_web_results(self.simulation_id, csi_sources, agent, round_num)
+                        
+                        # Refresh local sources and index to ensure THE SAME AGENT sees them immediately
+                        # in the next proposal chunk of the SAME ROUND.
+                        with self._sources_lock:
+                            updated_idx = self.store._load_sources_index(self.simulation_id)
+                            self.sources = updated_idx.get("sources", [])
+                            # Inject into recall so the agent "knows" what it just found
+                            if "selected_sources" in recall:
+                                existing_ids = {s.get("source_id") for s in recall["selected_sources"]}
+                                for new_s in ingested:
+                                    if new_s.get("source_id") not in existing_ids:
+                                        recall["selected_sources"].append(new_s)
                         
                         # Record the SEARCH_WEB action
                         self.store.record_agent_action(self.simulation_id, {
@@ -953,7 +1211,47 @@ class CSIResearchEngine:
 
         try:
             raw = self.llm.chat(messages=messages, temperature=0.4, max_tokens=1536)
-            # Parse JSON action
+            
+            # 0. Check for Native Tool Call wrap from LLMClient (Groq Compound path)
+            native_tool_match = re.search(r'<execute_tool>\s*(.*?)\s*</execute_tool>', raw, re.DOTALL)
+            if native_tool_match:
+                try:
+                    native_data = json.loads(native_tool_match.group(1))
+                    if native_data.get("name") == "web_search":
+                        results = native_data.get("parameters", {}).get("results", [])
+                        if results:
+                            # Direct ingest from native search
+                            csi_sources = []
+                            for r in results:
+                                csi_sources.append({
+                                    "title": r.get("title", "Untitled"),
+                                    "url": r.get("url"),
+                                    "content": r.get("content", ""),
+                                    "score": r.get("score", 0.5),
+                                    "source_type": "web"
+                                })
+                            
+                            ingested = self._ingest_web_results(self.simulation_id, csi_sources, reviewer, round_num)
+                            
+                            # Record the Native Search action
+                            self.store.record_agent_action(self.simulation_id, {
+                                "action_type": "NATIVE_SEARCH",
+                                "agent_id": reviewer.get("agent_id"),
+                                "agent_name": reviewer.get("agent_name"),
+                                "entity_uuid": reviewer.get("entity_uuid"),
+                                "role": reviewer.get("role"),
+                                "round_num": round_num,
+                                "detail": {
+                                    "ingested_count": len(ingested),
+                                    "intent": "groq_native_compound_search",
+                                    "target_claim": claim.get("claim_id")
+                                },
+                            })
+                            return {"type": "search_result", "ingested_count": len(ingested), "query": "native_groq_search"}
+                except Exception as e:
+                    logger.warning(f"Failed to parse native tool wrap in review: {e}")
+
+            # 1. Parse JSON action
             action_data = {}
             for pattern in [r'\{[^{}]*\}', r'\{.*\}']:
                 m = re.search(pattern, raw.strip(), re.DOTALL)
@@ -964,9 +1262,22 @@ class CSIResearchEngine:
                     except json.JSONDecodeError:
                         continue
             
-            # Intercept search_web
-            if action_data.get("action") == "search_web":
-                query = action_data.get("search_query")
+            # Intercept search_web or native model tool calls
+            # Check for native Groq 'web_search' or LightPanda 'web.run'
+            is_search = action_data.get("action") == "search_web" or action_data.get("name") in ("web_search", "web.run")
+            if is_search:
+                # Extract query from action_data['search_query'], ['query'], or ['arguments']['queries'][0]
+                query = action_data.get("search_query") or action_data.get("query")
+                if not query and "arguments" in action_data:
+                    args = action_data.get("arguments", {})
+                    query = args.get("search_query") or args.get("query")
+                    if not query:
+                        queries = args.get("queries", [])
+                        if isinstance(queries, list) and len(queries) > 0:
+                            query = queries[0]
+                        elif isinstance(queries, str):
+                            query = queries
+                
                 if query and self._agent_has_action(reviewer, "SEARCH_WEB"):
                     web_client = self._get_web_client()
                     if web_client:
@@ -1164,7 +1475,12 @@ class CSIResearchEngine:
         messages = _build_synthesis_messages(agent, claims_text, simulation_requirement)
 
         try:
-            raw = self.llm.chat(messages=messages, temperature=0.5, max_tokens=1536)
+            # Use low-cost Llama-3.1-8B for logistics synthesis turns
+            if "llama-3.1-8b" in Config.LLM_MODEL_NAME.lower() or "instant" in Config.LLM_MODEL_NAME.lower():
+                raw = self.llm.chat(messages=messages, temperature=0.5, max_tokens=1536)
+            else:
+                # If we're on a logic-heavy model, still use it but note the task type
+                raw = self.llm.chat(messages=messages, temperature=0.5, max_tokens=1536)
         except Exception as exc:
             if _is_access_denied_llm_error(exc):
                 logger.warning(

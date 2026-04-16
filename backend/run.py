@@ -4,6 +4,7 @@ MiroFish Backend 启动入口
 
 import os
 import sys
+from http import HTTPStatus
 
 # 解决 Windows 控制台中文乱码问题：在所有导入之前设置 UTF-8 编码
 if sys.platform == 'win32':
@@ -20,6 +21,38 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app import create_app
 from app.config import Config
+
+
+def _build_request_handler():
+    """Create a Werkzeug request handler that suppresses noisy polling logs."""
+    from werkzeug.serving import WSGIRequestHandler
+
+    class QuietPollingRequestHandler(WSGIRequestHandler):
+        QUIET_PREFIXES = (
+            "/api/simulation/",
+            "/api/graph/",
+        )
+
+        def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+            try:
+                status_code = int(code)
+            except (TypeError, ValueError):
+                status_code = 0
+
+            path = getattr(self, "path", "") or ""
+            method = getattr(self, "command", "") or ""
+
+            is_success_poll = (
+                method == "GET"
+                and status_code < HTTPStatus.BAD_REQUEST
+                and path.startswith(self.QUIET_PREFIXES)
+            )
+            if is_success_poll:
+                return
+
+            super().log_request(code, size)
+
+    return QuietPollingRequestHandler
 
 
 def main():
@@ -46,7 +79,13 @@ def main():
     debug = Config.DEBUG
 
     # 启动服务
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    app.run(
+        host=host,
+        port=port,
+        debug=debug,
+        threaded=True,
+        request_handler=_build_request_handler(),
+    )
 
 
 if __name__ == '__main__':

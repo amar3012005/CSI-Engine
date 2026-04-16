@@ -354,6 +354,10 @@ const resumeExistingSimulation = async () => {
       await fetchProfiles({ silent: true })
       await fetchRunStatusDetail()
       emit('update-status', 'completed')
+      // Show report confirmation if no report has been generated yet
+      if (!props.reportStarted) {
+        showReportConfirm.value = true
+      }
       return true
     }
 

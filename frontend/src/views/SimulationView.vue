@@ -2,12 +2,8 @@
   <div class="workspace-view">
     <AppSidebar
       :collapsed="leftNavCollapsed"
-      :activeSession="activeSessionInfo"
-      :sessions="sidebarHistory"
       @toggle="leftNavCollapsed = !leftNavCollapsed"
       @go-home="goHome"
-      @select-session="navigateToSimulation"
-      @delete-session="handleDeleteSession"
     />
 
     <div class="graph-stage" :style="{ left: leftNavCollapsed ? '68px' : '260px' }">
@@ -154,7 +150,9 @@ import AppSidebar from '../components/ui/AppSidebar.vue'
 import AgentMessageDock from '../components/ui/AgentMessageDock.vue'
 import { getSimulationProfilesRealtime } from '../api/simulation'
 import { getAvatarUrl } from '../utils/avatarResolver'
+import { safeGet, safeSet, safeRemove } from '../utils/safeStorage'
 import davinciLogo from '../assets/davinci-logo.svg'
+import { persistence } from '../utils/persistence'
 
 const route = useRoute()
 const router = useRouter()
@@ -259,7 +257,7 @@ const handleDeleteSession = async (simId) => {
     addLog(`Failed to delete session: ${err.message}`)
   }
 }
-const drawerWidth = ref(Math.min(Number(localStorage.getItem(DRAWER_WIDTH_KEY) || 400), window.innerWidth * 0.25))
+const drawerWidth = ref(Math.min(Number(safeGet(DRAWER_WIDTH_KEY) || 400), window.innerWidth * 0.25))
 const isResizing = ref(false)
 let resizeStartX = 0
 let resizeStartWidth = 0
@@ -287,7 +285,7 @@ const stopResize = () => {
   document.removeEventListener('mouseup', stopResize)
   document.body.style.cursor = ''
   document.body.style.userSelect = ''
-  localStorage.setItem(DRAWER_WIDTH_KEY, String(drawerWidth.value))
+  safeSet(DRAWER_WIDTH_KEY, String(drawerWidth.value))
 }
 
 const graphLoading = ref(false)
@@ -302,7 +300,7 @@ const simulationRunning = ref(false)
 const simulationCompleted = ref(false)
 const reportStarted = ref(false)
 const reportCompleted = ref(false)
-const currentReportId = ref(String(route.query.reportId || localStorage.getItem(reportStorageKey.value) || ''))
+const currentReportId = ref(String(route.query.reportId || safeGet(reportStorageKey.value) || ''))
 const minutesPerRound = ref(30)
 const agentProfiles = ref([])
 const selectedAgentId = ref(null)
@@ -481,11 +479,11 @@ const updateWorkspaceStatus = (status) => {
 
 const persistStage = () => {
   if (!hasRealSimulation.value) return
-  localStorage.setItem(stageStorageKey.value, activeStage.value)
+  safeSet(stageStorageKey.value, activeStage.value)
   if (currentReportId.value) {
-    localStorage.setItem(reportStorageKey.value, currentReportId.value)
+    safeSet(reportStorageKey.value, currentReportId.value)
   } else {
-    localStorage.removeItem(reportStorageKey.value)
+    safeRemove(reportStorageKey.value)
   }
 }
 
@@ -570,7 +568,7 @@ const chooseInitialStage = async () => {
     return
   }
   const requested = String(route.query.stage || '')
-  const saved = localStorage.getItem(stageStorageKey.value) || ''
+  const saved = safeGet(stageStorageKey.value) || ''
   const fallback = reportUnlocked.value ? 'report' : simulationUnlocked.value ? 'simulation' : 'environment'
   const desired = requested || saved || fallback
 
@@ -785,14 +783,31 @@ const submitContinuation = async () => {
     reportCompleted.value = false
     simulationCompleted.value = false
     simulationRunning.value = false
-    simulationUnlocked.value = false
+    simulationUnlocked.value = true
 
-    addLog(`Checkpoint ${res.data?.checkpoint_id || 'saved'} created. Ready for a new run.`)
-    // Go to Environment to show agents re-spawning
-    await selectStage('environment')
+    addLog(`Checkpoint ${res.data?.checkpoint_id || 'saved'} created. Starting new run...`)
+
+    // Skip environment — agents and config already exist.
+    // Go directly to simulation and start a new run.
+    await selectStage('simulation')
     await hydrateWorkspace({ initial: true })
     loadSidebarHistory()
-    // Restart polling to detect the new simulation starting
+
+    // Auto-start the simulation
+    try {
+      const { startSimulation } = await import('../api/simulation')
+      await startSimulation({
+        simulation_id: currentSimulationId.value,
+        platform: 'parallel',
+        force: true
+      })
+      addLog('Follow-up simulation started')
+      simulationRunning.value = true
+    } catch (startErr) {
+      addLog(`Failed to start follow-up: ${startErr.message}`)
+    }
+
+    // Restart polling
     stopWorkspacePolling()
     startWorkspacePolling()
   } catch (err) {
@@ -807,7 +822,7 @@ watch(
   async () => {
     stopWorkspacePolling()
     pendingUpload.value = getPendingUpload()
-    currentReportId.value = String(route.query.reportId || localStorage.getItem(reportStorageKey.value) || '')
+    currentReportId.value = String(route.query.reportId || safeGet(reportStorageKey.value) || '')
     reportStarted.value = Boolean(currentReportId.value)
     reportCompleted.value = false
     graphData.value = null
@@ -866,6 +881,17 @@ watch(simulationCompleted, (completed) => {
 watch(reportStarted, (started) => {
   if (started && simulationCompleted.value && activeStage.value === 'simulation') {
     selectStage('report')
+  }
+})
+
+watch(reportCompleted, async (completed) => {
+  if (completed && currentSimulationId.value) {
+    try {
+      await persistence.persistSession(currentSimulationId.value)
+      addLog('Session persisted to HIVEMIND')
+    } catch (e) {
+      addLog(`Session persistence: ${e.message}`)
+    }
   }
 })
 

@@ -163,6 +163,26 @@ class SimulationManager:
         # 内存中的模拟状态缓存
         self._simulations: Dict[str, SimulationState] = {}
 
+    # 全局CSI结果缓存，用于跨组件状态共享 (simulation_id -> csi_result)
+    _csi_results: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def _set_csi_result(cls, simulation_id: str, result: Dict[str, Any]):
+        """缓存CSI运行结果，供后续Round 1或Runner直接索引"""
+        cls._csi_results[simulation_id] = result
+        
+        # Determine current round accurately
+        state_info = result.get("state", {})
+        round_count = state_info.get("round_count", 0)
+        
+        # If we have rounds, suggest this is NOT just a prepare-stage seed, but a valid initial state
+        logger.info(f"CSI simulation result cached for {simulation_id} (Rounds: {round_count}, Sources: {result.get('source_count', 0)})")
+
+    @classmethod
+    def _get_csi_result(cls, simulation_id: str) -> Optional[Dict[str, Any]]:
+        """获取缓存的CSI结果"""
+        return cls._csi_results.get(simulation_id)
+
     def _tokenize_query(self, text: str) -> set:
         if not text:
             return set()
@@ -415,6 +435,34 @@ class SimulationManager:
             json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
         
         self._simulations[state.simulation_id] = state
+
+    def _persist_seed_sources(
+        self,
+        simulation_id: str,
+        csi_store: SimulationCSILocalStore,
+        csi_result: Dict[str, Any],
+        sources: List[Dict[str, Any]],
+    ) -> int:
+        """Merge seed sources into the CSI index and cache them for round 1."""
+        idx = csi_store._load_sources_index(simulation_id)
+        idx_sources = idx.get("sources", [])
+        all_sources = {s["source_id"]: s for s in idx_sources if s.get("source_id")}
+        for source in sources:
+            source_id = source.get("source_id")
+            if source_id:
+                all_sources[source_id] = source
+
+        idx["sources"] = list(all_sources.values())
+        idx["source_count"] = len(idx["sources"])
+        csi_store._save_sources_index(simulation_id, idx)
+
+        cache_payload = {
+            "sources": idx["sources"],
+            "source_count": idx["source_count"],
+            "state": csi_result.get("state", {}),
+        }
+        type(self)._set_csi_result(simulation_id, cache_payload)
+        return idx["source_count"]
     
     def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
         """从文件加载模拟状态"""
@@ -902,6 +950,10 @@ class SimulationManager:
         builds a minimal ``SimulationParameters`` config, and initializes the
         CSI store — all without touching the knowledge graph.
         """
+        state.status = SimulationStatus.PREPARING
+        state.updated_at = datetime.now().isoformat()
+        self._save_simulation_state(state)
+        
         try:
             from .research_team_generator import ResearchTeamGenerator
         except ImportError:
@@ -1096,6 +1148,7 @@ class SimulationManager:
 
             try:
                 from .web_search_client import WebSearchClient
+                from ..utils.groq_native_client import GroqNativeClient
 
                 seed_quality_config = {
                     "min_content_length": 200,
@@ -1107,22 +1160,59 @@ class SimulationManager:
                     "english_only": True,
                 }
 
+                # Try Groq Native Search first for higher quality "Native Intelligence" seeds
+                groq_client = GroqNativeClient()
                 web_client = WebSearchClient(
                     api_key=Config.TAVILY_API_KEY,
                     quality_config=seed_quality_config,
                 )
 
-                if web_client.is_available():
+                seed_count = 0
+                existing_sources = csi_result.get("sources", []) or csi_store._load_sources_index(simulation_id).get("sources", [])
+                existing_ids = {s.get("source_id") for s in existing_sources}
+
+                # OPTION 1: Groq Native Search (if available) - typically much higher quality synthesis
+                try:
+                    logger.info("Attempting Groq Native Seed Search for %s", simulation_id)
+                    seed_prompt_messages = [
+                        {"role": "system", "content": f"You are a specialized CSI Seed Search agent. Your goal is to provide a high-level research overview and initial facts for a new deep research project. Research requirement: {simulation_requirement}"},
+                        {"role": "user", "content": f"Provide an initial research report and key facts about: {simulation_requirement}. Use your native search tools to be thorough and provide many specific data points."}
+                    ]
+                    # Groq returns a synthesized answer. We wrap it as a primary seed source.
+                    native_synthesis = groq_client.chat_with_tools(seed_prompt_messages)
+                    
+                    if native_synthesis and len(native_synthesis) > 200:
+                        synthesis_id = f"csi_source_groq_seed_{hashlib.sha256(native_synthesis[:1000].encode()).hexdigest()[:8]}"
+                        if synthesis_id not in existing_ids:
+                            existing_sources.append({
+                                "source_id": synthesis_id,
+                                "source_type": "web",
+                                "title": f"Groq Native Research Overview: {simulation_requirement[:40]}...",
+                                "url": "groq:native_seed",
+                                "content": native_synthesis,
+                                "summary": native_synthesis[:800],
+                                "origin": "groq_native_search",
+                                "score": 1.0,
+                                "agent_name": "SeedSearch",
+                                "round_num": 0,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            existing_ids.add(synthesis_id)
+                            seed_count += 1
+                            logger.info("Groq Native Seed Search successful (Synthesized content length: %d)", len(native_synthesis))
+                except Exception as groq_exc:
+                    logger.warning("Groq Native Seed Search failed: %s. Falling back to Tavily.", groq_exc)
+
+                # OPTION 2: Standard Tavily/Core Search (only if Groq failed)
+                if seed_count == 0 and web_client.is_available():
+                    logger.info("Running Supplemental Seed Search via Tavily/Core...")
                     # 1-2 broad seed queries derived from the simulation requirement
                     seed_queries = [
                         simulation_requirement[:120],
                         f"{simulation_requirement[:60]} latest research overview",
                     ]
 
-                    existing_sources = csi_result.get("sources", []) or csi_store._load_sources_index(simulation_id).get("sources", [])
-                    existing_ids = {s.get("source_id") for s in existing_sources}
-                    seed_count = 0
-
+                    # seed_count already incremented if Groq worked
                     for sq in seed_queries:
                         csi_sources = web_client.search_as_csi_sources(
                             query=sq,
@@ -1137,43 +1227,6 @@ class SimulationManager:
                                 existing_sources.append(src)
                                 existing_ids.add(sid)
                                 seed_count += 1
-
-                    # Persist seed sources to the CSI store
-                    if seed_count > 0:
-                        try:
-                            idx = csi_store._load_sources_index(simulation_id)
-                            idx_sources = idx.get("sources", [])
-                            idx_sources.extend([s for s in existing_sources if s.get("source_id") not in {x.get("source_id") for x in idx_sources}])
-                            idx["sources"] = idx_sources
-                            idx["source_count"] = len(idx_sources)
-                            csi_store._save_sources_index(simulation_id, idx)
-                        except Exception as exc:
-                            logger.warning("Failed to persist seed sources: %s", exc)
-
-                    if seed_count <= 0:
-                        logger.warning(
-                            "Seed search produced 0 sources for %s — agents will search reactively during debate",
-                            simulation_id,
-                        )
-                        if progress_callback:
-                            progress_callback(
-                                "collecting_sources",
-                                100,
-                                "No seed sources found; agents will search reactively during debate.",
-                                current=1,
-                                total=1,
-                            )
-
-                    logger.info("Seed search complete: %d sources ingested for %s", seed_count, simulation_id)
-
-                    if progress_callback:
-                        progress_callback(
-                            "collecting_sources",
-                            100,
-                            f"Seed search done: {seed_count} sources. Agents will search reactively during debate.",
-                            current=1,
-                            total=1,
-                        )
                 else:
                     logger.warning("Web search unavailable for %s — Tavily and HIVEMIND Core both unconfigured. Agents will proceed without seed sources.", simulation_id)
                     if progress_callback:
@@ -1184,6 +1237,49 @@ class SimulationManager:
                             current=1,
                             total=1,
                         )
+
+                if seed_count > 0:
+                    try:
+                        total_sources = self._persist_seed_sources(
+                            simulation_id=simulation_id,
+                            csi_store=csi_store,
+                            csi_result=csi_result,
+                            sources=existing_sources,
+                        )
+                        logger.info(
+                            "CSI Seed Index updated and CACHED for %s: %d total sources",
+                            simulation_id,
+                            total_sources,
+                        )
+                        # Explicitly mark CSI as ready and initialized
+                        state.csi_initialized = True
+                        state.csi_artifacts_ready = True
+                    except Exception as exc:
+                        logger.warning("Failed to persist seed sources: %s", exc)
+                else:
+                    logger.warning(
+                        "Seed search produced 0 sources for %s — agents will search reactively during debate",
+                        simulation_id,
+                    )
+                    # Even with 0 sources, the CSI structure was initialized in Step 3
+                    state.csi_initialized = True
+                    state.csi_artifacts_ready = True
+
+                if progress_callback:
+                    status_message = (
+                        f"Seed search done: {seed_count} sources ready for round 1."
+                        if seed_count > 0
+                        else "No seed sources found; agents will search reactively during debate."
+                    )
+                    progress_callback(
+                        "collecting_sources",
+                        100,
+                        status_message,
+                        current=1,
+                        total=1,
+                    )
+
+                logger.info("Seed search complete: %d sources ingested for %s", seed_count, simulation_id)
 
             except Exception as exc:
                 logger.warning("Seed search failed during prepare (non-fatal): %s", exc)

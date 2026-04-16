@@ -229,3 +229,26 @@ export const interviewAgents = (data) => {
 export const getSimulationHistory = (limit = 20) => {
   return service.get('/api/simulation/history', { params: { limit } })
 }
+
+/**
+ * Bundle CSI artifacts and push to HIVEMIND.
+ * @param {string} simulationId
+ */
+export const createBundle = (simulationId) => {
+  return requestWithRetry(() => service.post(`/api/simulation/${simulationId}/bundle`), 2, 500)
+}
+
+/**
+ * Get compressed bundle for a simulation — from local cache or HIVEMIND.
+ * @param {string} simulationId
+ */
+export const getBundle = (simulationId) => {
+  return service.get(`/api/simulation/${simulationId}/bundle`)
+}
+
+/**
+ * List CSI sessions stored in HIVEMIND (proxied through backend).
+ */
+export const getCloudSessions = () => {
+  return service.get('/api/simulation/sessions/cloud')
+}

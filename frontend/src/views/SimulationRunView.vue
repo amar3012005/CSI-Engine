@@ -49,6 +49,7 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+import { safeGet, safeSet } from '../utils/safeStorage'
 
 const route = useRoute()
 const router = useRouter()
@@ -76,7 +77,7 @@ const currentStatus = ref('processing') // processing | completed | error
 
 // Panel Resizer Logic
 const PANEL_WIDTH_KEY = 'mirofish_right_panel_width'
-const savedWidth = localStorage.getItem(PANEL_WIDTH_KEY)
+const savedWidth = safeGet(PANEL_WIDTH_KEY)
 const rightPanelWidth = ref(savedWidth ? Number(savedWidth) : 42) // Percentage
 const isDragging = ref(false)
 
@@ -96,7 +97,7 @@ const onDrag = (e) => {
   if (newWidthPct < 20) newWidthPct = 20
   if (newWidthPct > 80) newWidthPct = 80
   rightPanelWidth.value = newWidthPct
-  localStorage.setItem(PANEL_WIDTH_KEY, rightPanelWidth.value)
+  safeSet(PANEL_WIDTH_KEY, rightPanelWidth.value)
 }
 
 const stopDrag = () => {

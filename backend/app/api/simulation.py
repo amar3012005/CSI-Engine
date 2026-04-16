@@ -6,6 +6,10 @@ Step2: Zep实体读取与过滤、OASIS模拟准备与运行（全程自动化�
 import json
 import os
 import traceback
+
+import requests
+import urllib3
+
 from flask import request, jsonify, send_file
 
 from . import simulation_bp
@@ -15,9 +19,12 @@ from ..services.oasis_profile_generator import OasisProfileGenerator
 from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
 from ..services.simulation_csi_local import SimulationCSILocalStore
+from ..services.simulation_persistence import create_full_bundle, push_to_hivemind, get_bundle
 from ..utils.logger import get_logger
 from ..utils.token_usage_tracker import TokenUsageTracker
 from ..models.project import ProjectManager
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = get_logger('mirofish.api.simulation')
 
@@ -3432,3 +3439,116 @@ def close_simulation_env():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+# ---------------------------------------------------------------------------
+# CSI Bundle endpoints
+# ---------------------------------------------------------------------------
+
+@simulation_bp.route('/<simulation_id>/bundle', methods=['POST'])
+def create_bundle_endpoint(simulation_id):
+    """Bundle CSI artifacts and push to HIVEMIND."""
+    api_key = request.headers.get('X-Hivemind-Key', '') or os.environ.get('HIVEMIND_API_KEY', '')
+    try:
+        bundle = create_full_bundle(simulation_id)
+
+        csi_state = bundle.get('csi_state') or {}
+        claim_count = len(csi_state.get('claims', [])) if isinstance(csi_state, dict) else 0
+        source_count = len(
+            csi_state.get('sources_index', {}).get('sources', [])
+        ) if isinstance(csi_state, dict) else 0
+
+        metadata = {
+            'query': bundle.get('query', ''),
+            'timestamp': bundle.get('timestamp', ''),
+            'claim_count': claim_count,
+            'source_count': source_count,
+        }
+
+        hivemind_result = {'success': False, 'error': 'No API key'}
+        if api_key:
+            hivemind_result = push_to_hivemind(
+                simulation_id,
+                bundle.get('compressed', ''),
+                metadata,
+                api_key,
+            )
+
+        return jsonify({
+            'success': True,
+            'simulation_id': simulation_id,
+            'bundle': {k: v for k, v in bundle.items() if k != 'compressed'},
+            'hivemind': hivemind_result,
+            'metadata': metadata,
+        })
+
+    except FileNotFoundError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 404
+    except Exception as exc:
+        logger.error(f"Bundle creation failed for {simulation_id}: {exc}")
+        return jsonify({
+            'success': False,
+            'error': str(exc),
+            'traceback': traceback.format_exc(),
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/bundle', methods=['GET'])
+def get_bundle_endpoint(simulation_id):
+    """Get compressed bundle — from local cache or HIVEMIND."""
+    api_key = request.headers.get('X-Hivemind-Key', '') or os.environ.get('HIVEMIND_API_KEY', '')
+    try:
+        result = get_bundle(simulation_id, api_key=api_key)
+        return jsonify(result)
+    except FileNotFoundError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 404
+    except Exception as exc:
+        logger.error(f"Bundle retrieval failed for {simulation_id}: {exc}")
+        return jsonify({
+            'success': False,
+            'error': str(exc),
+            'traceback': traceback.format_exc(),
+        }), 500
+
+
+# ---------------------------------------------------------------------------
+# Cloud sessions proxy
+# ---------------------------------------------------------------------------
+
+@simulation_bp.route('/sessions/cloud', methods=['GET'])
+def list_cloud_sessions():
+    """List CSI sessions stored in HIVEMIND (proxied to avoid browser CORS)."""
+    api_key = request.headers.get('X-Hivemind-Key', '') or os.environ.get('HIVEMIND_API_KEY', '')
+    if not api_key:
+        return jsonify({'success': True, 'sessions': []})
+
+    hivemind_url = (
+        os.environ.get('HIVEMIND_API_URL')
+        or os.environ.get('HIVEMIND_CORE_API_URL')
+        or 'https://core.hivemind.davinciai.eu:8050'
+    )
+    if 'core.hivemind.davinciai.eu' in hivemind_url and ':8050' not in hivemind_url:
+        hivemind_url = hivemind_url.replace('core.hivemind.davinciai.eu', 'core.hivemind.davinciai.eu:8050')
+    hivemind_url = hivemind_url.rstrip('/')
+
+    try:
+        response = requests.get(
+            f"{hivemind_url}/api/csi/bundles",
+            headers={'x-api-key': api_key},
+            timeout=10,
+            verify=False,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            sessions = data.get('sessions', [])
+            return jsonify({'success': True, 'sessions': sessions})
+
+        logger.warning(f"HIVEMIND sessions fetch failed: {response.status_code}")
+        return jsonify({'success': True, 'sessions': []})
+
+    except requests.exceptions.Timeout:
+        logger.warning("HIVEMIND sessions request timed out")
+        return jsonify({'success': True, 'sessions': []})
+    except Exception as exc:
+        logger.error(f"list_cloud_sessions error: {exc}")
+        return jsonify({'success': True, 'sessions': []})

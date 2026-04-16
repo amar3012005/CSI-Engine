@@ -78,6 +78,7 @@ import { computed, ref, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getProject } from './api/graph'
 import { getSimulation, getRunStatus, getSimulationHistory, continueSimulation, deleteSimulation, getSimulationTokenUsage } from './api/simulation'
+import { persistence } from './utils/persistence'
 import { getReport } from './api/report'
 import AppSidebar from './components/ui/AppSidebar.vue'
 import { useSidebar } from './store/sidebar'
@@ -214,13 +215,26 @@ const handleDeleteSession = async (simId) => {
 
 const loadSessions = async () => {
   try {
+    // Try merged cloud + local sessions first
+    const sessions = await persistence.listSessions()
+    if (sessions.length > 0) {
+      recentSessions.value = sessions.map(s => ({
+        id: s.simulation_id,
+        label: (s.query || '').substring(0, 50) || `Session ${s.simulation_id?.slice(-8) || ''}`,
+        simulationId: s.simulation_id,
+        source: s.source
+      }))
+      return
+    }
+  } catch { /* fallback below */ }
+
+  // Fallback: local backend history
+  try {
     const res = await getSimulationHistory(20)
     if (res?.success && res?.data) {
       recentSessions.value = (res.data.simulations || res.data || [])
         .map(s => {
-          // Try multiple fields for a human-readable label
-          const label = s.simulation_requirement || s.project_name || s.requirement || ''
-          // Skip entries that only have a sim ID as label
+          const label = s.simulation_requirement || s.project_name || ''
           const displayLabel = label && !label.startsWith('sim_') ? label.substring(0, 50) : ''
           return {
             id: s.simulation_id,
@@ -340,6 +354,17 @@ watch(
 
 // Load sessions on mount and when route changes
 onMounted(() => {
+  // Clean any stale OAuth callback params from URL
+  try {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('hivemind_auth')) {
+      const cleanUrl = new URL(window.location.href)
+      cleanUrl.searchParams.delete('token')
+      cleanUrl.searchParams.delete('hivemind_auth')
+      window.history.replaceState({}, '', cleanUrl.toString())
+    }
+  } catch {}
+
   loadSessions()
 })
 
