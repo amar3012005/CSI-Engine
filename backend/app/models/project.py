@@ -32,9 +32,13 @@ class Project:
     created_at: str
     updated_at: str
     
-    # 文件信息
-    files: List[Dict[str, str]] = field(default_factory=list)  # [{filename, path, size}]
+    # 文件信息 (DocumentAsset 格式)
+    # {asset_id, filename, path, size, source_type, mime, language, parser_used, extract_status, stats}
+    files: List[Dict[str, Any]] = field(default_factory=list)
     total_text_length: int = 0
+    
+    # 本地化诊断信息
+    extraction_diagnostics: Dict[str, Any] = field(default_factory=dict)
     
     # 本体信息（接口1生成后填充）
     ontology: Optional[Dict[str, Any]] = None
@@ -69,6 +73,7 @@ class Project:
             "simulation_requirement": self.simulation_requirement,
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
+            "extraction_diagnostics": self.extraction_diagnostics,
             "error": self.error
         }
     
@@ -87,6 +92,7 @@ class Project:
             updated_at=data.get('updated_at', ''),
             files=data.get('files', []),
             total_text_length=data.get('total_text_length', 0),
+            extraction_diagnostics=data.get('extraction_diagnostics', {}).copy(),
             ontology=data.get('ontology'),
             analysis_summary=data.get('analysis_summary'),
             graph_id=data.get('graph_id'),
@@ -293,6 +299,29 @@ class ProjectManager:
             "size": file_size
         }
     
+    @classmethod
+    def _get_project_assets_path(cls, project_id: str) -> str:
+        """获取项目 DocumentAssets 存储路径"""
+        return os.path.join(cls._get_project_dir(project_id), 'assets.json')
+    
+    @classmethod
+    def save_assets(cls, project_id: str, assets: List[Dict[str, Any]]) -> None:
+        """Stage 2: 保存结构化 DocumentAssets"""
+        assets_path = cls._get_project_assets_path(project_id)
+        # Strip large content before saving to metadata if needed, 
+        # but for now we keep it structured.
+        with open(assets_path, 'w', encoding='utf-8') as f:
+            json.dump(assets, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def get_assets(cls, project_id: str) -> List[Dict[str, Any]]:
+        """获取结构化 DocumentAssets"""
+        assets_path = cls._get_project_assets_path(project_id)
+        if not os.path.exists(assets_path):
+            return []
+        with open(assets_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
     @classmethod
     def save_extracted_text(cls, project_id: str, text: str) -> None:
         """保存提取的文本"""

@@ -265,29 +265,50 @@ def generate_ontology():
         project.simulation_requirement = simulation_requirement
         logger.info(f"创建项目: {project.project_id}")
         
-        # 保存文件并提取文本
+        # 保存文件并提取文本 (Stage 1: DocumentAsset normalize)
         document_texts = []
         all_text = ""
         failed_urls = []
         
         for file in uploaded_files:
-            if file and file.filename and allowed_file(file.filename):
+            if file and file.filename: # check allowed inside parse_asset
                 # 保存文件到项目目录
                 file_info = ProjectManager.save_file_to_project(
                     project.project_id, 
                     file, 
                     file.filename
                 )
-                project.files.append({
-                    "filename": file_info["original_filename"],
-                    "size": file_info["size"]
-                })
+                
+                # Stage 1: Normalize to DocumentAsset
+                asset = FileParser.parse_asset(file_info["path"], file.filename)
+                asset["original_filename"] = file.filename
+                asset["size"] = file_info["size"] # update with actual size
+                
+                # Reject empty/unsupported early
+                if asset["extract_status"] in ["rejected", "failed"]:
+                    logger.warning(f"Rejecting asset {file.filename}: {asset.get('error')}")
+                    # store diagnostics
+                    project.extraction_diagnostics[asset["asset_id"]] = {
+                        "filename": file.filename,
+                        "status": asset["extract_status"],
+                        "error": asset.get("error")
+                    }
+                    continue
+
+                project.files.append(asset)
                 
                 # 提取文本
-                text = FileParser.extract_text(file_info["path"])
+                text = asset.get("content", "")
                 text = TextProcessor.preprocess_text(text)
                 document_texts.append(text)
-                all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
+                all_text += f"\n\n=== {file.filename} ===\n{text}"
+                
+                # Store per-file diagnostic
+                project.extraction_diagnostics[asset["asset_id"]] = {
+                    "filename": file.filename,
+                    "status": "success",
+                    "stats": asset.get("stats")
+                }
 
         if requested_urls:
             web_search_client = WebSearchClient()
@@ -300,54 +321,49 @@ def generate_ontology():
             for url in requested_urls:
                 try:
                     source = extracted_sources.get(url)
+                    text = ""
+                    source_title = ""
+                    
                     if source and source.get('content'):
                         source_title = source.get('title') or urlparse(url).netloc or url
                         text = TextProcessor.preprocess_text(str(source.get('content', '')))
-                        if text:
-                            project.files.append({
-                                "filename": source_title,
-                                "size": len(text.encode('utf-8')),
-                                "source_url": url,
-                                "source_type": "url"
-                            })
-                            document_texts.append(text)
-                            all_text += f"\n\n=== {source_title} ({url}) ===\n{text}"
-                            continue
-
-                    fetched_source = _fetch_url_source(url)
-                    if fetched_source['mode'] == 'file':
-                        file_info = ProjectManager.save_bytes_to_project(
-                            project.project_id,
-                            fetched_source['content'],
-                            str(fetched_source['filename']),
-                        )
-                        text = FileParser.extract_text(file_info['path'])
-                        text = TextProcessor.preprocess_text(text)
-                        if text:
-                            project.files.append({
-                                "filename": file_info['original_filename'],
-                                "size": file_info['size'],
-                                "source_url": url,
-                                "source_type": "url"
-                            })
-                            document_texts.append(text)
-                            all_text += f"\n\n=== {file_info['original_filename']} ({url}) ===\n{text}"
-                            continue
-                    else:
-                        text = TextProcessor.preprocess_text(str(fetched_source['content']))
-                        if text:
+                        
+                    if not text:
+                        fetched_source = _fetch_url_source(url)
+                        if fetched_source['mode'] == 'file':
+                            file_info = ProjectManager.save_bytes_to_project(
+                                project.project_id,
+                                fetched_source['content'],
+                                str(fetched_source['filename']),
+                            )
+                            asset = FileParser.parse_asset(file_info['path'], file_info['original_filename'])
+                            if asset["extract_status"] == "success":
+                                text = TextProcessor.preprocess_text(asset.get("content", ""))
+                                source_title = file_info['original_filename']
+                        else:
+                            text = TextProcessor.preprocess_text(str(fetched_source['content']))
                             source_title = str(fetched_source['title']) or url
-                            project.files.append({
-                                "filename": source_title,
-                                "size": len(text.encode('utf-8')),
-                                "source_url": url,
-                                "source_type": "url"
-                            })
-                            document_texts.append(text)
-                            all_text += f"\n\n=== {source_title} ({url}) ===\n{text}"
-                            continue
 
-                    failed_urls.append({"url": url, "error": "未提取到可用文本"})
+                    if text:
+                        asset_id = f"asset_{uuid.uuid4().hex[:8]}"
+                        project.files.append({
+                            "asset_id": asset_id,
+                            "filename": source_title,
+                            "size": len(text.encode('utf-8')),
+                            "source_url": url,
+                            "source_type": "url",
+                            "extract_status": "success"
+                        })
+                        document_texts.append(text)
+                        all_text += f"\n\n=== {source_title} ({url}) ===\n{text}"
+                        
+                        project.extraction_diagnostics[asset_id] = {
+                            "filename": source_title,
+                            "url": url,
+                            "status": "success"
+                        }
+                    else:
+                        failed_urls.append({"url": url, "error": "未提取到可用文本"})
                 except Exception as exc:
                     logger.warning("URL ingestion failed for %s: %s", url, exc)
                     failed_urls.append({"url": url, "error": str(exc)})
@@ -363,7 +379,11 @@ def generate_ontology():
         # 保存提取的文本
         project.total_text_length = len(all_text)
         ProjectManager.save_extracted_text(project.project_id, all_text)
-        logger.info(f"文本提取完成，共 {len(all_text)} 字符")
+        
+        # Stage 2: Save structured DocumentAssets for provenance
+        ProjectManager.save_assets(project.project_id, project.files)
+        
+        logger.info(f"文本提取且 Asset 结构化完成，共 {len(all_text)} 字符")
         
         # 生成本体
         logger.info("调用 LLM 生成本体定义...")

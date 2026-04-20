@@ -1,77 +1,88 @@
 <template>
   <div class="report-workspace-panel">
-    <!-- Loading -->
-    <div v-if="loading" class="report-state">
-      <div class="state-spinner"></div>
-      <span class="state-title">Generating report</span>
-      <span class="state-desc">Drafting from simulation artifacts...</span>
-    </div>
+    <!-- Health mode: structured diagnostic report -->
+    <HealthReportPanel
+      v-if="resolvedHealthMode"
+      :simulationId="simulationId"
+    />
 
-    <!-- Error -->
-    <div v-else-if="error" class="report-state">
-      <span class="state-icon error-icon">!</span>
-      <span class="state-title">Report unavailable</span>
-      <span class="state-desc">{{ error }}</span>
-    </div>
-
-    <!-- Report content -->
-    <div v-else-if="reportData" class="report-content">
-      <!-- Header bar -->
-      <div class="report-bar">
-        <div class="rb-left">
-          <span class="rb-tag">Report</span>
-          <span class="rb-id">{{ currentReportId }}</span>
-          <span v-if="!isComplete" class="rb-generating">
-            <span class="rb-gen-dot"></span>
-            Generating
-          </span>
-        </div>
-        <div class="rb-right">
-          <span v-if="reportData.created_at" class="rb-date">{{ formatDate(reportData.created_at) }}</span>
-          <button class="rb-btn" @click="showPaper = true">View Paper</button>
-        </div>
+    <!-- Standard mode: markdown paper report -->
+    <template v-else>
+      <!-- Loading -->
+      <div v-if="loading" class="report-state">
+        <div class="state-spinner"></div>
+        <span class="state-title">Generating report</span>
+        <span class="state-desc">Drafting from simulation artifacts...</span>
       </div>
 
-      <!-- Section-by-section rendering -->
-      <div class="report-body">
-        <div
-          v-for="(section, idx) in reportSections"
-          :key="idx"
-          class="report-section"
-        >
-          <div v-if="section.content" class="section-rendered markdown-body" v-html="renderSection(section.content)"></div>
-          <div v-else class="section-skeleton">
-            <div class="skel-title"></div>
-            <div class="skel-line long"></div>
-            <div class="skel-line medium"></div>
-            <div class="skel-line short"></div>
+      <!-- Error -->
+      <div v-else-if="error" class="report-state">
+        <span class="state-icon error-icon">!</span>
+        <span class="state-title">Report unavailable</span>
+        <span class="state-desc">{{ error }}</span>
+      </div>
+
+      <!-- Report content -->
+      <div v-else-if="reportData" class="report-content">
+        <!-- Header bar -->
+        <div class="report-bar">
+          <div class="rb-left">
+            <span class="rb-tag">Report</span>
+            <span class="rb-id">{{ currentReportId }}</span>
+            <span v-if="!isComplete" class="rb-generating">
+              <span class="rb-gen-dot"></span>
+              Generating
+            </span>
+          </div>
+          <div class="rb-right">
+            <span v-if="reportData.created_at" class="rb-date">{{ formatDate(reportData.created_at) }}</span>
+            <button class="rb-btn" @click="showPaper = true">View Paper</button>
           </div>
         </div>
 
-        <!-- Loading skeleton for remaining sections -->
-        <div v-if="!isComplete && reportSections.length > 0" class="section-skeleton loading-next">
-          <div class="skel-spinner"></div>
-          <span class="skel-label">Writing next section...</span>
+        <!-- Section-by-section rendering -->
+        <div class="report-body">
+          <div
+            v-for="(section, idx) in reportSections"
+            :key="idx"
+            class="report-section"
+          >
+            <div v-if="section.content" class="section-rendered markdown-body" v-html="renderSection(section.content)"></div>
+            <div v-else class="section-skeleton">
+              <div class="skel-title"></div>
+              <div class="skel-line long"></div>
+              <div class="skel-line medium"></div>
+              <div class="skel-line short"></div>
+            </div>
+          </div>
+
+          <!-- Loading skeleton for remaining sections -->
+          <div v-if="!isComplete && reportSections.length > 0" class="section-skeleton loading-next">
+            <div class="skel-spinner"></div>
+            <span class="skel-label">Writing next section...</span>
+          </div>
         </div>
       </div>
-    </div>
 
-    <!-- Full page modal -->
-    <FullPaperModal
-      v-model="showPaper"
-      :report-id="currentReportId"
-      :report-data="reportData"
-      :loading="loading"
-    />
+      <!-- Full page modal -->
+      <FullPaperModal
+        v-model="showPaper"
+        :report-id="currentReportId"
+        :report-data="reportData"
+        :loading="loading"
+      />
+    </template>
   </div>
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { getPaperReportBySimulation, getReport } from '../api/report'
+import { getSimulation } from '../api/simulation'
 import FullPaperModal from './FullPaperModal.vue'
+import HealthReportPanel from './HealthReportPanel.vue'
 
 const props = defineProps({
   simulationId: {
@@ -85,6 +96,14 @@ const props = defineProps({
   reportStarted: {
     type: Boolean,
     default: false
+  },
+  isHealthMode: {
+    type: Boolean,
+    default: false
+  },
+  simulationConfigMode: {
+    type: String,
+    default: ''
   }
 })
 
@@ -93,6 +112,8 @@ const emit = defineEmits(['report-loaded'])
 const reportData = ref(null)
 const loading = ref(false)
 const showPaper = ref(false)
+// Self-determined health mode — verified from simulation API, not relying solely on prop
+const resolvedHealthMode = ref(props.isHealthMode)
 const error = ref('')
 const currentReportId = ref(props.reportId || '')
 let pollTimer = null
@@ -184,10 +205,31 @@ const fetchReport = async (id) => {
   }
 }
 
+const resolveHealthMode = async () => {
+  // Fast path: prop or already-loaded config_mode
+  if (props.isHealthMode || props.simulationConfigMode === 'health') {
+    resolvedHealthMode.value = true
+    return
+  }
+  // Fallback: fetch directly (handles cold-load where prop hasn't propagated yet)
+  if (!props.simulationId) return
+  try {
+    const res = await getSimulation(props.simulationId)
+    if (res.success && res.data?.config_mode === 'health') {
+      resolvedHealthMode.value = true
+    }
+  } catch {
+    // keep as prop value
+  }
+}
+
 const initialize = async () => {
+  // Health mode uses HealthReportPanel (rendered via v-if in template) — skip paper polling
+  if (resolvedHealthMode.value) return
+
   error.value = ''
   loading.value = true
-  
+
   try {
     if (props.reportId) {
       currentReportId.value = props.reportId
@@ -199,7 +241,7 @@ const initialize = async () => {
         await fetchReport(lookup.data.report_id)
       }
     }
-    
+
     if (props.reportStarted && reportData.value?.status !== 'completed') {
       startPolling()
     }
@@ -208,15 +250,30 @@ const initialize = async () => {
   }
 }
 
+watch(() => props.isHealthMode, (val) => {
+  if (val) resolvedHealthMode.value = true
+})
+
+watch(() => props.simulationConfigMode, (val) => {
+  if (val === 'health') resolvedHealthMode.value = true
+})
+
 watch(() => props.reportId, (newId) => {
-  if (newId && newId !== currentReportId.value) {
+  if (!resolvedHealthMode.value && newId && newId !== currentReportId.value) {
     currentReportId.value = newId
     initialize()
   }
 })
 
 watch(() => props.reportStarted, (started) => {
-  if (started && !reportData.value) {
+  if (!resolvedHealthMode.value && started && !reportData.value) {
+    initialize()
+  }
+})
+
+onMounted(async () => {
+  await resolveHealthMode()
+  if (!resolvedHealthMode.value) {
     initialize()
   }
 })
@@ -224,8 +281,6 @@ watch(() => props.reportStarted, (started) => {
 onBeforeUnmount(() => {
   stopPolling()
 })
-
-initialize()
 </script>
 
 <style scoped>

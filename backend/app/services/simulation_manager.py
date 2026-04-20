@@ -9,6 +9,8 @@ import json
 import shutil
 import re
 import hashlib
+import tempfile
+import threading
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,6 +22,7 @@ from .zep_entity_reader import ZepEntityReader, FilteredEntities, EntityNode
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
 from .simulation_csi_local import SimulationCSILocalStore
+from .text_processor import TextProcessor
 from ..models.project import ProjectManager
 
 logger = get_logger('mirofish.simulation')
@@ -155,6 +158,7 @@ class SimulationManager:
         os.path.dirname(__file__), 
         '../../uploads/simulations'
     )
+    _state_file_lock = threading.RLock()
     
     def __init__(self):
         # 确保目录存在
@@ -174,9 +178,10 @@ class SimulationManager:
         # Determine current round accurately
         state_info = result.get("state", {})
         round_count = state_info.get("round_count", 0)
+        source_count = result.get('source_count', 0)
         
         # If we have rounds, suggest this is NOT just a prepare-stage seed, but a valid initial state
-        logger.info(f"CSI simulation result cached for {simulation_id} (Rounds: {round_count}, Sources: {result.get('source_count', 0)})")
+        logger.info(f"CSI simulation result cached for {simulation_id} (Rounds: {round_count}, Sources: {source_count})")
 
     @classmethod
     def _get_csi_result(cls, simulation_id: str) -> Optional[Dict[str, Any]]:
@@ -430,9 +435,18 @@ class SimulationManager:
         state_file = os.path.join(sim_dir, "state.json")
         
         state.updated_at = datetime.now().isoformat()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+
+        with self._state_file_lock:
+            fd, temp_path = tempfile.mkstemp(prefix="state_", suffix=".json.tmp", dir=sim_dir)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, state_file)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
         
         self._simulations[state.simulation_id] = state
 
@@ -447,22 +461,34 @@ class SimulationManager:
         idx = csi_store._load_sources_index(simulation_id)
         idx_sources = idx.get("sources", [])
         all_sources = {s["source_id"]: s for s in idx_sources if s.get("source_id")}
-        for source in sources:
-            source_id = source.get("source_id")
-            if source_id:
-                all_sources[source_id] = source
-
-        idx["sources"] = list(all_sources.values())
-        idx["source_count"] = len(idx["sources"])
-        csi_store._save_sources_index(simulation_id, idx)
-
-        cache_payload = {
-            "sources": idx["sources"],
-            "source_count": idx["source_count"],
-            "state": csi_result.get("state", {}),
+        seen_urls = {
+            (s.get("url") or "").strip().lower().rstrip("/")
+            for s in idx_sources
+            if s.get("url")
         }
-        type(self)._set_csi_result(simulation_id, cache_payload)
-        return idx["source_count"]
+        for source in sources:
+            normalized_url = (source.get("url") or "").strip().lower().rstrip("/")
+            # Check if this URL is already in our persistent index
+            if normalized_url and normalized_url in seen_urls:
+                continue
+            
+            # If not in index, add it to our new set
+            sid = source.get("source_id")
+            if sid:
+                all_sources[sid] = source
+                if normalized_url:
+                    seen_urls.add(normalized_url)
+        
+        updated_list = list(all_sources.values())
+        csi_store._save_sources_index(simulation_id, {"sources": updated_list})
+        
+        # Log counts of actual unique URLs vs parts
+        unique_urls = len({(s.get("url") or "").strip().lower() for s in updated_list if s.get("url")})
+        logger.info(
+            "[CSI-PERSIST] %s | Sources: %d (New: %d) | Unique URLs: %d",
+            simulation_id, len(updated_list), len(sources), unique_urls
+        )
+        return len(updated_list)
     
     def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
         """从文件加载模拟状态"""
@@ -474,9 +500,10 @@ class SimulationManager:
         
         if not os.path.exists(state_file):
             return None
-        
-        with open(state_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+
+        with self._state_file_lock:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
         
         state = SimulationState(
             simulation_id=simulation_id,
@@ -544,6 +571,7 @@ class SimulationManager:
                 "deepresearch": "DeepResearch / CSI Workflow",
                 "web_research": "Web Research (query-only)",
                 "social": "Dual-Platform Social Simulation",
+                "health": "Health / Medical Diagnostic Workflow",
             }.get(config_mode, "Dual-Platform Social Simulation"),
         )
         
@@ -605,6 +633,7 @@ class SimulationManager:
                 "deepresearch": "DeepResearch / CSI Workflow",
                 "web_research": "Web Research (query-only)",
                 "social": "Dual-Platform Social Simulation",
+                "health": "Health / Medical Diagnostic Workflow",
             }
             state.config_mode = config_mode
             state.config_mode_label = mode_labels.get(config_mode, "Dual-Platform Social Simulation")
@@ -617,6 +646,16 @@ class SimulationManager:
             # ====================================================================
             if config_mode == "web_research":
                 return self._prepare_web_research(
+                    state=state,
+                    sim_dir=sim_dir,
+                    simulation_id=simulation_id,
+                    simulation_requirement=simulation_requirement,
+                    document_text=document_text,
+                    max_agents=max_agents,
+                    progress_callback=progress_callback,
+                )
+            elif config_mode == "health":
+                return self._prepare_health_research(
                     state=state,
                     sim_dir=sim_dir,
                     simulation_id=simulation_id,
@@ -858,7 +897,7 @@ class SimulationManager:
                     total=2
                 )
 
-            if config_mode == "deepresearch":
+            if config_mode in ("deepresearch", "health"):
                 csi_store = SimulationCSILocalStore()
                 profiles_payload = [
                     p.to_dict() if hasattr(p, "to_dict") else (p if isinstance(p, dict) else getattr(p, "__dict__", {}))
@@ -885,7 +924,7 @@ class SimulationManager:
                 )
                 state.csi_initialized = True
                 state.csi_rounds = csi_result.get("state", {}).get("round_count", 0)
-                state.csi_artifacts_ready = True
+                state.csi_artifacts_ready = bool(csi_result.get("sources"))
                 if progress_callback:
                     progress_callback(
                         "building_csi",
@@ -934,6 +973,50 @@ class SimulationManager:
     # Web-research prepare helper
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_health_seed_query(simulation_requirement: str) -> str:
+        """Extract a focused clinical search query from patient scenario text.
+
+        When the user pastes a structured patient form, the raw text starts with
+        "Medical Scenario: ..." and contains labels like "Chief Complaint:", "Age:", etc.
+        Tavily performs poorly on these — extract only the clinically meaningful part.
+        """
+        import re as _re
+        text = (simulation_requirement or "").strip()
+
+        # If short enough, use as-is
+        if len(text) <= 120:
+            return text
+
+        # Try to extract Chief Complaint line
+        cc_match = _re.search(
+            r'(?:chief complaint|presenting complaint|reason for visit|chief concern)[:\s]+([^\n]{5,200})',
+            text, _re.IGNORECASE,
+        )
+        if cc_match:
+            complaint = cc_match.group(1).strip().rstrip('.')
+            # Also extract age/sex if present for context
+            age_match = _re.search(r'(\d{1,3})[- ]?year[s]?[- ]?old', text, _re.IGNORECASE)
+            sex_match = _re.search(r'\b(male|female|man|woman)\b', text, _re.IGNORECASE)
+            prefix = ""
+            if age_match and sex_match:
+                prefix = f"{age_match.group(1)}-year-old {sex_match.group(1)} "
+            elif age_match:
+                prefix = f"{age_match.group(1)}-year-old patient "
+            return f"{prefix}{complaint}"
+
+        # Try first non-header meaningful line
+        for line in text.splitlines():
+            stripped = line.strip()
+            # Skip labels, headings, empty lines
+            if (stripped and len(stripped) > 20 and ':' not in stripped[:30]
+                    and not stripped.lower().startswith(('medical scenario', 'patient name',
+                                                          'age:', 'sex:', 'date:', 'section'))):
+                return stripped[:140]
+
+        # Fallback: first 140 chars
+        return text[:140]
+
     def _prepare_web_research(
         self,
         state: SimulationState,
@@ -981,7 +1064,10 @@ class SimulationManager:
         if progress_callback:
             progress_callback("generating_profiles", 0, "Generating research team from query...", current=0, total=3)
 
-        team_gen = ResearchTeamGenerator(LLMClient(usage_scope=simulation_id))
+        # Use gpt-oss (Open Source/Reasoning focused) for profile generation 
+        # to ensure diverse and high-quality research personas.
+        gen_llm = LLMClient(usage_scope=simulation_id)
+        team_gen = ResearchTeamGenerator(gen_llm)
         team_result = team_gen.generate_team(
             query=simulation_requirement,
             team_size=min(max_agents, 8),
@@ -1069,6 +1155,10 @@ class SimulationManager:
         state.profiles_generated = True
         state.profiles_count = len(agents)
 
+        # Persist readiness-critical files immediately so /api/simulation/start
+        # can proceed while seed search continues in the background portion of prepare.
+        self._save_simulation_state(state)
+
         if progress_callback:
             progress_callback("generating_config", 80, "Saving configuration...", current=2, total=3)
 
@@ -1115,9 +1205,10 @@ class SimulationManager:
         state.csi_initialized = True
         state.csi_rounds = csi_result.get("state", {}).get("round_count", 0)
         state.csi_artifacts_ready = True
+        self._save_simulation_state(state)
 
         if progress_callback:
-            progress_callback("building_csi", 100, "CSI store initialized for web research", current=1, total=1)
+            progress_callback("building_csi", 100, f"CSI store initialized: {state.profiles_count} agents ready", current=1, total=1)
 
         # ── Step 4: Check for existing blueprint OR run lightweight seed search ──
         existing_blueprint = None
@@ -1148,7 +1239,6 @@ class SimulationManager:
 
             try:
                 from .web_search_client import WebSearchClient
-                from ..utils.groq_native_client import GroqNativeClient
 
                 seed_quality_config = {
                     "min_content_length": 200,
@@ -1160,74 +1250,65 @@ class SimulationManager:
                     "english_only": True,
                 }
 
-                # Try Groq Native Search first for higher quality "Native Intelligence" seeds
-                groq_client = GroqNativeClient()
+                seed_count = 0
+                existing_sources = csi_result.get("sources", []) or csi_store._load_sources_index(simulation_id).get("sources", [])
+                existing_ids = {s.get("source_id") for s in existing_sources}
+
                 web_client = WebSearchClient(
                     api_key=Config.TAVILY_API_KEY,
                     quality_config=seed_quality_config,
                 )
 
-                seed_count = 0
-                existing_sources = csi_result.get("sources", []) or csi_store._load_sources_index(simulation_id).get("sources", [])
-                existing_ids = {s.get("source_id") for s in existing_sources}
-
-                # OPTION 1: Groq Native Search (if available) - typically much higher quality synthesis
-                try:
-                    logger.info("Attempting Groq Native Seed Search for %s", simulation_id)
-                    seed_prompt_messages = [
-                        {"role": "system", "content": f"You are a specialized CSI Seed Search agent. Your goal is to provide a high-level research overview and initial facts for a new deep research project. Research requirement: {simulation_requirement}"},
-                        {"role": "user", "content": f"Provide an initial research report and key facts about: {simulation_requirement}. Use your native search tools to be thorough and provide many specific data points."}
-                    ]
-                    # Groq returns a synthesized answer. We wrap it as a primary seed source.
-                    native_synthesis = groq_client.chat_with_tools(seed_prompt_messages)
-                    
-                    if native_synthesis and len(native_synthesis) > 200:
-                        synthesis_id = f"csi_source_groq_seed_{hashlib.sha256(native_synthesis[:1000].encode()).hexdigest()[:8]}"
-                        if synthesis_id not in existing_ids:
-                            existing_sources.append({
-                                "source_id": synthesis_id,
-                                "source_type": "web",
-                                "title": f"Groq Native Research Overview: {simulation_requirement[:40]}...",
-                                "url": "groq:native_seed",
-                                "content": native_synthesis,
-                                "summary": native_synthesis[:800],
-                                "origin": "groq_native_search",
-                                "score": 1.0,
-                                "agent_name": "SeedSearch",
-                                "round_num": 0,
-                                "timestamp": datetime.now().isoformat()
-                            })
-                            existing_ids.add(synthesis_id)
-                            seed_count += 1
-                            logger.info("Groq Native Seed Search successful (Synthesized content length: %d)", len(native_synthesis))
-                except Exception as groq_exc:
-                    logger.warning("Groq Native Seed Search failed: %s. Falling back to Tavily.", groq_exc)
-
-                # OPTION 2: Standard Tavily/Core Search (only if Groq failed)
-                if seed_count == 0 and web_client.is_available():
-                    logger.info("Running Supplemental Seed Search via Tavily/Core...")
-                    # 1-2 broad seed queries derived from the simulation requirement
-                    seed_queries = [
-                        simulation_requirement[:120],
-                        f"{simulation_requirement[:60]} latest research overview",
-                    ]
-
-                    # seed_count already incremented if Groq worked
-                    for sq in seed_queries:
-                        csi_sources = web_client.search_as_csi_sources(
-                            query=sq,
-                            agent_name="SeedSearch",
-                            round_num=0,
-                            max_results=5,
-                            search_depth="basic",
-                        )
-                        for src in csi_sources:
-                            sid = src.get("source_id", "")
-                            if sid not in existing_ids:
-                                existing_sources.append(src)
-                                existing_ids.add(sid)
-                                seed_count += 1
+                # SEED INGESTION: Tavily-only discovery. Seed sources are injected once,
+                # then agent actions operate over those chunks and their own Groq web searches.
+                # Limited to 5-10 seed sources total for efficiency
+                seed_queries = [
+                    simulation_requirement[:140],
+                    f"{simulation_requirement[:120]} technical research facts and evidence",
+                ]
+                if web_client.is_tavily_available():
+                    try:
+                        logger.info("Running Optimized Tavily discovery for seed sources: %s", simulation_id)
+                        for tq in seed_queries:
+                            if seed_count >= 10:  # Cap total seed sources at 10
+                                break
+                            csi_sources = web_client.search_as_csi_sources(
+                                query=tq,
+                                agent_name="SeedSearch",
+                                round_num=0,
+                                max_results=5,  # Reduced from 8 to get fewer but higher-quality sources
+                                search_depth="advanced",
+                                provider_mode="tavily_only",
+                                enrich_full_content=True,
+                            )
+                            for src in csi_sources:
+                                if seed_count >= 10:  # Respect the cap
+                                    break
+                                metadata = src.get("metadata") if isinstance(src.get("metadata"), dict) else {}
+                                metadata = dict(metadata)
+                                metadata["discovery"] = {
+                                    "kind": "seed",
+                                    "agent_id": None,
+                                    "agent_name": "SeedSearch",
+                                    "role": "seed_search",
+                                    "round_num": 0,
+                                    "prompt": tq,
+                                    "provider_mode": src.get("provider_mode") or metadata.get("provider_mode") or "tavily_only",
+                                    "search_depth": src.get("search_depth") or metadata.get("search_depth") or "advanced",
+                                }
+                                src["metadata"] = metadata
+                                src.setdefault("origin", "seed_search")
+                                sid = src.get("source_id", "")
+                                if sid not in existing_ids:
+                                    existing_sources.append(src)
+                                    existing_ids.add(sid)
+                                    seed_count += 1
+                    except Exception as tav_exc:
+                        logger.warning("Tavily discovery seeding failed: %s", tav_exc)
                 else:
+                    logger.warning("Tavily not available for strict seed discovery; seed discovery skipped for %s", simulation_id)
+                
+                if seed_count == 0:
                     logger.warning("Web search unavailable for %s — Tavily and HIVEMIND Core both unconfigured. Agents will proceed without seed sources.", simulation_id)
                     if progress_callback:
                         progress_callback(
@@ -1253,23 +1334,28 @@ class SimulationManager:
                         )
                         # Explicitly mark CSI as ready and initialized
                         state.csi_initialized = True
-                        state.csi_artifacts_ready = True
+                        state.csi_artifacts_ready = total_sources > 0
+                        if not state.csi_artifacts_ready:
+                            state.error = "CSI seed persistence completed with 0 persisted sources"
                     except Exception as exc:
                         logger.warning("Failed to persist seed sources: %s", exc)
+                        state.csi_initialized = True
+                        state.csi_artifacts_ready = False
+                        state.error = f"CSI seed persistence failed: {exc}"
                 else:
                     logger.warning(
-                        "Seed search produced 0 sources for %s — agents will search reactively during debate",
+                        "Seed search produced 0 sources for %s — blocking CSI start until seeds are available",
                         simulation_id,
                     )
-                    # Even with 0 sources, the CSI structure was initialized in Step 3
                     state.csi_initialized = True
-                    state.csi_artifacts_ready = True
+                    state.csi_artifacts_ready = False
+                    state.error = "CSI seed search produced 0 sources"
 
                 if progress_callback:
                     status_message = (
                         f"Seed search done: {seed_count} sources ready for round 1."
                         if seed_count > 0
-                        else "No seed sources found; agents will search reactively during debate."
+                        else "No seed sources found; CSI start is blocked until seeds are available."
                     )
                     progress_callback(
                         "collecting_sources",
@@ -1279,24 +1365,407 @@ class SimulationManager:
                         total=1,
                     )
 
-                logger.info("Seed search complete: %d sources ingested for %s", seed_count, simulation_id)
+                logger.info("Seed search complete: %d unique source URLs (yielding multiple parts) ingested for %s", seed_count, simulation_id)
 
             except Exception as exc:
                 logger.warning("Seed search failed during prepare (non-fatal): %s", exc)
+                state.csi_initialized = True
+                state.csi_artifacts_ready = False
+                state.error = f"CSI seed search failed: {exc}"
                 if progress_callback:
                     progress_callback(
                         "collecting_sources",
                         100,
-                        "Seed search encountered errors — agents will search reactively",
+                        "Seed search encountered errors — CSI start is blocked",
                         current=1,
                         total=1,
                     )
 
-        state.status = SimulationStatus.READY
+        state.status = SimulationStatus.READY if state.csi_artifacts_ready else SimulationStatus.FAILED
         self._save_simulation_state(state)
         logger.info(
-            "Web-research prepare complete: %s, agents=%d",
-            simulation_id, len(agents),
+            "Web-research prepare complete: %s, agents=%d, csi_artifacts_ready=%s",
+            simulation_id, len(agents), state.csi_artifacts_ready,
+        )
+        return state
+
+    # ------------------------------------------------------------------
+    # Health-research prepare helper
+    # ------------------------------------------------------------------
+
+    def _prepare_health_research(
+        self,
+        state: SimulationState,
+        sim_dir: str,
+        simulation_id: str,
+        simulation_requirement: str,
+        document_text: str,
+        max_agents: int = 25,
+        progress_callback: Optional[callable] = None,
+    ) -> SimulationState:
+        """Prepare simulation for health / medical diagnostic research mode.
+
+        Mirrors ``_prepare_web_research`` exactly, with the following differences:
+        - Calls ``ResearchTeamGenerator.generate_team(mode='health')``
+        - Uses ``config_mode='health'`` throughout
+        - Sets state labels to "Health / Medical Diagnostic Workflow"
+        """
+        state.status = SimulationStatus.PREPARING
+        state.updated_at = datetime.now().isoformat()
+        self._save_simulation_state(state)
+
+        try:
+            from .research_team_generator import ResearchTeamGenerator
+        except ImportError:
+            logger.error(
+                "research_team_generator module not available; "
+                "cannot prepare health mode for %s",
+                simulation_id,
+            )
+            state.status = SimulationStatus.FAILED
+            state.error = "ResearchTeamGenerator module is not yet available"
+            self._save_simulation_state(state)
+            return state
+
+        from ..utils.llm_client import LLMClient
+        from .simulation_config_generator import (
+            SimulationParameters,
+            TimeSimulationConfig,
+            EventConfig,
+            ResearchWorkflowConfig,
+            ResearchAgentAssignment,
+            AgentActivityConfig,
+        )
+
+        # ── Step 1: Generate research team from query ──
+        if progress_callback:
+            progress_callback("generating_profiles", 0, "Generating health research team from query...", current=0, total=3)
+
+        gen_llm = LLMClient(usage_scope=simulation_id)
+        team_gen = ResearchTeamGenerator(gen_llm)
+        team_result = team_gen.generate_team(
+            query=simulation_requirement,
+            team_size=min(max_agents, 9),
+            mode='health',
+        )
+        agents = team_result["agents"]  # list[dict]
+        research_wf = team_result["research_workflow_config"]  # dict
+
+        state.entities_count = len(agents)
+        state.entity_types = list({a.get("research_role", "unknown") for a in agents})
+
+        if progress_callback:
+            progress_callback(
+                "generating_profiles", 50,
+                f"Health research team generated: {len(agents)} agents",
+                current=1, total=3,
+            )
+
+        # ── Step 2: Build SimulationParameters (no graph dependency) ──
+        agent_configs = []
+        for idx, ag in enumerate(agents):
+            agent_configs.append(AgentActivityConfig(
+                agent_id=ag.get("agent_id", idx),
+                entity_uuid=f"health_{idx}",
+                entity_name=ag.get("entity_name", ag.get("agent_name", f"Agent-{idx}")),
+                entity_type=ag.get("entity_type", "researcher"),
+                activity_level=0.8,
+                role=ag.get("research_role", "explorer"),
+                skills=ag.get("skills", []),
+                qualification_score=ag.get("qualification_score", 0.85),
+                source_origin="health_research_team",
+                research_focus=ag.get("skills", []),
+            ))
+
+        # Reconstruct a ResearchWorkflowConfig from the dict
+        rwf = ResearchWorkflowConfig(
+            workflow_type=research_wf.get("workflow_type", "health_research_csi"),
+            mode_label="Health / Medical Diagnostic Workflow",
+            research_rounds=research_wf.get("research_rounds", []),
+            claim_policy=research_wf.get("claim_policy", {}),
+            debate_policy=research_wf.get("debate_policy", {}),
+            verdict_policy=research_wf.get("verdict_policy", {}),
+            provenance_policy=research_wf.get("provenance_policy", {}),
+            gate_policy=research_wf.get("gate_policy", {}),
+        )
+        # Build agent_assignments from the team
+        for ag in agents:
+            rwf.agent_assignments.append(ResearchAgentAssignment(
+                agent_id=ag.get("agent_id", 0),
+                entity_uuid=f"health_{ag.get('agent_id', 0)}",
+                entity_name=ag.get("entity_name", ag.get("agent_name", "")),
+                entity_type=ag.get("entity_type", "researcher"),
+                research_role=ag.get("research_role", "explorer"),
+                responsibility=ag.get("responsibility", ""),
+                evidence_priority=ag.get("evidence_priority", "source_diversity"),
+                challenge_targets=ag.get("challenge_targets", []),
+                output_types=ag.get("world_actions", []) + ag.get("peer_actions", []),
+            ))
+
+        sim_params = SimulationParameters(
+            simulation_id=simulation_id,
+            project_id=state.project_id,
+            graph_id="",  # no graph for health research
+            simulation_requirement=simulation_requirement,
+            config_mode="health",
+            mode_label="Health / Medical Diagnostic Workflow",
+            time_config=TimeSimulationConfig(
+                total_simulation_hours=1,
+                minutes_per_round=60,
+            ),
+            agent_configs=agent_configs,
+            event_config=EventConfig(
+                hot_topics=[simulation_requirement],
+            ),
+            research_workflow_config=rwf,
+            generation_reasoning="Health-research mode: team generated from query, no graph dependency",
+        )
+
+        # Save config
+        config_path = os.path.join(sim_dir, "simulation_config.json")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.write(sim_params.to_json())
+
+        state.config_mode = "health"
+        state.config_mode_label = "Health / Medical Diagnostic Workflow"
+        state.config_reasoning = sim_params.generation_reasoning
+        state.config_generated = True
+        state.profiles_generated = True
+        state.profiles_count = len(agents)
+
+        # Persist readiness-critical files immediately so /api/simulation/start
+        # can proceed while seed search continues in the background portion of prepare.
+        self._save_simulation_state(state)
+
+        if progress_callback:
+            progress_callback("generating_config", 80, "Saving configuration...", current=2, total=3)
+
+        # ── Step 3: Build profiles payload & initialize CSI store ──
+        profiles_payload = agents  # already list[dict] from ResearchTeamGenerator
+
+        # Write empty platform profile files so _check_simulation_prepared passes
+        empty_reddit_path = os.path.join(sim_dir, "reddit_profiles.json")
+        with open(empty_reddit_path, 'w', encoding='utf-8') as f:
+            json.dump(profiles_payload, f, ensure_ascii=False, indent=2)
+
+        empty_twitter_path = os.path.join(sim_dir, "twitter_profiles.csv")
+        with open(empty_twitter_path, 'w', encoding='utf-8') as f:
+            f.write("agent_id,agent_name,bio\n")
+            for ag in agents:
+                name = ag.get("agent_name", "").replace(",", " ")
+                bio = ag.get("bio", "").replace(",", " ").replace("\n", " ")
+                f.write(f"{ag.get('agent_id', 0)},{name},{bio}\n")
+
+        if progress_callback:
+            progress_callback("building_csi", 0, "Initializing CSI store for health research...", current=0, total=1)
+
+        csi_store = SimulationCSILocalStore()
+        sim_config_dict = sim_params.to_dict()
+        csi_store._write_json(
+            os.path.join(sim_dir, "csi", "simulation_config_snapshot.json"),
+            sim_config_dict,
+        )
+        csi_store._write_json(
+            os.path.join(sim_dir, "csi", "profiles_snapshot.json"),
+            profiles_payload,
+        )
+        csi_result = csi_store.initialize_from_prepare(
+            simulation_id=simulation_id,
+            project_id=state.project_id,
+            graph_id="",
+            simulation_requirement=simulation_requirement,
+            document_text=document_text or "",
+            simulation_config=sim_config_dict,
+            profiles=profiles_payload,
+            bootstrap_rounds=0,
+        )
+
+        state.csi_initialized = True
+        state.csi_rounds = csi_result.get("state", {}).get("round_count", 0)
+        state.csi_artifacts_ready = True
+        self._save_simulation_state(state)
+
+        if progress_callback:
+            progress_callback("building_csi", 100, f"CSI store initialized: {state.profiles_count} agents ready", current=1, total=1)
+
+        # ── Step 4: Check for existing blueprint OR run lightweight seed search ──
+        existing_blueprint = None
+        try:
+            from .csi_research_engine import CSIResearchEngine
+            existing_blueprint = CSIResearchEngine.load_blueprint(csi_store, simulation_id)
+        except Exception:
+            pass
+
+        if existing_blueprint:
+            logger.info(
+                "Reusing existing blueprint for %s: %d claims, %d sources",
+                simulation_id,
+                existing_blueprint.get("total_claims", 0),
+                existing_blueprint.get("total_sources", 0),
+            )
+            if progress_callback:
+                progress_callback(
+                    "collecting_sources", 100,
+                    f"Blueprint loaded: {existing_blueprint.get('total_claims', 0)} claims, "
+                    f"{existing_blueprint.get('total_sources', 0)} sources from prior run",
+                    current=1, total=1,
+                )
+        else:
+            # No prior blueprint — run a lightweight seed search
+            if progress_callback:
+                progress_callback("collecting_sources", 0, "Running baseline seed search...", current=0, total=1)
+
+            try:
+                from .web_search_client import WebSearchClient
+
+                seed_quality_config = {
+                    "min_content_length": 200,
+                    "min_title_length": 10,
+                    "min_search_score": 0.4,
+                    "require_news_indicators": False,  # Relaxed for seed — just get context
+                    "strict_domain_filter": True,
+                    "max_ad_indicators": 2,
+                    "english_only": True,
+                }
+
+                seed_count = 0
+                existing_sources = csi_result.get("sources", []) or csi_store._load_sources_index(simulation_id).get("sources", [])
+                existing_ids = {s.get("source_id") for s in existing_sources}
+
+                web_client = WebSearchClient(
+                    api_key=Config.TAVILY_API_KEY,
+                    quality_config=seed_quality_config,
+                )
+
+                # SEED INGESTION: Tavily-only discovery. Seed sources are injected once,
+                # then agent actions operate over those chunks and their own Groq web searches.
+                # Limited to 5-10 seed sources total for efficiency
+                focused_query = self._extract_health_seed_query(simulation_requirement)
+                seed_queries = [
+                    focused_query[:140],
+                    f"{focused_query[:120]} clinical evidence medical research",
+                ]
+                if web_client.is_tavily_available():
+                    try:
+                        logger.info("Running Optimized Tavily discovery for health seed sources: %s", simulation_id)
+                        for tq in seed_queries:
+                            if seed_count >= 10:  # Cap total seed sources at 10
+                                break
+                            csi_sources = web_client.search_as_csi_sources(
+                                query=tq,
+                                agent_name="SeedSearch",
+                                round_num=0,
+                                max_results=5,  # Reduced from 8 to get fewer but higher-quality sources
+                                search_depth="advanced",
+                                provider_mode="tavily_only",
+                                enrich_full_content=True,
+                            )
+                            for src in csi_sources:
+                                if seed_count >= 10:  # Respect the cap
+                                    break
+                                metadata = src.get("metadata") if isinstance(src.get("metadata"), dict) else {}
+                                metadata = dict(metadata)
+                                metadata["discovery"] = {
+                                    "kind": "seed",
+                                    "agent_id": None,
+                                    "agent_name": "SeedSearch",
+                                    "role": "seed_search",
+                                    "round_num": 0,
+                                    "prompt": tq,
+                                    "provider_mode": src.get("provider_mode") or metadata.get("provider_mode") or "tavily_only",
+                                    "search_depth": src.get("search_depth") or metadata.get("search_depth") or "advanced",
+                                }
+                                src["metadata"] = metadata
+                                src.setdefault("origin", "seed_search")
+                                sid = src.get("source_id", "")
+                                if sid not in existing_ids:
+                                    existing_sources.append(src)
+                                    existing_ids.add(sid)
+                                    seed_count += 1
+                    except Exception as tav_exc:
+                        logger.warning("Tavily discovery seeding failed: %s", tav_exc)
+                else:
+                    logger.warning("Tavily not available for strict seed discovery; seed discovery skipped for %s", simulation_id)
+
+                if seed_count == 0:
+                    logger.warning("Web search unavailable for %s — Tavily and HIVEMIND Core both unconfigured. Agents will proceed without seed sources.", simulation_id)
+                    if progress_callback:
+                        progress_callback(
+                            "collecting_sources",
+                            100,
+                            "Web search unavailable — proceeding without seed sources",
+                            current=1,
+                            total=1,
+                        )
+
+                if seed_count > 0:
+                    try:
+                        total_sources = self._persist_seed_sources(
+                            simulation_id=simulation_id,
+                            csi_store=csi_store,
+                            csi_result=csi_result,
+                            sources=existing_sources,
+                        )
+                        logger.info(
+                            "CSI Seed Index updated and CACHED for %s: %d total sources",
+                            simulation_id,
+                            total_sources,
+                        )
+                        # Explicitly mark CSI as ready and initialized
+                        state.csi_initialized = True
+                        state.csi_artifacts_ready = total_sources > 0
+                        if not state.csi_artifacts_ready:
+                            state.error = "CSI seed persistence completed with 0 persisted sources"
+                    except Exception as exc:
+                        logger.warning("Failed to persist seed sources: %s", exc)
+                        state.csi_initialized = True
+                        state.csi_artifacts_ready = False
+                        state.error = f"CSI seed persistence failed: {exc}"
+                else:
+                    logger.warning(
+                        "Seed search produced 0 sources for %s — blocking CSI start until seeds are available",
+                        simulation_id,
+                    )
+                    state.csi_initialized = True
+                    state.csi_artifacts_ready = False
+                    state.error = "CSI seed search produced 0 sources"
+
+                if progress_callback:
+                    status_message = (
+                        f"Seed search done: {seed_count} sources ready for round 1."
+                        if seed_count > 0
+                        else "No seed sources found; CSI start is blocked until seeds are available."
+                    )
+                    progress_callback(
+                        "collecting_sources",
+                        100,
+                        status_message,
+                        current=1,
+                        total=1,
+                    )
+
+                logger.info("Seed search complete: %d unique source URLs (yielding multiple parts) ingested for %s", seed_count, simulation_id)
+
+            except Exception as exc:
+                logger.warning("Seed search failed during prepare (non-fatal): %s", exc)
+                state.csi_initialized = True
+                state.csi_artifacts_ready = False
+                state.error = f"CSI seed search failed: {exc}"
+                if progress_callback:
+                    progress_callback(
+                        "collecting_sources",
+                        100,
+                        "Seed search encountered errors — CSI start is blocked",
+                        current=1,
+                        total=1,
+                    )
+
+        state.config_mode = "health"
+        state.status = SimulationStatus.READY if state.csi_artifacts_ready else SimulationStatus.FAILED
+        self._save_simulation_state(state)
+        logger.info(
+            "Health-research prepare complete: %s, agents=%d, csi_artifacts_ready=%s",
+            simulation_id, len(agents), state.csi_artifacts_ready,
         )
         return state
 

@@ -182,6 +182,8 @@ class WebSearchClient:
     _MIN_SEARCH_GAP: float = 2.0  # light guard; 429 retry handles overflow
     _core_quota_exhausted: bool = False
     _core_quota_exhausted_logged: bool = False
+    _groq_quota_exhausted: bool = False
+    _groq_quota_exhausted_logged: bool = False
 
     def __init__(self, api_key: str | None = None, quality_config: Dict[str, Any] | None = None) -> None:
         self._api_key: str = api_key or os.environ.get("TAVILY_API_KEY", "")
@@ -215,7 +217,7 @@ class WebSearchClient:
             return False
 
     def is_available(self) -> bool:
-        """Check if web search is available (Tavily or HIVEMIND Core fallback)."""
+        """Check if web search is available (Tavily, HIVEMIND Core, or Groq fallback)."""
         if self._ensure_client():
             return True
         # Even without Tavily, the HIVEMIND Core API fallback may work
@@ -228,9 +230,25 @@ class WebSearchClient:
             # Check hardcoded core URL as last resort
             if hivemind_key:
                 return True
+            groq_key = os.environ.get("GROQ_API_KEY") or getattr(Config, "LLM_API_KEY", "")
+            if groq_key:
+                return True
         except Exception:
             pass
         return False
+
+    def is_tavily_available(self) -> bool:
+        """Check if Tavily itself is available, without fallback providers."""
+        return self._ensure_client()
+
+    def is_groq_available(self) -> bool:
+        """Check if Groq native search is available."""
+        try:
+            from ..utils.groq_native_client import GroqNativeClient
+
+            return GroqNativeClient().is_available()
+        except Exception:
+            return False
 
     def _throttle(self) -> None:
         """Enforce minimum gap between web searches to stay under rate limits."""
@@ -254,7 +272,10 @@ class WebSearchClient:
         """Search the web. Returns list of {title, url, content, score}."""
         self._throttle()
         if not self._ensure_client():
-            return self._hivemind_core_fallback(query, max_results)
+            fallback_results = self._hivemind_core_fallback(query, max_results)
+            if fallback_results:
+                return fallback_results
+            return self._groq_web_fallback(query, max_results)
         try:
             kwargs: Dict[str, Any] = {
                 "query": query,
@@ -290,7 +311,90 @@ class WebSearchClient:
             return results
         except Exception as exc:
             logger.warning("Tavily search failed for query '%s': %s", query, exc)
-            return self._hivemind_core_fallback(query, max_results)
+            fallback_results = self._hivemind_core_fallback(query, max_results)
+            if fallback_results:
+                return fallback_results
+            return self._groq_web_fallback(query, max_results)
+
+    def search_tavily_only(
+        self,
+        query: str,
+        max_results: int = 5,
+        search_depth: str = "advanced",
+        topic: str = "general",
+        days: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Search using Tavily only. No HIVEMIND Core or Groq fallback."""
+        self._throttle()
+        if not self._ensure_client():
+            logger.warning("Tavily-only search unavailable for query '%s'", query)
+            return []
+        try:
+            kwargs: Dict[str, Any] = {
+                "query": query,
+                "max_results": max_results,
+                "search_depth": search_depth,
+                "include_raw_content": False,
+                "include_answer": True,
+                "topic": topic,
+            }
+            if topic == "news":
+                kwargs["days"] = days
+
+            response = self._client.search(**kwargs)
+            results: List[Dict[str, Any]] = []
+
+            answer = response.get("answer")
+            if answer and answer.strip():
+                results.append({
+                    "title": f"Tavily Synthesis: {query[:30]}...",
+                    "url": "tavily:synthesis",
+                    "content": answer,
+                    "score": 1.0,
+                })
+
+            for item in response.get("results", []):
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "content": item.get("content", ""),
+                    "score": float(item.get("score", 0.5) or 0.5),
+                })
+            return results
+        except Exception as exc:
+            logger.warning("Tavily-only search failed for query '%s': %s", query, exc)
+            return []
+
+    def search_groq_only(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+        """Search using Groq native web search only."""
+        self._throttle()
+        return self._groq_web_fallback(query, max_results)
+
+    def _groq_web_fallback(self, query: str, max_results: int) -> List[Dict[str, Any]]:
+        if WebSearchClient._groq_quota_exhausted:
+            if not WebSearchClient._groq_quota_exhausted_logged:
+                logger.error("Groq web search disabled: quota exhausted")
+                WebSearchClient._groq_quota_exhausted_logged = True
+            return []
+
+        try:
+            from ..utils.groq_native_client import GroqNativeClient
+
+            client = GroqNativeClient()
+            if not client.is_available():
+                return []
+
+            logger.info("Falling back to Groq native web search for query: '%s'", query)
+            results = client.web_search(query=query, max_results=max_results)
+            logger.info("Groq native web search returned %d results for query '%s'", len(results), query)
+            return results
+        except Exception as exc:
+            message = str(exc).lower()
+            if "quota" in message or "rate limit" in message or "429" in message:
+                WebSearchClient._groq_quota_exhausted = True
+                WebSearchClient._groq_quota_exhausted_logged = True
+            logger.warning("Groq web search fallback failed for query '%s': %s", query, exc)
+            return []
 
     def _hivemind_core_fallback(self, query: str, max_results: int) -> List[Dict[str, Any]]:
         """Fallback to HIVEMIND Core API (web intelligence / LightPanda).
@@ -477,16 +581,29 @@ class WebSearchClient:
         round_num: int,
         max_results: int = 5,
         search_depth: str = "advanced",
+        provider_mode: str = "auto",
+        enrich_full_content: bool = False,
     ) -> List[Dict[str, Any]]:
         """Search and return results pre-formatted as CSI source dicts.
         
         Includes comprehensive quality validation to ensure source accuracy.
         """
-        raw_results = self.search(
-            query=query,
-            max_results=max_results * 2,  # Get more results to allow for filtering
-            search_depth=search_depth,
-        )
+        normalized_provider_mode = (provider_mode or "auto").strip().lower()
+        requested_results = max_results * 2  # Get more results to allow for filtering
+        if normalized_provider_mode == "tavily_only":
+            raw_results = self.search_tavily_only(
+                query=query,
+                max_results=requested_results,
+                search_depth=search_depth,
+            )
+        elif normalized_provider_mode == "groq_only":
+            raw_results = self.search_groq_only(query=query, max_results=requested_results)
+        else:
+            raw_results = self.search(
+                query=query,
+                max_results=requested_results,
+                search_depth=search_depth,
+            )
         
         sources: List[Dict[str, Any]] = []
         quality_stats = {"total": len(raw_results), "accepted": 0, "rejected": 0, "reasons": {}}
@@ -499,28 +616,50 @@ class WebSearchClient:
             "max_ad_indicators": max(int(self._quality_config.get("max_ad_indicators", 3)), 5),
         }
         deferred_results: List[Dict[str, Any]] = []
+        provider_origin = {
+            "tavily_only": "tavily_search_seed",
+            "groq_only": "groq_native_search",
+            "auto": "web_search",
+        }.get(normalized_provider_mode, "web_search")
+
+        extracted_by_url: Dict[str, Dict[str, Any]] = {}
+        if enrich_full_content and normalized_provider_mode == "tavily_only":
+            extractable_urls = [
+                r.get("url", "") for r in raw_results
+                if r.get("url", "").startswith(("http://", "https://"))
+            ][: min(max_results, 8)]
+            if extractable_urls:
+                extracted_items = self.extract(extractable_urls)
+                extracted_by_url = {
+                    item.get("url", ""): item for item in extracted_items if item.get("url")
+                }
 
         def _append_source(result: Dict[str, Any], quality_check: Dict[str, Any]) -> None:
             content = result.get("content", "")
             title = result.get("title", "")
             url = result.get("url", "")
+            extracted = extracted_by_url.get(url, {})
+            full_content = extracted.get("content", "") or content
+            full_title = extracted.get("title", "") or title
             source_id = f"csi_source_web_{_content_hash(url, content)}"
             sources.append({
                 "source_id": source_id,
                 "source_type": "web",
-                "title": title,
+                "title": full_title,
                 "url": url,
-                "content": content,
-                "summary": content[:500],
-                "origin": "web_search",
+                "content": full_content,
+                "summary": full_content[:500],
+                "origin": provider_origin,
                 "priority": quality_check["quality_score"],
-                "keywords": _tokenize_keywords(f"{title} {content}"),
+                "keywords": _tokenize_keywords(f"{full_title} {full_content}"),
                 "metadata": {
                     "discovered_by": agent_name,
                     "search_query": query,
                     "round_num": round_num,
+                    "provider_mode": normalized_provider_mode,
                     "quality_check": quality_check,
                     "search_score": float(result.get("score", 0.5) or 0.5),
+                    "full_content_enriched": bool(extracted),
                 },
             })
         
@@ -572,11 +711,12 @@ class WebSearchClient:
                         break
         
         logger.info(
-            "Web search quality filter: %d/%d strict matches for query '%s' (agent: %s, top_rejections=%s, final_sources=%d)",
+            "Web search quality filter: %d/%d strict matches for query '%s' (agent: %s, mode=%s, top_rejections=%s, final_sources=%d)",
             quality_stats["accepted"],
             quality_stats["total"],
             query[:50],
             agent_name,
+            normalized_provider_mode,
             quality_stats["reasons"],
             len(sources),
         )

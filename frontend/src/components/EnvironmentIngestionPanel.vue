@@ -27,6 +27,10 @@
 
         <div class="card-content">
           <p class="api-note">POST /api/graph/ontology/generate</p>
+          <div v-if="phase === 0" class="realtime-status-bar">
+            <div class="bar-fill animate-pulse"></div>
+            <span class="bar-text">Analyzing documents & building ontology...</span>
+          </div>
           <p class="description">
             Files and URLs are normalized, extracted, and attached to a project so ontology generation can begin.
           </p>
@@ -467,6 +471,47 @@ onBeforeUnmount(() => {
 
 .step-info {
   gap: 12px;
+}
+
+.realtime-status-bar {
+  margin: 10px 0;
+  background: #f0f7ff;
+  border-radius: 8px;
+  height: 36px;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid #cce4ff;
+}
+
+.bar-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(90deg, #117dff 0%, #00b8ff 50%, #117dff 100%);
+  background-size: 200% 100%;
+  opacity: 0.15;
+}
+
+.animate-pulse {
+  animation: bar-slide 2s linear infinite;
+}
+
+@keyframes bar-slide {
+  0% { background-position: 200% 0; }
+  100% { background-position: 0% 0; }
+}
+
+.bar-text {
+  font-size: 13px;
+  color: #117dff;
+  font-weight: 600;
+  position: relative;
+  z-index: 1;
 }
 
 .step-num {

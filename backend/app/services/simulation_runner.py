@@ -498,11 +498,18 @@ class SimulationRunner:
             started_at=datetime.now().isoformat(),
         )
 
-        cls._save_run_state(state)
-
         # ── Check config_mode: deepresearch / web_research skip OASIS entirely ──
         config_mode = (config.get("config_mode") or "social").strip().lower()
-        if config_mode in {"deepresearch", "csi", "web_research"}:
+        if config_mode in {"deepresearch", "csi", "web_research", "health"}:
+            from .simulation_manager import SimulationManager
+
+            simulation_state = SimulationManager().get_simulation(simulation_id)
+            if not simulation_state or not simulation_state.csi_artifacts_ready:
+                raise ValueError(
+                    f"CSI artifacts are not ready for {simulation_id}; rerun prepare before starting research"
+                )
+
+            cls._save_run_state(state)
             logger.info(
                 "config_mode=%s — skipping OASIS social simulation, "
                 "launching CSI research rounds directly for %s",
@@ -520,6 +527,8 @@ class SimulationRunner:
             )
             csi_thread.start()
             return state
+
+        cls._save_run_state(state)
 
         # ── Social simulation mode: launch OASIS subprocess ──
 
@@ -977,14 +986,30 @@ class SimulationRunner:
 
             merged.append(agent)
 
+        # --- Deduplicate merged roster to prevent engine-level duplicate processing ---
+        seen_names: set[str] = set()
+        unique_merged: List[Dict[str, Any]] = []
+        for ag in merged:
+            name_key = (ag.get("agent_name") or "").strip().lower()
+            if name_key and name_key not in seen_names:
+                seen_names.add(name_key)
+                unique_merged.append(ag)
+        merged = unique_merged
+
         if merged:
             return merged
 
         # 5. Fallback: just assignments (if no profiles exist)
         if assignments:
+            unique_assignments: List[Dict[str, Any]] = []
+            seen_assign_names: set[str] = set()
             for a in assignments:
                 a.setdefault("agent_name", a.get("entity_name"))
-            return assignments
+                name_key = (a.get("agent_name") or "").strip().lower()
+                if name_key and name_key not in seen_assign_names:
+                    seen_assign_names.add(name_key)
+                    unique_assignments.append(a)
+            return unique_assignments
 
         # 2. research_workflow_config.agent_assignments
         try:
@@ -1020,7 +1045,7 @@ class SimulationRunner:
         if config_mode in {"deepresearch", "csi"}:
             config_mode = "deepresearch"
 
-        if config_mode == "deepresearch":
+        if config_mode in {"deepresearch", "health"}:
             logger.info(
                 "Social simulation completed for %s — launching CSI research phase",
                 simulation_id,
@@ -1057,6 +1082,12 @@ class SimulationRunner:
             from ..utils.llm_client import LLMClient
             from .simulation_manager import SimulationManager
 
+            simulation_state = SimulationManager().get_simulation(simulation_id)
+            if not simulation_state or not simulation_state.csi_artifacts_ready:
+                raise ValueError(
+                    f"CSI artifacts are not ready for {simulation_id}; persisted seed sources are required"
+                )
+
             # 1. Load simulation config
             config = cls._load_simulation_config(simulation_id)
             research_config: Dict[str, Any] = (
@@ -1075,6 +1106,11 @@ class SimulationRunner:
             else:
                 sources = snapshot.get("sources_index", {}).get("sources", [])
                 logger.debug("No cached CSI result found for %s, using snapshot (%d sources)", simulation_id, len(sources))
+
+            if not sources:
+                raise ValueError(
+                    f"CSI artifacts marked ready for {simulation_id}, but persisted sources are empty"
+                )
 
             # 3. Load agent roster
             roster = cls._load_agent_roster(simulation_id)
@@ -1096,14 +1132,35 @@ class SimulationRunner:
             state.runner_status = RunnerStatus.RUNNING
             cls._save_run_state(state)
 
-            # 6. Create engine and run
-            engine = CSIResearchEngine(
+            # 6. Create harness and engine
+            from .agent_harness import AgentHarness, ActionBudget
+            
+            # Standard budget for a simulation run
+            harness_budget = ActionBudget(
+                max_tokens_per_simulation=5000000,
+                max_tokens_per_round=1000000
+            )
+            
+            # Harness acts as the single execution layer
+            run_config_mode = config.get("config_mode", "web_research")
+
+            harness = AgentHarness(
                 simulation_id=simulation_id,
                 llm_client=LLMClient(usage_scope=simulation_id),
+                budget=harness_budget,
+                store=csi_store,
+                web_client=None,  # CSIResearchEngine has lazy web client initialization
+                config_mode=run_config_mode,
+            )
+
+            engine = CSIResearchEngine(
+                simulation_id=simulation_id,
+                harness=harness,
                 csi_store=csi_store,
                 sources=sources,
                 roster=roster,
                 config=research_config,
+                config_mode=run_config_mode,
             )
 
             def _on_round_complete(round_idx: int) -> None:

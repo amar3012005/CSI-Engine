@@ -78,6 +78,7 @@
             :projectData="projectData"
             :graphData="graphData"
             :configMode="workspaceConfigMode"
+            :isHealthMode="isHealthMode"
             :systemLogs="systemLogs"
             :autoStart="environmentAutoStart"
             :agentProfiles="agentProfiles"
@@ -99,7 +100,9 @@
             :minutesPerRound="minutesPerRound"
             :embedded="true"
             :reportStarted="reportStarted"
+            :autoGenerateReportOnComplete="autoGenerateReportOnComplete"
             :agentProfiles="agentProfiles"
+            :isHealthMode="isHealthMode"
             @go-back="selectStage('environment')"
             @next-step="handleSimulationNext"
             @add-log="addLog"
@@ -111,6 +114,8 @@
             :simulationId="currentSimulationId"
             :reportId="currentReportId"
             :reportStarted="reportStarted"
+            :isHealthMode="isHealthMode"
+            :simulationConfigMode="simulationData?.config_mode"
             @report-loaded="handleReportLoaded"
           />
         </div>
@@ -304,7 +309,17 @@ const currentReportId = ref(String(route.query.reportId || safeGet(reportStorage
 const minutesPerRound = ref(30)
 const agentProfiles = ref([])
 const selectedAgentId = ref(null)
-const workspaceConfigMode = ref(String(route.query.configMode || 'web_research'))
+const CONFIG_MODE_STORAGE_PREFIX = 'mirofish_config_mode_'
+const configModeStorageKey = computed(() => `${CONFIG_MODE_STORAGE_PREFIX}${currentSimulationId.value}`)
+const workspaceConfigMode = ref(
+  String(route.query.configMode || safeGet(configModeStorageKey.value) || 'web_research')
+)
+const isHealthMode = computed(() =>
+  workspaceConfigMode.value === 'health' ||
+  String(route.query.configMode || '').toLowerCase() === 'health'
+)
+const workspaceHydrated = ref(false)
+const autoGenerateReportOnComplete = ref(false)
 let workspaceTimer = null
 
 const visibleStages = computed(() => {
@@ -595,7 +610,7 @@ const hydrateWorkspace = async ({ initial = false } = {}) => {
     const simRes = await getSimulation(currentSimulationId.value)
     if (simRes.success && simRes.data) {
       simulationData.value = simRes.data
-      workspaceConfigMode.value = String(simRes.data.config_mode || workspaceConfigMode.value || 'web_research')
+      workspaceConfigMode.value = String(route.query.configMode || simRes.data.config_mode || workspaceConfigMode.value || 'web_research')
 
       if (simRes.data.project_id) {
         const projectRes = await getProject(simRes.data.project_id)
@@ -637,7 +652,7 @@ const hydrateWorkspace = async ({ initial = false } = {}) => {
     try {
       const configRes = await getSimulationConfigRealtime(currentSimulationId.value)
       if (configRes.success && configRes.data) {
-        workspaceConfigMode.value = String(configRes.data.config?.config_mode || workspaceConfigMode.value)
+        workspaceConfigMode.value = String(route.query.configMode || configRes.data.config?.config_mode || workspaceConfigMode.value)
         if (configRes.data.config_generated && configRes.data.config?.time_config?.minutes_per_round) {
           simulationUnlocked.value = true
           minutesPerRound.value = configRes.data.config.time_config.minutes_per_round
@@ -671,7 +686,12 @@ const hydrateWorkspace = async ({ initial = false } = {}) => {
       } catch {
         reportCompleted.value = false
       }
-    } else if (simulationCompleted.value || reportUnlocked.value) {
+    } else if (isHealthMode.value && String(route.query.stage || '') === 'report') {
+      // Health mode: no separate reportId needed — HealthReportPanel fetches by simulationId.
+      // Mark report as started so reportUnlocked becomes true and chooseInitialStage can
+      // select the report stage when navigating directly via ?stage=report.
+      reportStarted.value = true
+    } else if (!autoGenerateReportOnComplete.value && !isHealthMode.value && (simulationCompleted.value || reportUnlocked.value)) {
       try {
         const reportLookup = await getPaperReportBySimulation(currentSimulationId.value)
         if (reportLookup.success && reportLookup.data) {
@@ -684,12 +704,19 @@ const hydrateWorkspace = async ({ initial = false } = {}) => {
       }
     }
 
+    // Persist resolved configMode so cold-loads restore correctly
+    if (workspaceConfigMode.value && currentSimulationId.value) {
+      safeSet(configModeStorageKey.value, workspaceConfigMode.value)
+    }
+
     persistStage()
+    workspaceHydrated.value = true
     if (initial) {
       await chooseInitialStage()
     }
   } catch (err) {
     addLog(`Failed to hydrate workspace: ${err.message}`)
+    workspaceHydrated.value = true  // unblock render even on error
   }
 }
 
@@ -740,10 +767,17 @@ const handlePendingSimulationCreated = async ({ simulationId }) => {
 }
 
 const handleSimulationNext = async (payload = {}) => {
-  if (payload?.reportId) {
-    currentReportId.value = payload.reportId
+  if (payload?.stage === 'report' || payload?.reportId) {
+    if (payload.reportId) {
+      currentReportId.value = payload.reportId
+    }
     reportStarted.value = true
     reportCompleted.value = false
+    autoGenerateReportOnComplete.value = false
+    // Persist configMode before navigating to report
+    if (workspaceConfigMode.value && currentSimulationId.value) {
+      safeSet(configModeStorageKey.value, workspaceConfigMode.value)
+    }
     persistStage()
     await selectStage('report')
     startWorkspacePolling()
@@ -781,6 +815,7 @@ const submitContinuation = async () => {
     currentReportId.value = ''
     reportStarted.value = false
     reportCompleted.value = false
+    autoGenerateReportOnComplete.value = true
     simulationCompleted.value = false
     simulationRunning.value = false
     simulationUnlocked.value = true
@@ -831,6 +866,7 @@ watch(
     simulationUnlocked.value = false
     simulationRunning.value = false
     simulationCompleted.value = false
+    autoGenerateReportOnComplete.value = false
     await hydrateWorkspace({ initial: true })
     startWorkspacePolling()
   }
@@ -863,29 +899,30 @@ watch(
   }
 )
 
-// Auto-navigate between stages based on progress
-// Environment → Simulation (when simulation starts running)
-watch(simulationRunning, (running) => {
-  if (running && activeStage.value === 'environment') {
+// Auto-navigate between stages only on real state transitions.
+// This prevents background polling from forcing the user away from a manually selected section.
+watch(simulationRunning, (running, wasRunning) => {
+  if (running && !wasRunning && activeStage.value === 'environment') {
     selectStage('simulation')
   }
 })
 
 // Simulation → Report (when simulation completes and report starts)
-watch(simulationCompleted, (completed) => {
-  if (completed && activeStage.value === 'simulation' && reportStarted.value) {
+watch(simulationCompleted, (completed, wasCompleted) => {
+  if (completed && !wasCompleted && activeStage.value === 'simulation' && reportStarted.value) {
     selectStage('report')
   }
 })
 
-watch(reportStarted, (started) => {
-  if (started && simulationCompleted.value && activeStage.value === 'simulation') {
+watch(reportStarted, (started, wasStarted) => {
+  if (started && !wasStarted && simulationCompleted.value && activeStage.value === 'simulation') {
     selectStage('report')
   }
 })
 
 watch(reportCompleted, async (completed) => {
   if (completed && currentSimulationId.value) {
+    autoGenerateReportOnComplete.value = false
     try {
       await persistence.persistSession(currentSimulationId.value)
       addLog('Session persisted to HIVEMIND')
@@ -895,17 +932,44 @@ watch(reportCompleted, async (completed) => {
   }
 })
 
+// React to URL stage changes (e.g. from child components pushing route)
+watch(() => route.query.stage, (newStage, oldStage) => {
+  if (newStage && newStage !== oldStage && newStage !== activeStage.value) {
+    selectStage(String(newStage))
+  }
+})
+
+// Auto-generate report when simulation completes in health mode
+watch([() => activeStage.value, () => isHealthMode.value], ([stage, isHealth]) => {
+  if (stage === 'simulation' && isHealth) {
+    autoGenerateReportOnComplete.value = true
+  }
+})
+
+// React to URL configMode changes
+watch(() => route.query.configMode, (newMode) => {
+  if (newMode && newMode !== workspaceConfigMode.value) {
+    workspaceConfigMode.value = String(newMode)
+  }
+})
+
 onMounted(async () => {
   // Start with sidebar collapsed for the reveal effect
   sidebarCollapsed.value = true
-  
+
   // Start data loading immediately but don't await blocking UI
   hydrateWorkspace({ initial: true })
+
+  // Initialize activeStage from URL param (handles direct navigation to ?stage=report)
+  const urlStage = String(route.query.stage || '').trim().toLowerCase()
+  if (urlStage === 'report' || urlStage === 'simulation') {
+    activeStage.value = urlStage
+  }
 
   addLog('Unified simulation workspace initialized')
   pendingUpload.value = getPendingUpload()
   loadSidebarHistory()
-  
+
   // Elegantly reveal elements like a movie sequence
   setTimeout(() => {
     // Open the right-side preview/drawer

@@ -1,121 +1,149 @@
 <template>
-  <div class="app-shell">
+  <div class="shell">
     <AppSidebar
       :collapsed="sidebarCollapsed"
+      :recentSessions="recentSessions"
       @toggle="sidebarCollapsed = !sidebarCollapsed"
       @go-home="handleNewChat"
+      @navigate="navigateToSession"
     />
 
-    <main class="main-area">
-      <!-- Center content -->
-      <div class="center-stage">
-        <div class="hero-brand">
-          <img :src="davinciLogo" alt="Da'vinci" class="hero-logo" />
-          <h1 class="hero-title">Deep Research</h1>
+    <main class="main">
+      <!-- Top bar -->
+      <div class="topbar">
+        <div class="topbar-spacer" />
+        <div class="topbar-right">
+          <button class="topbar-btn" title="Settings">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/>
+            </svg>
+          </button>
         </div>
+      </div>
 
-        <!-- Chat input card -->
-        <Transition name="card-swap" mode="out-in">
-          <div v-if="!showConfirmCard" key="input" class="chat-card-container">
-            <div class="chat-card">
-              <div class="card-chrome">
-                <div class="traffic-lights">
-                  <span class="dot red"></span>
-                  <span class="dot yellow"></span>
-                  <span class="dot green"></span>
-                </div>
-                <span class="card-label">AI Research</span>
+      <!-- Center stage -->
+      <div class="center">
+        <Transition name="fade-up" mode="out-in">
+
+          <!-- Input card -->
+          <div v-if="!showConfirmCard" key="input" class="input-wrap">
+            <div class="chat-card" :class="{ focused: isFocused, 'health-card': isHealthMode }">
+              <!-- Mode pills row inside card top -->
+              <div class="card-modes">
+                <button
+                  v-for="mode in MODES"
+                  :key="mode.key"
+                  class="mode-pill"
+                  :class="{ active: selectedMode === mode.key, [`mode-${mode.key}`]: true }"
+                  @click="selectedMode = mode.key"
+                >
+                  <span class="mode-icon">{{ mode.icon }}</span>
+                  {{ mode.label }}
+                </button>
               </div>
+
+              <!-- Textarea -->
               <div class="card-body">
                 <textarea
                   ref="queryInput"
                   v-model="formData.simulationRequirement"
                   @keydown="handleKeyDown"
-                  placeholder="Ask anything..."
+                  @focus="isFocused = true"
+                  @blur="isFocused = false"
+                  :placeholder="chatPlaceholder"
                   rows="1"
-                  class="chat-input"
+                  class="chat-textarea"
                   :disabled="loading"
-                  @input="adjustTextareaHeight"
-                ></textarea>
+                  @input="adjustHeight"
+                />
               </div>
-              <div class="card-footer">
-                <div class="footer-left">
-                  <button class="attach-btn" @click="triggerFileInput" :disabled="loading">
-                    <span class="attach-plus">+</span>
+
+              <!-- Footer toolbar -->
+              <div class="card-toolbar">
+                <div class="toolbar-left">
+                  <button class="tool-btn" @click="triggerFileInput" :disabled="loading" title="Attach file">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                    </svg>
                   </button>
-                  <button class="connector-btn">
-                    <span class="connector-icon">@</span>
-                    <span>Sources</span>
-                  </button>
-                  <input
-                    ref="fileInput"
-                    type="file"
-                    multiple
-                    accept=".pdf,.md,.txt"
-                    @change="handleFileSelect"
-                    style="display: none"
-                    :disabled="loading"
-                  />
-                  <div v-if="files.length > 0" class="chips">
-                    <span v-for="(file, index) in files" :key="index" class="chip">
-                      {{ file.name }}
-                      <button @click.stop="removeFile(index)" class="chip-x">&times;</button>
+                  <input ref="fileInput" type="file" multiple accept=".pdf,.md,.txt" @change="handleFileSelect" style="display:none" />
+                  <div v-if="files.length" class="chips">
+                    <span v-for="(f, i) in files" :key="i" class="chip">
+                      {{ f.name }}<button class="chip-x" @click.stop="files.splice(i,1)">×</button>
                     </span>
                   </div>
                 </div>
-                <div class="footer-right">
-                  <div class="model-selector">
+                <div class="toolbar-right">
+                  <button class="model-btn">
                     <span>Model</span>
-                    <span class="selector-chevron">▾</span>
-                  </div>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+                  </button>
+                  <button class="tool-btn" title="Voice input">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                      <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+                    </svg>
+                  </button>
                   <button
-                    class="submit-btn"
-                    @click="handleSubmitQuery"
+                    class="send-btn"
+                    @click="handleSubmit"
                     :disabled="!canSubmit || loading"
+                    :class="{ active: canSubmit && !loading }"
                   >
-                    <svg class="submit-icon" viewBox="0 0 24 24" width="20" height="20">
-                      <path d="M12 4l-1.41 1.41L15.17 10H4v2h11.17l-4.58 4.59L12 18l7-7-7-7z" fill="currentColor"/>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                      <line x1="22" y1="2" x2="11" y2="13"/>
+                      <polygon points="22 2 15 22 11 13 2 9 22 2"/>
                     </svg>
                   </button>
                 </div>
               </div>
             </div>
 
-            <!-- Suggestion Panel -->
-            <div class="suggestion-panel">
-              <div class="suggestion-header">
-                <span class="header-icon">✨</span>
-                <span class="header-text">Research ideas for you</span>
-              </div>
-              <div class="suggestion-grid">
-                <button 
-                  v-for="idea in researchIdeas" 
-                  :key="idea.text"
-                  class="suggestion-item"
-                  @click="useIdea(idea.text)"
+            <!-- Suggestion cards -->
+            <div class="suggestions-wrap">
+              <p class="suggestions-heading">{{ isHealthMode ? 'Example clinical cases' : 'Make the most out of HIVEMIND' }}</p>
+              <div class="suggestion-cards">
+                <div
+                  v-for="(card, i) in currentCards"
+                  :key="i"
+                  class="scard"
+                  @click="useCard(card.query)"
                 >
-                  <span v-if="idea.tag" class="suggestion-tag" :class="idea.tag.toLowerCase()">{{ idea.tag }}</span>
-                  <span class="suggestion-text">{{ idea.text }}</span>
-                </button>
+                  <div class="scard-icon" :style="{ background: card.bg }">
+                    <span class="scard-emoji">{{ card.icon }}</span>
+                  </div>
+                  <div class="scard-text">
+                    <div class="scard-title">{{ card.title }}</div>
+                    <div class="scard-desc">{{ card.desc }}</div>
+                  </div>
+                  <button class="scard-close" @click.stop="dismissCard(i)" title="Dismiss">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
 
-          <!-- CSI confirmation card (replaces input after submit) -->
+          <!-- Confirm card -->
           <CsiConfirmCard
             v-else
             key="confirm"
             :visible="true"
             :query="formData.simulationRequirement"
             :loading="loading"
+            :title="isHealthMode ? 'Medical Assessment' : 'Cognitive Swarm Intelligence'"
+            :icon="isHealthMode ? '🩺' : '⊡'"
+            :stats="isHealthMode
+              ? [{ value: '9', label: 'Specialists' }, { value: 'Health', label: 'Mode' }, { value: 'EBM', label: 'Evidence' }]
+              : [{ value: '8', label: 'Agents' }, { value: 'CSI', label: 'Mode' }, { value: 'Deep', label: 'Research' }]"
+            :continueLabel="isHealthMode ? 'Start Assessment' : 'Continue'"
             @back="showConfirmCard = false"
             @continue="startSimulation"
           />
         </Transition>
       </div>
     </main>
-
-    <!-- HIVEMIND Auth Modal was previously here, now fully delegated to AppSidebar -->
   </div>
 </template>
 
@@ -125,88 +153,94 @@ import { useRouter } from 'vue-router'
 import { useSidebar } from '../store/sidebar'
 import AppSidebar from '../components/ui/AppSidebar.vue'
 import CsiConfirmCard from '../components/ui/CsiConfirmCard.vue'
-import davinciLogo from '../assets/davinci-logo.svg'
 
 const router = useRouter()
 const { sidebarCollapsed } = useSidebar()
-const recentSessions = ref([])
-const fileInput = ref(null)
-const queryInput = ref(null)
 
-const formData = ref({
-  simulationRequirement: ''
-})
+const formData = ref({ simulationRequirement: '' })
 const files = ref([])
 const loading = ref(false)
 const showConfirmCard = ref(false)
+const isFocused = ref(false)
+const queryInput = ref(null)
+const fileInput = ref(null)
+const recentSessions = ref([])
+const error = ref('')
 
-const researchIdeas = ref([
-  { text: 'Analyze market competitors for generative AI platforms in 2026', tag: 'Market' },
-  { text: 'Benchmark on-device LLM performance across different hardware configurations', tag: 'Technical' },
-  { text: 'How do HIVE-MIND agents compare to traditional linear search workflows?', tag: 'Strategy' },
-  { text: 'Map global silicon supply chain vulnerabilities and mitigation strategies', tag: 'Geopolitics' },
-  { text: 'Synthesize the latest research on transformer-alternative architectures', tag: 'Research' }
+// Mode selector
+const selectedMode = ref('web_research')
+const MODES = [
+  { key: 'web_research', label: 'Research', icon: '🔬' },
+  { key: 'health',       label: 'Health',   icon: '🩺' },
+]
+const isHealthMode = computed(() => selectedMode.value === 'health')
+
+const chatPlaceholder = computed(() =>
+  isHealthMode.value
+    ? 'Describe the patient case — chief complaint, history, symptoms...'
+    : 'Type / for search modes and shortcuts'
+)
+
+// Suggestion cards
+const researchCards = ref([
+  {
+    icon: '🌐', bg: 'linear-gradient(135deg, #dbeafe, #bfdbfe)',
+    title: 'Browse hands free',
+    desc: 'Tell HIVEMIND what you need and watch it work for you.',
+    query: 'Analyze the latest trends in large language model research and deployment'
+  },
+  {
+    icon: '🖥️', bg: 'linear-gradient(135deg, #f3f4f6, #e5e7eb)',
+    title: 'Start Deep Research',
+    desc: 'Research works on any topic: market analysis, technical deep dives, competitive intelligence.',
+    query: 'Synthesize the latest research on transformer-alternative architectures'
+  },
 ])
 
-const useIdea = (text) => {
-  formData.value.simulationRequirement = text
+const healthCards = ref([
+  {
+    icon: '🩺', bg: 'linear-gradient(135deg, #d1fae5, #a7f3d0)',
+    title: 'Clinical Assessment',
+    desc: 'Describe a patient case and get evidence-based differential diagnosis.',
+    query: '45-year-old male, 2 weeks persistent headache, photophobia, neck stiffness'
+  },
+  {
+    icon: '💊', bg: 'linear-gradient(135deg, #fce7f3, #fbcfe8)',
+    title: 'Pharmacology Check',
+    desc: 'Review drug interactions, contraindications, and dosing for complex cases.',
+    query: 'Patient on Warfarin, Metformin, Lisinopril — starting new antibiotic therapy, check interactions'
+  },
+])
+
+const dismissedCards = ref([])
+const currentCards = computed(() => {
+  const cards = isHealthMode.value ? healthCards.value : researchCards.value
+  return cards.filter((_, i) => !dismissedCards.value.includes(`${selectedMode.value}-${i}`))
+})
+
+const dismissCard = (i) => dismissedCards.value.push(`${selectedMode.value}-${i}`)
+
+const canSubmit = computed(() => formData.value.simulationRequirement.trim().length >= 5)
+
+const useCard = (query) => {
+  formData.value.simulationRequirement = query
   queryInput.value?.focus()
 }
 
-const adjustTextareaHeight = () => {
+const adjustHeight = () => {
   const el = queryInput.value
   if (!el) return
   el.style.height = 'auto'
-  el.style.height = el.scrollHeight + 'px'
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px'
 }
 
-const handleSubmitQuery = () => {
+const handleKeyDown = (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit() }
+}
+
+const handleSubmit = () => {
   if (!canSubmit.value || loading.value) return
   showConfirmCard.value = true
-}
-const error = ref('')
-
-const URL_PATTERN = /(https?:\/\/[^\s]+)/gi
-
-const extractUrls = (text) => {
-  const matches = text.match(URL_PATTERN) || []
-  return [...new Set(matches.map((url) => url.replace(/[),.;!?]+$/, '')))]
-}
-
-const canSubmit = computed(() => {
-  return formData.value.simulationRequirement.trim().length >= 5
-})
-
-// Load history on mount
-onMounted(async () => {
-  // Check for OAuth callback if any old auth logic remains in URL
-  if (window.location.search.includes('hivemind_auth=callback')) {
-    window.history.replaceState({}, '', window.location.pathname)
-  }
-
-  try {
-    const { getSimulationHistory } = await import('../api/simulation')
-    if (getSimulationHistory) {
-      const res = await getSimulationHistory(15)
-      if (res?.success && res?.data) {
-        recentSessions.value = (res.data.simulations || res.data || []).map(s => ({
-          id: s.simulation_id,
-          label: (s.simulation_requirement || s.project_name || s.simulation_id || '').substring(0, 40),
-          simulationId: s.simulation_id,
-        }))
-      }
-    }
-  } catch {
-    // History load is best-effort
-  }
-})
-
-// Handlers
-const handleKeyDown = (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()
-    startSimulation()
-  }
 }
 
 const handleNewChat = () => {
@@ -214,6 +248,7 @@ const handleNewChat = () => {
   files.value = []
   error.value = ''
   loading.value = false
+  showConfirmCard.value = false
   queryInput.value?.focus()
 }
 
@@ -221,61 +256,39 @@ const navigateToSession = (item) => {
   router.push({ name: 'Simulation', params: { simulationId: item.simulationId } })
 }
 
-const handleDeleteSession = async (simId) => {
-  if (!confirm('Delete this session and all its data? This cannot be undone.')) return
-  try {
-    const { deleteSimulation } = await import('../api/simulation')
-    const res = await deleteSimulation(simId)
-    if (res?.success) {
-      recentSessions.value = recentSessions.value.filter(s => s.simulationId !== simId)
-    }
-  } catch {
-    // best-effort
-  }
-}
+const triggerFileInput = () => { if (!loading.value) fileInput.value?.click() }
 
-const triggerFileInput = () => {
-  if (!loading.value) fileInput.value?.click()
-}
-
-const handleFileSelect = (event) => {
-  const selected = Array.from(event.target.files)
-  const valid = selected.filter(f => ['pdf', 'md', 'txt'].includes(f.name.split('.').pop().toLowerCase()))
+const handleFileSelect = (e) => {
+  const valid = Array.from(e.target.files).filter(f =>
+    ['pdf','md','txt'].includes(f.name.split('.').pop().toLowerCase())
+  )
   files.value.push(...valid)
 }
 
-const removeFile = (index) => {
-  files.value.splice(index, 1)
-}
+const URL_PATTERN = /(https?:\/\/[^\s]+)/gi
+const extractUrls = (text) => [...new Set((text.match(URL_PATTERN) || []).map(u => u.replace(/[),.;!?]+$/, '')))]
 
 const startSimulation = async () => {
   if (!canSubmit.value || loading.value) return
-
   loading.value = true
+  const configMode = selectedMode.value
   const urls = extractUrls(formData.value.simulationRequirement)
 
   if (files.value.length > 0 || urls.length > 0) {
     const { setPendingUpload } = await import('../store/pendingUpload.js')
     setPendingUpload(files.value, formData.value.simulationRequirement, urls)
-
-    router.push({
-      name: 'Simulation',
-      params: { simulationId: 'new' },
-      query: { configMode: 'deepresearch', stage: 'environment', pendingUpload: '1' }
-    })
+    router.push({ name: 'Simulation', params: { simulationId: 'new' }, query: { configMode: 'deepresearch', stage: 'environment', pendingUpload: '1' } })
   } else {
     try {
       const { createSimulation } = await import('../api/simulation')
       const res = await createSimulation({
-        project_id: '',
-        graph_id: '',
+        project_id: '', graph_id: '',
         simulation_requirement: formData.value.simulationRequirement,
-        config_mode: 'web_research',
+        config_mode: configMode,
       })
-
       if (res.success && res.data?.simulation_id) {
         showConfirmCard.value = false
-        router.push({ name: 'Simulation', params: { simulationId: res.data.simulation_id } })
+        router.push({ name: 'Simulation', params: { simulationId: res.data.simulation_id }, query: { configMode } })
       } else {
         error.value = res.error || 'Failed to create session'
         loading.value = false
@@ -286,940 +299,241 @@ const startSimulation = async () => {
     }
   }
 }
+
+onMounted(async () => {
+  if (window.location.search.includes('hivemind_auth=callback')) {
+    window.history.replaceState({}, '', window.location.pathname)
+  }
+  try {
+    const { getSimulationHistory } = await import('../api/simulation')
+    if (getSimulationHistory) {
+      const res = await getSimulationHistory(20)
+      if (res?.success && res?.data) {
+        recentSessions.value = (res.data.simulations || res.data || []).map(s => ({
+          id: s.simulation_id,
+          label: (s.simulation_requirement || s.project_name || s.simulation_id || '').substring(0, 45),
+          simulationId: s.simulation_id,
+        }))
+      }
+    }
+  } catch { /* best-effort */ }
+})
 </script>
 
 <style scoped>
-* { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 
-.app-shell {
+.shell {
+  display: flex;
   width: 100%;
   height: 100%;
-  display: flex;
-  background-color: #faf9f4;
-  /* Monochrome ASCII pattern background */
-  background-image: url("data:image/svg+xml,%3Csvg width='200' height='200' viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cstyle%3E text %7B font-family: 'Courier New', monospace; font-size: 14px; font-weight: 900; fill: %23000000; opacity: 0.12; letter-spacing: 2px; %7D%3C/style%3E%3Ctext x='5' y='20'%3E0 1 1 0 1 0 1 0 1 1 %23 %26 *%3C/text%3E%3Ctext x='5' y='45'%3E%26 * _ - %2B %3D ! ~ %3F / %5C %7C %23 %5B %5D%3C/text%3E%3Ctext x='5' y='70'%3E%7B %7D %24 %3E %3C _ ( ) : ; ' %22 %2C .%3C/text%3E%3Ctext x='5' y='95'%3E0 1 1 0 1 0 1 0 1 1 %23 %26 *%3C/text%3E%3Ctext x='5' y='120'%3E%26 * _ - %2B %3D ! ~ %3F / %5C %7C %23 %5B %5D%3C/text%3E%3Ctext x='5' y='145'%3E%7B %7D %24 %3E %3C _ ( ) : ; ' %22 %2C .%3C/text%3E%3Ctext x='5' y='170'%3E0 1 1 0 1 0 1 0 1 1 %23 %26 *%3C/text%3E%3Ctext x='5' y='195'%3E%26 * _ - %2B %3D ! ~ %3F / %5C %7C %23 %5B %5D%3C/text%3E%3C/svg%3E");
-  background-size: 200px 200px;
-  background-repeat: repeat;
-  font-family: 'Space Grotesk', 'Noto Sans SC', system-ui, -apple-system, sans-serif;
-  color: #000000;
-  overflow: hidden;
+  background: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+  color: #1a1a1a;
 }
 
-:deep(.app-sidebar) {
-  flex-shrink: 0;
-  height: 100%;
-}
-
-.main-area {
+/* Main area */
+.main {
   flex: 1;
-  height: 100%;
   display: flex;
   flex-direction: column;
-  position: relative;
-  background: transparent;
   min-width: 0;
+  background: #ffffff;
 }
 
-/* Old sidebar styles removed — now using AppSidebar.vue */
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-}
-
-.brand-hex {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  background: rgba(17, 125, 255, 0.1);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-  color: #117dff;
-  flex-shrink: 0;
-}
-
-.brand-info {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.brand-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: #0a0a0a;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-}
-
-.brand-sub {
-  font-size: 10px;
-  color: #a3a3a3;
-  font-family: 'JetBrains Mono', monospace;
-  white-space: nowrap;
-}
-
-.collapse-btn {
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: #a3a3a3;
-  font-size: 16px;
-  padding: 4px;
-  border-radius: 6px;
-  transition: all 0.15s;
-  flex-shrink: 0;
-}
-
-.collapse-btn:hover {
-  background: #f3f1ec;
-  color: #525252;
-}
-
-.sidebar-content {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  padding: 10px;
-  overflow-y: auto;
-  gap: 14px;
-}
-
-.sidebar-action {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid #DDD9D3;
-  border-radius: 10px;
-  background: #FFF;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 500;
-  color: #0a0a0a;
-  transition: all 0.15s;
-  margin-bottom: 12px;
-}
-
-.sidebar-action:hover {
-  background: #F0EEED;
-  border-color: #CCC;
-}
-
-.action-icon {
-  font-size: 16px;
-  color: #737373;
-}
-
-.sidebar-nav {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.nav-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  font-size: 13px;
-  color: #525252;
-  cursor: pointer;
-  transition: all 0.15s;
-  text-decoration: none;
-}
-
-.nav-item:hover {
-  background: #f3f1ec;
-  color: #0a0a0a;
-}
-
-.nav-item.active {
-  background: #f3f1ec;
-  color: #0a0a0a;
-  font-weight: 500;
-}
-
-.nav-icon {
-  font-size: 16px;
-  width: 20px;
-  text-align: center;
-  color: #a3a3a3;
-  flex-shrink: 0;
-}
-
-.nav-item.active .nav-icon,
-.nav-item:hover .nav-icon {
-  color: #525252;
-}
-
-.sidebar-section {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.section-label {
-  font-size: 10px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #a3a3a3;
-  padding: 0 10px;
-  margin-bottom: 4px;
-}
-
-.history-list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.history-item {
-  padding: 7px 10px;
-  font-size: 12px;
-  color: #525252;
-  border-radius: 8px;
-  cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  transition: all 0.15s;
-}
-
-.history-item:hover {
-  background: #f3f1ec;
-  color: #0a0a0a;
-}
-
-.history-empty {
-  padding: 12px;
-  font-size: 12px;
-  color: #a3a3a3;
-}
-
-/* (main-area defined above) */
-
-/* navbar and sidebar are now in App.vue */
-
-/* Card swap transition */
-.card-swap-enter-active {
-  transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.25s ease;
-}
-.card-swap-leave-active {
-  transition: transform 0.2s ease, opacity 0.15s ease;
-}
-.card-swap-enter-from {
-  transform: translateY(30px);
-  opacity: 0;
-}
-.card-swap-leave-to {
-  transform: translateY(-15px);
-  opacity: 0;
-}
-
-.main-area {
-  flex: 1;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  position: relative;
-  background: white;
-  min-width: 0;
-}
-
-.center-stage {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 0 40px;
-  max-width: 800px;
-  margin: 0 auto;
-  width: 100%;
-}
-
-.hero-brand {
-  margin-bottom: 24px;
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-}
-
-.hero-logo {
-  height: 64px;
-  width: auto;
-  filter: invert(1);
-}
-
-.hero-title {
-  font-size: 32px;
-  font-weight: 700;
-  color: #000;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-  letter-spacing: -0.02em;
-}
-
-.chat-card-container {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-/* Updated Chat input card */
-.chat-card {
-  width: 100%;
-  background: #FFF;
-  border: 1px solid #e5e5e5;
-  border-radius: 12px;
-  overflow: hidden;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
-  transition: border-color 0.2s, box-shadow 0.2s;
-}
-
-.chat-card:focus-within {
-  border-color: #117dff;
-  box-shadow: 0 4px 24px rgba(17, 125, 255, 0.1);
-}
-
-.card-chrome {
+/* Topbar */
+.topbar {
+  height: 44px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  background: #fdfdfc;
-  border-bottom: 1px solid #f2f2f1;
+  padding: 0 16px;
+  flex-shrink: 0;
+}
+.topbar-spacer { flex: 1; }
+.topbar-right { display: flex; align-items: center; gap: 4px; }
+.topbar-btn {
+  width: 32px; height: 32px; border: none; background: none; border-radius: 7px;
+  cursor: pointer; color: #8c8882; display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s, color 0.12s;
+}
+.topbar-btn:hover { background: #f0ede8; color: #1a1a1a; }
+
+/* Center stage */
+.center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 24px 40px;
 }
 
-.traffic-lights {
+.input-wrap {
+  width: 100%;
+  max-width: 660px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Chat card */
+.chat-card {
+  background: #ffffff;
+  border: 1px solid #e5e3de;
+  border-radius: 14px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.06), 0 1px 3px rgba(0,0,0,0.04);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.chat-card.focused {
+  border-color: #c8c5be;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.08), 0 1px 4px rgba(0,0,0,0.04);
+}
+.chat-card.health-card.focused {
+  border-color: #6ee7b7;
+  box-shadow: 0 4px 20px rgba(16,185,129,0.1);
+}
+
+/* Mode pills row */
+.card-modes {
   display: flex;
   gap: 6px;
+  padding: 10px 12px 0;
 }
 
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-}
-
-.dot.red { background: #FF5F57; }
-.dot.yellow { background: #FEBC2E; }
-.dot.green { background: #28C840; }
-
-.card-label {
-  font-size: 11px;
+.mode-pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 11px 3px 8px;
+  border: 1px solid #e0ddd8;
+  border-radius: 20px;
+  background: transparent;
+  font-size: 12px;
   font-weight: 500;
-  color: #999;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
+  color: #6b6862;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.12s;
+  line-height: 1.5;
 }
+.mode-pill:hover { border-color: #b8b5af; color: #1a1a1a; background: #f5f4f1; }
+.mode-pill.active { background: #1a1a1a; border-color: #1a1a1a; color: #fff; }
+.mode-pill.mode-health.active { background: #064e3b; border-color: #064e3b; }
+.mode-icon { font-size: 12px; line-height: 1; }
 
-.card-body {
-  padding: 12px 16px;
-}
-
-.chat-input {
+/* Textarea */
+.card-body { padding: 10px 14px 8px; }
+.chat-textarea {
   width: 100%;
   border: none;
   outline: none;
   resize: none;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-  font-size: 16px;
-  font-weight: 400;
-  color: #000;
+  font-family: inherit;
+  font-size: 15px;
+  color: #1a1a1a;
   background: transparent;
-  min-height: 24px;
+  min-height: 28px;
   max-height: 200px;
+  line-height: 1.5;
 }
+.chat-textarea::placeholder { color: #b0ada8; }
 
-.chat-input::placeholder {
-  color: #a3a3a3;
-}
-
-.card-footer {
+/* Toolbar */
+.card-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 16px;
-  border-top: 1px solid #f2f2f1;
+  padding: 8px 10px 10px;
+  border-top: 1px solid #f0ede8;
 }
+.toolbar-left, .toolbar-right { display: flex; align-items: center; gap: 4px; }
 
-.footer-left, .footer-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.tool-btn {
+  width: 30px; height: 30px; border: none; background: none; border-radius: 7px;
+  cursor: pointer; color: #8c8882; display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s, color 0.12s;
 }
+.tool-btn:hover { background: #f0ede8; color: #1a1a1a; }
+.tool-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
-.attach-btn {
-  width: 24px;
-  height: 24px;
-  border: 1px solid #e5e5e5;
-  border-radius: 6px;
-  background: #FFF;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #737373;
-  font-size: 14px;
-  cursor: pointer;
+.model-btn {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border: 1px solid #e5e3de; border-radius: 8px;
+  background: none; font-size: 12.5px; font-weight: 500; color: #4a4845;
+  cursor: pointer; font-family: inherit; transition: background 0.12s;
 }
+.model-btn:hover { background: #f5f4f1; }
 
-.connector-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid #e5e5e5;
-  border-radius: 8px;
-  background: #fdfdfc;
-  font-size: 13px;
-  color: #4a4a4a;
-  cursor: pointer;
-}
-
-.connector-icon {
-  font-weight: 700;
-  color: #117dff;
-}
-
-.model-selector {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 13px;
-  color: #737373;
-  cursor: pointer;
-  font-weight: 500;
-}
-
-.submit-btn {
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: #000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px;
-  border-radius: 50%;
-  transition: transform 0.2s, background 0.2s;
-}
-
-.submit-btn:hover:not(:disabled) {
-  background: #f3f3f3;
-  transform: translateX(2px);
-}
-
-.submit-btn:disabled {
-  color: #e5e5e5;
-  cursor: not-allowed;
-}
-
-/* Suggestion Panel */
-.suggestion-panel {
-  background: #fdfdfc;
-  border: 1px solid #f0f0ef;
-  border-radius: 12px;
-  padding: 16px;
-}
-
-.suggestion-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-  color: #737373;
-}
-
-.header-text {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.suggestion-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.suggestion-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 10px 12px;
-  background: transparent;
-  border: none;
-  border-radius: 8px;
-  text-align: left;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.suggestion-item:hover {
-  background: #f5f5f4;
-}
-
-.suggestion-tag {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-
-.suggestion-tag.market { background: #E0E7FF; color: #4338CA; }
-.suggestion-tag.technical { background: #ECFDF5; color: #047857; }
-.suggestion-tag.strategy { background: #FEF3C7; color: #92400E; }
-.suggestion-tag.geopolitics { background: #FCE7F3; color: #9D174D; }
-.suggestion-tag.research { background: #F3E8FF; color: #6D28D9; }
-
-.suggestion-text {
-  font-size: 14px;
-  color: #262626;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.chip {
-  background: #f3f3f3;
-  padding: 2px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.chip-x {
-  background: none;
-  border: none;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.status-text {
-  font-size: 12px;
-  color: #117dff;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.spin {
-  display: inline-block;
-  animation: spinning 0.8s linear infinite;
-}
-
-@keyframes spinning {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.submit-btn {
-  padding: 8px 20px;
-  border-radius: 10px;
-  border: none;
-  background: #0a0a0a;
-  color: #FFF;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s;
-  flex-shrink: 0;
-}
-
-.submit-btn:hover:not(:disabled) {
-  background: #333;
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-}
-
-.submit-btn:active:not(:disabled) {
-  transform: translateY(0);
-}
-
-.submit-btn:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-
-/* ─── Responsive ──────────────────────────────────── */
-/* ─── Sidebar Auth ────────────────────────────── */
-.sidebar-auth {
-  padding: 8px 0;
-  border-top: 1px solid #E8E5E0;
-}
-
-.connect-btn {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 9px 12px;
-  border: 1px solid #D4D1CC;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #FFF 0%, #F7F6F3 100%);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 600;
-  color: #525252;
-  transition: all 0.2s;
-}
-
-.connect-btn:hover {
-  border-color: #117dff;
-  color: #117dff;
-  background: rgba(17, 125, 255, 0.04);
-}
-
-.connect-icon {
-  font-size: 14px;
-}
-
-.auth-user {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 10px;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-.auth-user:hover {
-  background: #EDEBE8;
-}
-
-.user-avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  object-fit: cover;
-}
-
-.user-avatar-fallback {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: #117dff;
-  color: #FFF;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-
-.user-info {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.user-name {
-  font-size: 12px;
-  font-weight: 600;
-  color: #0a0a0a;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.user-meta {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-wrap: wrap;
-}
-
-.user-badge {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  color: #16a34a;
-  background: rgba(22, 163, 74, 0.1);
-  padding: 1px 5px;
-  border-radius: 4px;
-}
-
-.user-org {
-  font-size: 9px;
-  color: #737373;
-}
-
-.user-role {
-  font-size: 9px;
-  color: #a3a3a3;
-  text-transform: capitalize;
-}
-
-/* ─── Auth Modal ──────────────────────────────── */
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 9999;
-}
-
-.auth-modal {
-  width: 420px;
-  background: #FFF;
-  border-radius: 20px;
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.15);
-  overflow: hidden;
-}
-
-.modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 20px 24px;
-  border-bottom: 1px solid #E8E5E0;
-}
-
-.modal-title-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.modal-icon {
-  font-size: 18px;
-  color: #117dff;
-}
-
-.modal-title {
-  font-size: 16px;
-  font-weight: 700;
-  margin: 0;
-}
-
-.modal-close {
-  background: none;
-  border: none;
-  font-size: 22px;
-  color: #a3a3a3;
-  cursor: pointer;
-  padding: 4px;
-  border-radius: 6px;
+.send-btn {
+  width: 32px; height: 32px; border: none; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; background: #e5e3de; color: #8c8882;
   transition: all 0.15s;
 }
+.send-btn.active { background: #1a1a1a; color: #fff; }
+.send-btn.active:hover { background: #333; }
+.send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.modal-close:hover {
-  background: #F0EEED;
-  color: #333;
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip {
+  background: #f0ede8; padding: 2px 8px; border-radius: 5px;
+  font-size: 11.5px; display: flex; align-items: center; gap: 4px;
 }
+.chip-x { background: none; border: none; font-size: 14px; cursor: pointer; color: #8c8882; padding: 0; }
 
-.modal-body {
-  padding: 24px;
-}
+/* Suggestions */
+.suggestions-wrap { display: flex; flex-direction: column; gap: 10px; }
 
-.modal-desc {
+.suggestions-heading {
   font-size: 13px;
-  color: #737373;
-  line-height: 1.6;
-  margin: 0 0 20px;
-}
-
-.auth-option {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  width: 100%;
-  padding: 12px;
-  border: 1px solid #D4D1CC;
-  border-radius: 12px;
-  background: #FFF;
-  cursor: pointer;
-  font-size: 14px;
   font-weight: 500;
-  color: #0a0a0a;
-  transition: all 0.2s;
-}
-
-.auth-option:hover:not(:disabled) {
-  border-color: #999;
-  background: #FAFAFA;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-}
-
-.auth-option:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.google-icon {
-  flex-shrink: 0;
-}
-
-.auth-divider {
-  display: flex;
-  align-items: center;
-  margin: 20px 0;
-}
-
-.auth-divider::before,
-.auth-divider::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: #E8E5E0;
-}
-
-.auth-divider span {
-  padding: 0 12px;
-  font-size: 11px;
-  color: #a3a3a3;
-}
-
-.apikey-section {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.apikey-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: #525252;
-}
-
-.apikey-input-row {
-  display: flex;
-  gap: 8px;
-}
-
-.apikey-input {
-  flex: 1;
-  padding: 10px 12px;
-  border: 1px solid #D4D1CC;
-  border-radius: 10px;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 12px;
-  outline: none;
-  transition: border-color 0.2s;
-}
-
-.apikey-input:focus {
-  border-color: #117dff;
-}
-
-.apikey-submit {
-  padding: 10px 16px;
-  border: none;
-  border-radius: 10px;
-  background: #0a0a0a;
-  color: #FFF;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.2s;
-  white-space: nowrap;
-}
-
-.apikey-submit:hover:not(:disabled) {
-  background: #333;
-}
-
-.apikey-submit:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-
-.apikey-hint {
-  font-size: 11px;
-  color: #a3a3a3;
+  color: #8c8882;
   margin: 0;
+  padding: 0 2px;
 }
 
-.apikey-link {
-  color: #117dff;
-  text-decoration: none;
-}
+.suggestion-cards { display: flex; flex-direction: column; gap: 8px; }
 
-.apikey-link:hover {
-  text-decoration: underline;
-}
-
-.auth-error {
-  margin-top: 16px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: #FEF2F2;
-  border: 1px solid #FECACA;
-  color: #DC2626;
-  font-size: 12px;
-}
-
-.auth-success {
-  margin-top: 16px;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: #F0FDF4;
-  border: 1px solid #BBF7D0;
-  color: #16a34a;
-  font-size: 12px;
+.scard {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.disconnect-btn {
-  background: none;
-  border: none;
-  color: #DC2626;
-  font-size: 11px;
-  font-weight: 600;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 13px 14px;
+  background: #fff;
+  border: 1px solid #ebe9e4;
+  border-radius: 12px;
   cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
+  text-align: left;
+  transition: background 0.12s, border-color 0.12s;
+  position: relative;
+  user-select: none;
 }
+.scard:hover { background: #faf9f7; border-color: #dddbd6; }
 
-.disconnect-btn:hover {
-  background: #FEF2F2;
+.scard-icon {
+  width: 38px; height: 38px; border-radius: 9px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
 }
+.scard-emoji { font-size: 18px; line-height: 1; }
 
-/* Modal transitions */
-.modal-enter-active { transition: all 0.25s ease; }
-.modal-leave-active { transition: all 0.2s ease; }
-.modal-enter-from { opacity: 0; }
-.modal-enter-from .auth-modal { transform: scale(0.95) translateY(10px); }
-.modal-leave-to { opacity: 0; }
-.modal-leave-to .auth-modal { transform: scale(0.95) translateY(10px); }
+.scard-text { flex: 1; min-width: 0; }
+.scard-title { font-size: 13.5px; font-weight: 600; color: #1a1a1a; margin-bottom: 2px; }
+.scard-desc { font-size: 12.5px; color: #6b6862; line-height: 1.4; }
 
-/* ─── Responsive ──────────────────────────────── */
-@media (max-width: 768px) {
-  .sidebar { width: 56px; }
-  .sidebar-content { display: none; }
-  .center-stage { padding: 0 16px 40px; }
-  .chat-card { max-width: 100%; }
-  .auth-modal { width: calc(100% - 32px); }
+.scard-close {
+  position: absolute; top: 10px; right: 10px;
+  width: 22px; height: 22px; border: none; background: none; border-radius: 5px;
+  cursor: pointer; color: #b0ada8; display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s, color 0.12s;
+  opacity: 0;
 }
+.scard:hover .scard-close { opacity: 1; }
+.scard-close:hover { background: #f0ede8; color: #1a1a1a; }
+
+/* Transitions */
+.fade-up-enter-active { transition: opacity 0.25s ease, transform 0.3s cubic-bezier(0.16,1,0.3,1); }
+.fade-up-leave-active { transition: opacity 0.15s ease, transform 0.15s ease; }
+.fade-up-enter-from { opacity: 0; transform: translateY(16px); }
+.fade-up-leave-to { opacity: 0; transform: translateY(-8px); }
 </style>

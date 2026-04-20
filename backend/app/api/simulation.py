@@ -360,10 +360,10 @@ def create_simulation():
         project_id = data.get('project_id', '')
         simulation_requirement = data.get('simulation_requirement', '')
 
-        # Web research mode: create a lightweight project if none provided
-        if config_mode == 'web_research' and not project_id:
+        # Web research / health mode: create a lightweight project if none provided
+        if config_mode in {'web_research', 'health'} and not project_id:
             project = ProjectManager.create_project(
-                name=simulation_requirement[:80] or "Web Research"
+                name=simulation_requirement[:80] or ("Medical Assessment" if config_mode == 'health' else "Web Research")
             )
             project.simulation_requirement = simulation_requirement
             from ..models.project import ProjectStatus
@@ -386,7 +386,7 @@ def create_simulation():
 
         graph_id = data.get('graph_id') or getattr(project, 'graph_id', '') or ''
         # web_research mode does not require a graph
-        if not graph_id and config_mode != 'web_research':
+        if not graph_id and config_mode not in {'web_research', 'health'}:
             return jsonify({
                 "success": False,
                 "error": "项目尚未构建图谱，请先调用 /api/graph/build"
@@ -474,6 +474,8 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         
         status = state_data.get("status", "")
         config_generated = state_data.get("config_generated", False)
+        config_mode = (state_data.get("config_mode") or "social").strip().lower()
+        csi_artifacts_ready = bool(state_data.get("csi_artifacts_ready", False))
         
         # 详细日志
         logger.debug(f"检测模拟准备状态: {simulation_id}, status={status}, config_generated={config_generated}")
@@ -488,6 +490,14 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - failed: 运行失败（但准备是完成的）
         prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
+            if config_mode in {"deepresearch", "csi", "web_research"} and not csi_artifacts_ready:
+                return False, {
+                    "reason": "CSI 种子证据尚未准备完成",
+                    "status": status,
+                    "config_mode": config_mode,
+                    "csi_artifacts_ready": csi_artifacts_ready,
+                }
+
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
             config_file = os.path.join(simulation_dir, "simulation_config.json")
@@ -511,7 +521,6 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
                 except Exception as e:
                     logger.warning(f"自动更新状态失败: {e}")
             
-            config_mode = state_data.get("config_mode", "social")
             config_mode_label = state_data.get("config_mode_label", "Dual-Platform Social Simulation")
             config_data = None
             try:
@@ -644,6 +653,43 @@ def prepare_simulation():
                 "error": f"项目不存在: {state.project_id}"
             }), 404
         
+        # Stage 3: Extraction quality gating before /prepare
+        # Enforce minimum unique sources and extraction confidence threshold
+        # SKIP GATE for web_research mode (no documents required)
+        config_mode = str(data.get('config_mode', 'social')).strip().lower()
+
+        assets = ProjectManager.get_assets(state.project_id)
+        if config_mode in {'web_research', 'health'}:
+            logger.info(f"config_mode is '{config_mode}', skipping extraction quality gate for {simulation_id}")
+        elif not assets:
+            # Fallback to legacy check if no assets.json (e.g. old projects)
+            text = ProjectManager.get_extracted_text(state.project_id)
+            if not text or len(text) < 100:
+                return jsonify({
+                    "success": False,
+                    "error": "Extraction incomplete: No usable text found in project."
+                }), 400
+        else:
+            good_assets = [a for a in assets if a.get("extract_status") == "success"]
+            unique_sources = len(set(a.get("filename") for a in good_assets))
+            avg_confidence = sum(a.get("confidence", 0) for a in good_assets) / len(good_assets) if good_assets else 0
+            
+            # Actionable error if below thresholds
+            MIN_UNIQUE_SOURCES = 1
+            CONFIDENCE_THRESHOLD = 0.5
+            
+            if unique_sources < MIN_UNIQUE_SOURCES:
+                return jsonify({
+                    "success": False,
+                    "error": f"Extraction quality gate failed: Found {unique_sources} unique sources, required {MIN_UNIQUE_SOURCES}. Please upload more documents."
+                }), 400
+                
+            if avg_confidence < CONFIDENCE_THRESHOLD:
+                 return jsonify({
+                    "success": False,
+                    "error": f"Extraction confidence too low ({avg_confidence:.2f} < {CONFIDENCE_THRESHOLD}). Check extraction diagnostics."
+                }), 400
+
         # 获取模拟需求
         simulation_requirement = project.simulation_requirement or ""
         if not simulation_requirement:
@@ -661,10 +707,10 @@ def prepare_simulation():
         config_mode = str(data.get('config_mode', 'social')).strip().lower()
         if config_mode in {'deepresearch', 'csi'}:
             config_mode = 'deepresearch'
-        if config_mode not in {'social', 'deepresearch', 'web_research'}:
+        if config_mode not in {'social', 'deepresearch', 'web_research', 'health'}:
             return jsonify({
                 "success": False,
-                "error": "config_mode 仅支持 social, deepresearch 或 web_research"
+                "error": "config_mode 仅支持 social, deepresearch, web_research 或 health"
             }), 400
 
         max_agents = int(data.get('max_agents', 25))
@@ -680,7 +726,7 @@ def prepare_simulation():
         # ========== 同步获取实体数量（在后台任务启动前） ==========
         # 这样前端在调用prepare后立即就能获取到预期Agent总数
         # web_research mode skips graph entity reads entirely
-        if config_mode != 'web_research':
+        if config_mode not in {'web_research', 'health'}:
             try:
                 logger.info(f"同步获取实体数量: graph_id={state.graph_id}")
                 reader = ZepEntityReader()
@@ -718,6 +764,7 @@ def prepare_simulation():
             "deepresearch": "DeepResearch / CSI Workflow",
             "web_research": "Web Research (query-only)",
             "social": "Dual-Platform Social Simulation",
+            "health": "Health / Medical Diagnostic Workflow",
         }
         state.config_mode_label = _mode_labels.get(config_mode, "Dual-Platform Social Simulation")
         manager._save_simulation_state(state)
@@ -1757,8 +1804,21 @@ def get_local_csi_state(simulation_id: str):
                 "success": False,
                 "error": f"CSI state not found for simulation: {simulation_id}",
             }), 404
-        state = store.get_state(simulation_id)
-        snapshot = store.get_snapshot(simulation_id)
+
+        state = None
+        snapshot = None
+
+        try:
+            state = store.get_state(simulation_id)
+        except Exception as e:
+            logger.warning(f"Failed to get state for {simulation_id}: {str(e)}")
+            state = {}
+
+        try:
+            snapshot = store.get_snapshot(simulation_id)
+        except Exception as e:
+            logger.warning(f"Failed to get snapshot for {simulation_id}: {str(e)}")
+            snapshot = {}
 
         return jsonify({
             "success": True,
@@ -1788,10 +1848,10 @@ def get_local_csi_state(simulation_id: str):
         }), 200
     except Exception as e:
         logger.error(f"获取本地CSI状态失败: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -1805,7 +1865,13 @@ def get_local_csi_graph(simulation_id: str):
                 "success": False,
                 "error": f"CSI graph not found for simulation: {simulation_id}",
             }), 404
-        snapshot = store.get_snapshot(simulation_id)
+
+        snapshot = {}
+        try:
+            snapshot = store.get_snapshot(simulation_id)
+        except Exception as e:
+            logger.warning(f"Failed to get snapshot for graph {simulation_id}: {str(e)}")
+
         graph_payload = _to_csi_graph_shape(snapshot)
         return jsonify({
             "success": True,
@@ -1818,10 +1884,10 @@ def get_local_csi_graph(simulation_id: str):
         }), 200
     except Exception as e:
         logger.error(f"获取本地CSI图失败: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             "success": False,
             "error": str(e),
-            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -2304,10 +2370,10 @@ def start_simulation():
         graph_id = None
         config_mode = getattr(state, 'config_mode', '') or ''
         if enable_graph_memory_update:
-            if config_mode in ('web_research',):
-                # Web research has no graph — silently disable graph memory update
+            if config_mode in ('web_research', 'health'):
+                # These modes have no graph — silently disable graph memory update
                 enable_graph_memory_update = False
-                logger.info(f"Graph memory update disabled for web_research mode: {simulation_id}")
+                logger.info(f"Graph memory update disabled for {config_mode} mode: {simulation_id}")
             else:
                 # 从模拟状态或项目中获取 graph_id
                 graph_id = state.graph_id
@@ -3552,3 +3618,29 @@ def list_cloud_sessions():
     except Exception as exc:
         logger.error(f"list_cloud_sessions error: {exc}")
         return jsonify({'success': True, 'sessions': []})
+
+
+# ---------------------------------------------------------------------------
+# Health CSI report
+# ---------------------------------------------------------------------------
+
+@simulation_bp.route('/<simulation_id>/health-report', methods=['GET'])
+def get_health_report(simulation_id: str):
+    """Return comprehensive structured health assessment for a completed health-mode simulation."""
+    try:
+        from ..services.health_report_generator import generate_health_report
+
+        manager = SimulationManager()
+        sim = manager.get_simulation(simulation_id)
+        if not sim:
+            return jsonify({'error': 'Simulation not found'}), 404
+
+        if sim.config_mode != 'health':
+            return jsonify({'error': 'Not a health mode simulation'}), 400
+
+        assessment = generate_health_report(simulation_id)
+        return jsonify(assessment), 200
+
+    except Exception as exc:
+        logger.error(f"Health report error for {simulation_id}: {exc}")
+        return jsonify({'error': str(exc)}), 500

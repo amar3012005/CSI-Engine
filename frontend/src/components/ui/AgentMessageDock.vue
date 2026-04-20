@@ -136,7 +136,7 @@ onBeforeUnmount(() => {
 /* ─── Notch Container ─────────────────────────── */
 .agent-notch {
   position: absolute;
-  top: 48px;
+  top: 0px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 55;
@@ -219,6 +219,7 @@ onBeforeUnmount(() => {
   height: 28px;
   margin-left: 2px;
 }
+
 
 .notch-avatars.expanded .notch-avatar-btn:first-child {
   margin-left: 0;

@@ -122,21 +122,33 @@
                   <div class="ac-meta-line muted">— Idle</div>
                 </template>
 
-                <!-- CSI: PROPOSE_CLAIM / propose_claim -->
-                <template v-if="action.action_type === 'PROPOSE_CLAIM' || action.action_type === 'propose_claim'">
-                  <div class="ac-text">{{ action.action_args?.claim_text || action.action_args?.content || action.action_summary || 'Proposed a new claim' }}</div>
-                  <div v-if="action.action_args?.confidence" class="ac-meta-line">Confidence: {{ Math.round((action.action_args.confidence || 0) * 100) }}%</div>
+                <!-- CSI: PROPOSE_CLAIM / propose_claim / claim_propose -->
+                <template v-if="['PROPOSE_CLAIM','propose_claim','claim_propose'].includes(action.action_type)">
+                  <div class="ac-text">{{ action.action_args?.content || action.action_args?.claim_text || 'New clinical finding' }}</div>
                 </template>
 
-                <!-- CSI: CHALLENGE_CLAIM / peer_review -->
-                <template v-if="action.action_type === 'CHALLENGE_CLAIM' || action.action_type === 'peer_review'">
-                  <div class="ac-text">{{ action.action_args?.review_text || action.action_args?.content || action.action_summary || 'Reviewing a claim' }}</div>
-                  <div v-if="action.action_args?.verdict" class="ac-meta-line">Verdict: {{ action.action_args.verdict }}</div>
+                <!-- CSI: CHALLENGE_CLAIM / VERIFY_CLAIM / peer_review -->
+                <template v-if="['CHALLENGE_CLAIM','VERIFY_CLAIM','peer_review'].includes(action.action_type)">
+                  <div class="ac-text">{{ action.action_args?.content || action.action_args?.review_text || 'Peer review' }}</div>
+                  <div v-if="action.action_args?.verdict" class="ac-meta-line verdict-chip" :class="'verdict-' + action.action_args.verdict">
+                    {{ action.action_args.verdict === 'needs_revision' ? '↻ Needs Revision' : action.action_args.verdict === 'supports' ? '✓ Supports' : action.action_args.verdict }}
+                  </div>
+                </template>
+
+                <!-- CSI: REVISE_CLAIM -->
+                <template v-if="['REVISE_CLAIM','revise_claim'].includes(action.action_type)">
+                  <div class="ac-text">{{ action.action_args?.content || 'Revised claim based on peer challenge' }}</div>
                 </template>
 
                 <!-- CSI: SEARCH_WEB / search_web -->
                 <template v-if="action.action_type === 'SEARCH_WEB' || action.action_type === 'search_web'">
-                  <div class="ac-meta-line">🔍 Searching: <span class="ac-search-q">"{{ action.action_args?.query || '' }}"</span></div>
+                  <div class="ac-meta-line">
+                    🔍 Searching
+                    <span v-if="action.action_args?.query || action.detail?.query" class="ac-search-q">
+                      "{{ action.action_args?.query || action.detail?.query }}"
+                    </span>
+                    <span v-else class="ac-search-q">medical literature</span>
+                  </div>
                   <div v-if="action.action_args?.results_count || action.action_args?.extracted_count" class="ac-meta-line">Found {{ action.action_args?.results_count || action.action_args?.extracted_count || 0 }} results</div>
                 </template>
 
@@ -153,8 +165,8 @@
                 </template>
 
                 <!-- CSI: RECALL -->
-                <template v-if="action.action_type === 'RECALL'">
-                  <div class="ac-text">{{ action.action_args?.query || action.action_summary || 'Recalling prior research' }}</div>
+                <template v-if="action.action_type === 'RECALL' || action.action_type === 'recall'">
+                  <div class="ac-text">{{ action.action_args?.content || action.action_args?.query || 'Recalling prior research' }}</div>
                   <div v-if="action.action_args?.source_ids?.length" class="ac-meta-line">Retrieved {{ action.action_args.source_ids.length }} sources</div>
                 </template>
 
@@ -192,13 +204,19 @@
     <div v-if="showReportConfirm" class="report-confirm-overlay">
       <CsiConfirmCard
         :visible="true"
-        title="Generate Report"
-        icon="&#x1F4C4;"
-        query="Compile all claims, trials, and evidence into a final CSI Deep Research report."
-        :stats="reportConfirmStats"
+        :title="isHealthMode ? 'Medical Assessment Ready' : 'Generate Report'"
+        :icon="isHealthMode ? '🩺' : '📄'"
+        :query="isHealthMode
+          ? 'Synthesize all clinical findings, evidence, and specialist consultations into a structured diagnostic assessment.'
+          : 'Compile all claims, trials, and evidence into a final CSI Deep Research report.'"
+        :stats="isHealthMode ? [
+          { value: allActions.length, label: 'Clinical Findings' },
+          { value: Math.max(runStatus.twitter_current_round || 0, runStatus.reddit_current_round || 0), label: 'Review Rounds' },
+          { value: 'Health', label: 'Mode' }
+        ] : reportConfirmStats"
         backLabel="Later"
-        continueLabel="Generate Report"
-        loadingLabel="Generating..."
+        :continueLabel="isHealthMode ? 'Generate Assessment' : 'Generate Report'"
+        :loadingLabel="isHealthMode ? 'Generating Assessment...' : 'Generating...'"
         :loading="isGeneratingReport"
         @back="showReportConfirm = false"
         @continue="confirmReportGeneration"
@@ -209,7 +227,7 @@
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { 
   startSimulation, 
   stopSimulation,
@@ -238,15 +256,30 @@ const props = defineProps({
     type: Boolean,
     default: false
   },
+  autoGenerateReportOnComplete: {
+    type: Boolean,
+    default: false
+  },
   agentProfiles: {
     type: Array,
     default: () => []
+  },
+  isHealthMode: {
+    type: Boolean,
+    default: false
   }
 })
 
 const emit = defineEmits(['go-back', 'next-step', 'add-log', 'update-status'])
 
 const router = useRouter()
+const route = useRoute()
+
+// Override prop with URL check — guards against prop chain timing failures
+const isHealthMode = computed(() =>
+  props.isHealthMode ||
+  String(route.query.configMode || '').toLowerCase() === 'health'
+)
 
 // State
 const isGeneratingReport = ref(false)
@@ -275,6 +308,13 @@ const actionIds = ref(new Set()) // Action ID set for deduplication
 const scrollContainer = ref(null)
 const profiles = ref([])
 const isHydrating = ref(false)
+
+const scrollActionsToBottom = (behavior = 'smooth') => {
+  nextTick(() => {
+    if (!scrollContainer.value) return
+    scrollContainer.value.scrollTo({ top: scrollContainer.value.scrollHeight, behavior })
+  })
+}
 
 // Computed
 // Display actions in chronological order (newest at the bottom)
@@ -354,8 +394,11 @@ const resumeExistingSimulation = async () => {
       await fetchProfiles({ silent: true })
       await fetchRunStatusDetail()
       emit('update-status', 'completed')
-      // Show report confirmation if no report has been generated yet
-      if (!props.reportStarted) {
+      if (props.autoGenerateReportOnComplete && !props.reportStarted) {
+        addLog('Follow-up run completed, auto-starting report generation')
+        await handleNextStep()
+      } else if (!props.reportStarted) {
+        // Show report confirmation if no report has been generated yet
         showReportConfirm.value = true
       }
       return true
@@ -542,8 +585,13 @@ const fetchRunStatus = async () => {
         stopPolling()
         await fetchRunStatusDetail() // Fetch final complete action logs
         emit('update-status', 'completed')
-        // Show confirmation card instead of auto-generating
-        showReportConfirm.value = true
+        if (props.autoGenerateReportOnComplete && !props.reportStarted) {
+          addLog('Follow-up run completed, auto-starting report generation')
+          await handleNextStep()
+        } else {
+          // Show confirmation card instead of auto-generating
+          showReportConfirm.value = true
+        }
       } else if (isFailed) {
         addLog('Simulation terminated due to error')
         phase.value = 2
@@ -619,20 +667,47 @@ const fetchRunStatusDetail = async () => {
             let contentStr = ''
             
             // Format CSI details to readable content
+            const isPropose = ['PROPOSE_CLAIM','propose_claim','claim_propose'].includes(action.action_type)
+            const isReview  = ['CHALLENGE_CLAIM','peer_review','VERIFY_CLAIM'].includes(action.action_type)
+            const isRevise  = ['REVISE_CLAIM','revise_claim'].includes(action.action_type)
+            const isRecall  = action.action_type === 'recall'
+            const isSynth   = action.action_type === 'SYNTHESIZE'
+
             if (action.action_type === 'SEARCH_WEB' || action.action_type === 'search_web') {
-              contentStr = `Query: "${detail.query}" - Found ${detail.results_count || detail.ingested_count || 0} results`
+              const q = detail.query || ''
+              const n = detail.results_count || detail.ingested_count || 0
+              contentStr = q ? `"${q}"` : 'medical literature'
+              if (n) contentStr += ` · ${n} sources found`
             } else if (action.action_type === 'READ_URL' || action.action_type === 'investigate_source') {
-              if (detail.urls && detail.urls.length) {
-                contentStr = `Read ${detail.urls.length} URLs (Extracted: ${detail.extracted_count || 0})`
+              const cnt = detail.urls?.length || detail.extracted_count || 1
+              contentStr = `Read ${cnt} source${cnt > 1 ? 's' : ''}`
+            } else if (isPropose) {
+              const claimTxt = detail.claim_text || ''
+              const conf = detail.confidence != null ? Math.round(detail.confidence * 100) + '%' : null
+              const srcCnt = detail.source_ids?.length || detail.source_count || 1
+              if (claimTxt) {
+                contentStr = claimTxt.length > 180 ? claimTxt.substring(0, 180) + '…' : claimTxt
+              } else {
+                contentStr = `New clinical finding · ${srcCnt} source${srcCnt > 1 ? 's' : ''}`
               }
-            } else if (action.action_type === 'propose_claim' || action.action_type === 'PROPOSE_CLAIM') {
-              contentStr = `Proposed claim ${detail.claim_id?.substring(0, 10)}... (confidence: ${detail.confidence}) based on ${detail.source_count || 1} sources.`
-            } else if (action.action_type === 'peer_review' || action.action_type === 'CHALLENGE_CLAIM') {
-              contentStr = `Reviewed trial ${detail.trial_id?.substring(0, 10)}... or related artifact.`
+              if (conf) contentStr += ` (${conf})`
+            } else if (isReview) {
+              const verdict = detail.verdict || detail.trial_verdict || ''
+              const reviewTxt = detail.review_text || detail.response || ''
+              contentStr = reviewTxt ? (reviewTxt.length > 160 ? reviewTxt.substring(0, 160) + '…' : reviewTxt)
+                         : verdict ? `Verdict: ${verdict}` : 'Reviewed peer claim'
+            } else if (isRevise) {
+              contentStr = 'Revised previous claim based on peer challenge'
+            } else if (isRecall) {
+              const q = detail.query || detail.recall_id || ''
+              const srcCnt = detail.source_ids?.length || 0
+              contentStr = q ? `Recalled: "${q.substring(0, 100)}"` : `Retrieved ${srcCnt} sources from memory`
+            } else if (isSynth) {
+              contentStr = 'Synthesizing all findings into consolidated assessment'
             } else {
-              // fallback: json stringify keys
-              contentStr = JSON.stringify(detail, null, 2)
-              if (contentStr.length > 200) contentStr = contentStr.substring(0, 200) + '...'
+              // fallback: only show non-empty keys
+              const keys = Object.keys(detail).filter(k => detail[k] !== null && detail[k] !== '' && detail[k] !== undefined)
+              contentStr = keys.length ? keys.map(k => `${k}: ${String(detail[k]).substring(0, 60)}`).join(' · ') : ''
             }
 
             return {
@@ -675,16 +750,9 @@ const fetchRunStatusDetail = async () => {
         allActions.value.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
       }
       
-      // Auto-scroll to bottom when new actions arrive (like a group chat)
+      // Auto-scroll to bottom when new actions arrive.
       if (newActionsAdded > 0 && scrollContainer.value) {
-        nextTick(() => {
-          const el = scrollContainer.value
-          // Only auto-scroll if user is near the bottom (within 200px)
-          const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200
-          if (isNearBottom) {
-            el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
-          }
-        })
+        scrollActionsToBottom('smooth')
       }
     }
   } catch (err) {
@@ -696,7 +764,28 @@ const fetchRunStatusDetail = async () => {
 const getActionTypeLabel = (type) => {
   if (!type) return 'UNKNOWN'
   if (type.length > 20) return type.substring(0, 20)
-  
+
+  if (isHealthMode.value) {
+    const healthLabels = {
+      'PROPOSE_CLAIM': 'Clinical Finding',
+      'propose_claim': 'Clinical Finding',
+      'claim_propose': 'Clinical Finding',
+      'CHALLENGE_CLAIM': 'Specialist Review',
+      'challenge_claim': 'Specialist Review',
+      'peer_review': 'Specialist Review',
+      'VERIFY_CLAIM': 'Evidence Verification',
+      'REVISE_CLAIM': 'Revised Finding',
+      'revise_claim': 'Revised Finding',
+      'recall': 'Evidence Recall',
+      'SYNTHESIZE': 'Diagnostic Synthesis',
+      'synthesize': 'Diagnostic Synthesis',
+      'SEARCH_WEB': 'Medical Literature Search',
+      'search_web': 'Medical Literature Search',
+      'READ_URL': 'Clinical Source Review',
+    }
+    if (healthLabels[type]) return healthLabels[type]
+  }
+
   const labels = {
     'CREATE_POST': 'POST',
     'REPOST': 'REPOST',
@@ -816,6 +905,15 @@ const handleNextStep = async () => {
   }
 
   isGeneratingReport.value = true
+
+  // Health mode: skip paper generation, navigate to report stage
+  if (isHealthMode.value) {
+    addLog('Generating medical assessment...')
+    isGeneratingReport.value = false
+    emit('next-step', { stage: 'report', reportId: null })
+    return
+  }
+
   addLog('Starting report generation...')
 
   try {
@@ -860,9 +958,7 @@ onMounted(() => {
       }
       // Scroll to bottom after loading existing actions
       nextTick(() => {
-        if (scrollContainer.value) {
-          scrollContainer.value.scrollTop = scrollContainer.value.scrollHeight
-        }
+        scrollActionsToBottom('auto')
       })
     })
   }
@@ -1123,6 +1219,19 @@ onUnmounted(() => {
 .ac-meta-line.muted {
   color: #bbb;
 }
+
+.verdict-chip {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 10px;
+  margin-top: 3px;
+}
+.verdict-chip.verdict-supports { background: #dcfce7; color: #15803d; }
+.verdict-chip.verdict-needs_revision { background: #fef9c3; color: #92400e; }
+.verdict-chip.verdict-challenges,
+.verdict-chip.verdict-disagrees { background: #fee2e2; color: #991b1b; }
 
 .ac-search-q {
   font-family: 'JetBrains Mono', monospace;

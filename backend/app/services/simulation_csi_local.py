@@ -114,6 +114,7 @@ class SimulationCSILocalStore:
             "source_count": 0,
             "claim_count": 0,
             "trial_count": 0,
+            "review_count": 0,
             "agent_action_count": 0,
             "recall_count": 0,
             "relation_count": 0,
@@ -138,8 +139,91 @@ class SimulationCSILocalStore:
         return self._load_json(self._path(simulation_id, "sources_index.json"), default)
 
     def _save_sources_index(self, simulation_id: str, payload: Dict[str, Any]) -> None:
+        payload["source_count"] = len(payload.get("sources", []) or [])
         payload["updated_at"] = self._now()
         self._write_json(self._path(simulation_id, "sources_index.json"), payload)
+        self._write_source_jsol(simulation_id, payload)
+
+    def _write_source_jsol(self, simulation_id: str, payload: Dict[str, Any]) -> None:
+        sources = payload.get("sources", []) or []
+        updated_at = payload.get("updated_at") or self._now()
+
+        def _entry(source: Dict[str, Any]) -> Dict[str, Any]:
+            metadata = source.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            discovery = metadata.get("discovery") or {}
+            if not isinstance(discovery, dict):
+                discovery = {}
+
+            prompt = (
+                discovery.get("prompt")
+                or metadata.get("prompt")
+                or source.get("query")
+                or ""
+            )
+            category = discovery.get("kind") or ("seed" if source.get("origin") == "seed_search" else "agent")
+
+            return {
+                "source_id": source.get("source_id"),
+                "title": source.get("title"),
+                "url": source.get("url"),
+                "source_type": source.get("source_type"),
+                "origin": source.get("origin"),
+                "summary": source.get("summary") or "",
+                "prompt": prompt,
+                "source": {
+                    "provider_mode": discovery.get("provider_mode") or metadata.get("provider_mode") or "",
+                    "search_depth": discovery.get("search_depth") or metadata.get("search_depth") or "",
+                    "round_num": discovery.get("round_num"),
+                },
+                "by": {
+                    "agent_id": discovery.get("agent_id"),
+                    "agent_name": discovery.get("agent_name") or metadata.get("agent_name"),
+                    "role": discovery.get("role") or metadata.get("role"),
+                    "kind": category,
+                },
+                "created_at": source.get("created_at"),
+                "updated_at": source.get("updated_at"),
+            }
+
+        all_entries = [_entry(source) for source in sources]
+        seed_sources = [entry for entry in all_entries if entry.get("by", {}).get("kind") == "seed"]
+        agent_sources = [entry for entry in all_entries if entry.get("by", {}).get("kind") != "seed"]
+
+        artifact = {
+            "simulation_id": simulation_id,
+            "updated_at": updated_at,
+            "counts": {
+                "all_sources": len(all_entries),
+                "seed_sources": len(seed_sources),
+                "agent_sources": len(agent_sources),
+            },
+            "seed_sources": seed_sources,
+            "agent_sources": agent_sources,
+            "all_sources": all_entries,
+        }
+        self._write_json(self._path(simulation_id, "source.jsol"), artifact)
+
+    def merge_sources(self, simulation_id: str, sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+        with self._lock:
+            idx = self._load_sources_index(simulation_id)
+            existing_ids = {
+                source.get("source_id")
+                for source in idx.get("sources", [])
+                if source.get("source_id")
+            }
+            merged_sources = list(idx.get("sources", []))
+            for source in sources:
+                source_id = source.get("source_id")
+                if not source_id or source_id in existing_ids:
+                    continue
+                merged_sources.append(source)
+                existing_ids.add(source_id)
+            idx["sources"] = merged_sources
+            idx["source_count"] = len(merged_sources)
+            self._save_sources_index(simulation_id, idx)
+            return idx
 
     def _manifest_path(self, simulation_id: str) -> str:
         return self._path(simulation_id, "manifest.json")
@@ -153,8 +237,10 @@ class SimulationCSILocalStore:
             "files": {
                 "state": "state.json",
                 "sources_index": "sources_index.json",
+                "source_manifest": "source.jsol",
                 "claims": "claims.jsonl",
                 "trials": "trials.jsonl",
+                "reviews": "reviews.jsonl",
                 "agent_actions": "agent_actions.jsonl",
                 "recalls": "recalls.jsonl",
                 "relations": "relations.jsonl",
@@ -163,14 +249,127 @@ class SimulationCSILocalStore:
         self._write_json(self._manifest_path(simulation_id), manifest)
         return manifest
 
+    def _build_blackboard_snapshot(self, simulation_id: str) -> Dict[str, Any]:
+        claims = self._read_jsonl(self._path(simulation_id, "claims.jsonl"))
+        trials = self._read_jsonl(self._path(simulation_id, "trials.jsonl"))
+        reviews = self._read_jsonl(self._path(simulation_id, "reviews.jsonl"))
+        actions = self._read_jsonl(self._path(simulation_id, "agent_actions.jsonl"))
+        recalls = self._read_jsonl(self._path(simulation_id, "recalls.jsonl"))
+        relations = self._read_jsonl(self._path(simulation_id, "relations.jsonl"))
+        sources_index = self._load_sources_index(simulation_id)
+        sources = sources_index.get("sources", [])
+
+        reviewed_claim_ids = {
+            str(trial.get("claim_id"))
+            for trial in trials
+            if trial.get("claim_id")
+        }
+
+        reviewed_claim_ids = {
+            str(trial.get("claim_id"))
+            for trial in trials
+            if trial.get("claim_id")
+        }
+        unique_sources_cited = self._unique([
+            str(source_id)
+            for claim in claims
+            for source_id in (claim.get("source_ids") or [])
+            if source_id
+        ])
+        active_agent_ids = self._unique([
+            str(agent_id)
+            for agent_id in (
+                [claim.get("agent_id") for claim in claims]
+                + [trial.get("query_agent_id") for trial in trials]
+                + [trial.get("target_agent_id") for trial in trials]
+                + [action.get("agent_id") for action in actions]
+                + [recall.get("agent_id") for recall in recalls]
+            )
+            if agent_id is not None
+        ])
+        latest_round = 0
+        for value in (
+            [claim.get("round_num") for claim in claims]
+            + [trial.get("round_num") for trial in trials]
+            + [action.get("round_num") for action in actions]
+            + [recall.get("round_num") for recall in recalls]
+        ):
+            try:
+                latest_round = max(latest_round, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+
+        return {
+            "counts": {
+                "sources": len(sources),
+                "claims": len(claims),
+                "trials": len(trials),
+                "reviews": len(reviews),
+                "agent_actions": len(actions),
+                "recalls": len(recalls),
+                "relations": len(relations),
+                "reviewed_claims": len(reviewed_claim_ids),
+                "unique_sources_cited": len(unique_sources_cited),
+                "active_agents": len(active_agent_ids),
+            },
+            "latest_round": latest_round,
+            "reviewed_claim_ids": reviewed_claim_ids,
+            "unique_source_ids": unique_sources_cited,
+            "active_agent_ids": active_agent_ids,
+            "updated_at": self._now(),
+        }
+
+    def refresh_blackboard_state(self, simulation_id: str) -> Dict[str, Any]:
+        with self._lock:
+            state = self._load_state(simulation_id)
+            blackboard = self._build_blackboard_snapshot(simulation_id)
+            counts = blackboard.get("counts", {})
+            state["source_count"] = int(counts.get("sources", 0))
+            state["claim_count"] = int(counts.get("claims", 0))
+            state["trial_count"] = int(counts.get("trials", 0))
+            state["review_count"] = int(counts.get("reviews", 0))
+            state["agent_action_count"] = int(counts.get("agent_actions", 0))
+            state["recall_count"] = int(counts.get("recalls", 0))
+            state["relation_count"] = int(counts.get("relations", 0))
+            state["round_count"] = max(int(state.get("round_count", 0) or 0), int(blackboard.get("latest_round", 0) or 0))
+            state["blackboard"] = {
+                "latest_round": int(blackboard.get("latest_round", 0) or 0),
+                "reviewed_claim_ids": sorted(blackboard.get("reviewed_claim_ids", set())),
+                "unique_source_ids": blackboard.get("unique_source_ids", []),
+                "active_agent_ids": blackboard.get("active_agent_ids", []),
+                "counts": counts,
+                "updated_at": blackboard.get("updated_at"),
+            }
+            self._save_state(simulation_id, state)
+
+            manifest = self._ensure_manifest(simulation_id)
+            manifest["updated_at"] = self._now()
+            manifest["source_count"] = state["source_count"]
+            manifest["claim_count"] = state["claim_count"]
+            manifest["trial_count"] = state["trial_count"]
+            manifest["review_count"] = state["review_count"]
+            manifest["agent_action_count"] = state["agent_action_count"]
+            manifest["recall_count"] = state["recall_count"]
+            manifest["relation_count"] = state["relation_count"]
+            manifest["round_count"] = state["round_count"]
+            manifest["blackboard"] = {
+                "latest_round": state["blackboard"]["latest_round"],
+                "counts": counts,
+                "updated_at": state["blackboard"].get("updated_at"),
+            }
+            self._write_json(self._manifest_path(simulation_id), manifest)
+            return state
+
     def _reset_artifact_files(self, simulation_id: str) -> None:
         for filename in (
             "claims.jsonl",
             "trials.jsonl",
+            "reviews.jsonl",
             "agent_actions.jsonl",
             "recalls.jsonl",
             "relations.jsonl",
             "sources_index.json",
+            "source.jsol",
             "simulation_config_snapshot.json",
             "profiles_snapshot.json",
             "state.json",
@@ -430,7 +629,8 @@ class SimulationCSILocalStore:
                 state["round_count"] = updated
                 state["round_source"] = source
                 self._save_state(simulation_id, state)
-            return int(state.get("round_count", updated))
+            refreshed = self.refresh_blackboard_state(simulation_id)
+            return int(refreshed.get("round_count", updated))
 
     def _normalize_profile(self, index: int, profile: Dict[str, Any], agent_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         agent_id = int(profile.get("user_id") or profile.get("agent_id") or agent_cfg.get("agent_id") or index + 1)
@@ -1241,16 +1441,8 @@ class SimulationCSILocalStore:
                 },
             })
             self._save_state(simulation_id, state)
-
-            manifest = self._ensure_manifest(simulation_id)
-            manifest["updated_at"] = self._now()
-            manifest["source_count"] = sources_index.get("source_count", 0)
-            manifest["claim_count"] = bootstrap.get("claims", 0)
-            manifest["trial_count"] = bootstrap.get("trials", 0)
-            manifest["agent_action_count"] = bootstrap.get("agent_actions", 0)
-            manifest["recall_count"] = bootstrap.get("recalls", 0)
-            manifest["relation_count"] = bootstrap.get("relations", 0)
-            self._write_json(self._manifest_path(simulation_id), manifest)
+            state = self.refresh_blackboard_state(simulation_id)
+            manifest = self._load_json(self._manifest_path(simulation_id), {})
 
             return {
                 "simulation_id": simulation_id,
@@ -1308,6 +1500,30 @@ class SimulationCSILocalStore:
             self._append_jsonl(self._path(simulation_id, "trials.jsonl"), record)
             state = self._load_state(simulation_id)
             state["trial_count"] = int(state.get("trial_count", 0)) + 1
+            self._save_state(simulation_id, state)
+            return record
+
+    def record_review(self, simulation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            record = {
+                "review_id": payload.get("review_id") or self._entity_id(simulation_id, "review", uuid.uuid4().hex),
+                "claim_id": payload.get("claim_id"),
+                "agent_id": payload.get("agent_id"),
+                "agent_name": payload.get("agent_name"),
+                "entity_uuid": payload.get("entity_uuid"),
+                "entity_name": payload.get("entity_name"),
+                "entity_type": payload.get("entity_type"),
+                "role": payload.get("role"),
+                "verdict": payload.get("verdict", "needs_revision"),
+                "text": payload.get("text", ""),
+                "confidence": float(payload.get("confidence", 0.5) or 0.5),
+                "round_num": int(payload.get("round_num", 0) or 0),
+                "created_at": self._now(),
+                "updated_at": self._now(),
+            }
+            self._append_jsonl(self._path(simulation_id, "reviews.jsonl"), record)
+            state = self._load_state(simulation_id)
+            state["review_count"] = int(state.get("review_count", 0)) + 1
             self._save_state(simulation_id, state)
             return record
 
@@ -1408,6 +1624,7 @@ class SimulationCSILocalStore:
             state["recall_count"] = int(state.get("recall_count", 0)) + result.get("recalls", 0)
             state["relation_count"] = int(state.get("relation_count", 0)) + result.get("relations", 0)
             self._save_state(simulation_id, state)
+            state = self.refresh_blackboard_state(simulation_id)
             return {
                 "simulation_id": simulation_id,
                 "state": state,

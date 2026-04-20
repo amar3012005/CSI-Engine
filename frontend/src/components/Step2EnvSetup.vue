@@ -122,6 +122,7 @@ let lastLoggedConfigStage = ''
 const useCustomRounds = ref(false) // default: use auto-configured rounds
 const customMaxRounds = ref(40)   // default recommended: 40 rounds
 
+
 // Watch stage to update phase
 watch(currentStage, (newStage) => {
   if (newStage === 'generating_profiles') {
@@ -181,7 +182,7 @@ watch(
   (value) => {
     if (!value) return
     const normalized = String(value).toLowerCase()
-    if (normalized === 'social' || normalized === 'deepresearch' || normalized === 'web_research') {
+    if (normalized === 'social' || normalized === 'deepresearch' || normalized === 'web_research' || normalized === 'health') {
       selectedConfigMode.value = normalized
       configMode.value = normalized
     }
@@ -190,6 +191,7 @@ watch(
 
 const isDeepResearchMode = computed(() => configMode.value === 'deepresearch' || configMode.value === 'web_research')
 const isWebResearchMode = computed(() => configMode.value === 'web_research')
+const isHealthMode = computed(() => configMode.value === 'health')
 const isModeLocked = computed(() => Boolean(props.simulationId))
 const stepOneTitle = computed(() => (
   isWebResearchMode.value ? 'Research Workspace Init' : 'Simulation Instance Init'
@@ -282,6 +284,14 @@ const totalTopicsCount = computed(() => {
 
 // Environment stage pipeline
 const envStages = computed(() => {
+  if (isHealthMode.value) {
+    return [
+      { key: 'patient', label: 'Patient Data' },
+      { key: 'team', label: 'Team Assembly' },
+      { key: 'evidence', label: 'Medical Evidence' },
+      { key: 'ready', label: 'Ready' },
+    ]
+  }
   if (isWebResearchMode.value) {
     return [
       { key: 'bootstrap', label: 'Bootstrap Sandbox' },
@@ -385,6 +395,13 @@ const handleStartSimulation = () => {
   emit('next-step', params)
 }
 
+const maybeAutoAdvanceToSimulation = () => {
+  if (!props.autoStart) return
+  setTimeout(() => {
+    handleStartSimulation()
+  }, 1200)
+}
+
 const truncateBio = (bio) => {
   if (bio.length > 80) {
     return bio.substring(0, 80) + '...'
@@ -418,11 +435,12 @@ const startPrepareSimulation = async () => {
   setTimeout(() => { sandboxSeqOverride.value = null }, 4200) // let computed decide
   
   try {
+    const simulationRequirement = props.projectData?.simulation_requirement || ''
     const res = await prepareSimulation({
       simulation_id: props.simulationId,
       use_llm_for_profiles: true,
       parallel_profile_count: 5,
-      config_mode: requestedConfigMode.value
+      config_mode: requestedConfigMode.value,
     })
     
     if (res.success && res.data) {
@@ -670,10 +688,8 @@ const fetchConfigRealtime = async () => {
         addLog('Environment setup complete, ready to start simulation')
         emit('update-status', 'completed')
         
-        // Auto-transition to Step 3: Simulation after a short delay
-        setTimeout(() => {
-          handleStartSimulation()
-        }, 1200)
+        // Auto-transition to Step 3 only during the active setup flow.
+        maybeAutoAdvanceToSimulation()
       }
     }
   } catch (err) {
@@ -717,10 +733,8 @@ const loadPreparedData = async () => {
         phase.value = 4
         emit('update-status', 'completed')
 
-        // Auto-transition to Step 3: Simulation after a short delay
-        setTimeout(() => {
-          handleStartSimulation()
-        }, 1200)
+        // Auto-transition to Step 3 only during the active setup flow.
+        maybeAutoAdvanceToSimulation()
 
       } else {
         // Config not yet generated, start polling
@@ -737,9 +751,14 @@ const loadPreparedData = async () => {
 onMounted(() => {
   addLog('Step 2 environment setup initialized')
   addLog(`Workflow mode selected: ${requestedConfigMode.value}`)
-  // Always auto-start — no manual button
   nextTick(() => {
-    startPrepareSimulation()
+    if (props.autoStart) {
+      startPrepareSimulation()
+      return
+    }
+    if (props.simulationId) {
+      loadPreparedData()
+    }
   })
 })
 
@@ -981,5 +1000,42 @@ onUnmounted(() => {
   color: #c4c0ba;
   flex-shrink: 0;
   font-family: 'JetBrains Mono', monospace;
+}
+
+/* ─── Health CSI Patient Form ─────────────────── */
+.health-patient-form {
+  background: #faf9f4;
+  border: 1px solid #e3e0db;
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-top: 1rem;
+}
+.health-form-header { margin-bottom: 1.5rem; }
+.health-form-icon { font-size: 1.5rem; }
+.health-form-header h3 { font-family: 'Space Grotesk', sans-serif; font-size: 1.1rem; font-weight: 600; margin: 0.25rem 0; }
+.health-form-subtitle { font-size: 0.8rem; color: #666; }
+.health-form-field { margin-bottom: 1rem; }
+.health-form-field label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 0.4rem; }
+.health-form-field textarea {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid #e3e0db;
+  border-radius: 8px;
+  background: white;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 0.875rem;
+  resize: vertical;
+}
+.health-form-field textarea:focus { outline: none; border-color: #999; }
+.required { color: #e74c3c; }
+.optional { color: #999; font-size: 0.8rem; }
+.health-disclaimer {
+  font-size: 0.8rem;
+  color: #888;
+  background: #fffdf0;
+  border: 1px solid #e8e0c0;
+  border-radius: 6px;
+  padding: 0.75rem;
+  margin-top: 1rem;
 }
 </style>

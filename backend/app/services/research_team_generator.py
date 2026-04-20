@@ -41,48 +41,89 @@ ROLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "challenge_targets": ["fact_checker"],
     },
     "domain_expert": {
-        "world_actions": ["READ_URL"],
+        "world_actions": ["SEARCH_WEB", "READ_URL"],
         "peer_actions": ["PROPOSE_CLAIM", "EVALUATE_CLAIM", "PROVIDE_CONTEXT"],
         "evidence_priority": "technical_correctness",
         "challenge_targets": ["challenger"],
     },
     "fact_checker": {
-        "world_actions": ["SEARCH_WEB"],
+        "world_actions": ["SEARCH_WEB", "READ_URL"],
         "peer_actions": ["VERIFY_CLAIM", "CHALLENGE_CLAIM", "REQUEST_SOURCE"],
         "evidence_priority": "peer_reviewed",
         "challenge_targets": ["explorer", "domain_expert"],
     },
     "challenger": {
-        "world_actions": ["SEARCH_WEB"],
+        "world_actions": ["SEARCH_WEB", "READ_URL"],
         "peer_actions": ["CHALLENGE_CLAIM", "COUNTER_ARGUE", "REQUEST_EVIDENCE"],
         "evidence_priority": "counter_evidence",
         "challenge_targets": ["domain_expert", "synthesizer"],
     },
     "synthesizer": {
-        "world_actions": [],
+        "world_actions": ["SEARCH_WEB"],
         "peer_actions": ["SYNTHESIZE", "RESOLVE_CONTRADICTION", "PROPOSE_CONCLUSION"],
         "evidence_priority": "coherence",
         "challenge_targets": ["communicator"],
     },
     "communicator": {
-        "world_actions": [],
+        "world_actions": ["SEARCH_WEB"],
         "peer_actions": ["SUMMARIZE", "TRANSLATE_FINDING", "DRAFT_REPORT"],
         "evidence_priority": "clarity",
         "challenge_targets": [],
     },
     "methodologist": {
-        "world_actions": ["READ_URL"],
+        "world_actions": ["SEARCH_WEB", "READ_URL"],
         "peer_actions": ["EVALUATE_METHOD", "PROPOSE_FRAMEWORK", "CHALLENGE_CLAIM"],
         "evidence_priority": "methodological_rigor",
         "challenge_targets": ["domain_expert", "explorer"],
     },
     "second_domain_expert": {
-        "world_actions": ["READ_URL"],
+        "world_actions": ["SEARCH_WEB", "READ_URL"],
         "peer_actions": ["PROPOSE_CLAIM", "EVALUATE_CLAIM", "COUNTER_ARGUE"],
         "evidence_priority": "technical_correctness",
         "challenge_targets": ["domain_expert", "challenger"],
     },
 }
+
+_HEALTH_ROLE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "medical_researcher": {
+        "world_actions": ["SEARCH_WEB"],
+        "peer_actions": ["PROPOSE_CLAIM", "VERIFY_CLAIM"],
+        "evidence_priority": "clinical_evidence",
+        "challenge_targets": ["primary_physician"],
+    },
+    "primary_physician": {
+        "world_actions": ["SEARCH_WEB"],
+        "peer_actions": ["PROPOSE_CLAIM", "CHALLENGE_CLAIM"],
+        "evidence_priority": "diagnostic_accuracy",
+        "challenge_targets": ["diagnostician", "medical_researcher"],
+    },
+    "clinical_pharmacologist": {
+        "world_actions": ["SEARCH_WEB"],
+        "peer_actions": ["CHALLENGE_CLAIM", "VERIFY_CLAIM"],
+        "evidence_priority": "pharmacological_safety",
+        "challenge_targets": ["primary_physician", "diagnostician"],
+    },
+    "diagnostician": {
+        "world_actions": ["SEARCH_WEB"],
+        "peer_actions": ["PROPOSE_CLAIM", "CHALLENGE_CLAIM"],
+        "evidence_priority": "diagnostic_accuracy",
+        "challenge_targets": ["medical_researcher", "primary_physician"],
+    },
+    "medical_synthesizer": {
+        "world_actions": [],
+        "peer_actions": ["SYNTHESIZE"],
+        "evidence_priority": "clinical_consensus",
+        "challenge_targets": [],
+    },
+    "patient_advocate": {
+        "world_actions": [],
+        "peer_actions": ["CHALLENGE_CLAIM", "VERIFY_CLAIM"],
+        "evidence_priority": "patient_safety",
+        "challenge_targets": ["primary_physician", "diagnostician", "clinical_pharmacologist"],
+    },
+}
+
+HEALTH_REQUIRED_ROLES: List[str] = list(_HEALTH_ROLE_DEFAULTS.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +149,10 @@ class ResearchAgent:
     qualification_score: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Ensure 'role' is present as a mirror of 'research_role' for CSI compatibility
+        d["role"] = self.research_role
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -128,22 +172,22 @@ competencies and can investigate the query rigorously.
 1. **explorer** — Discovers primary and secondary sources via web search. \
    world_actions: ["SEARCH_WEB", "READ_URL"]
 2. **domain_expert** — Deep technical/domain knowledge relevant to the query. \
-   world_actions: ["READ_URL"]
+   world_actions: ["SEARCH_WEB", "READ_URL"]
 3. **fact_checker** — Verifies claims against independent, authoritative sources. \
-   world_actions: ["SEARCH_WEB"]
+   world_actions: ["SEARCH_WEB", "READ_URL"]
 4. **challenger** — Adversarial reviewer who seeks counter-evidence and weaknesses. \
-   world_actions: ["SEARCH_WEB"]
+   world_actions: ["SEARCH_WEB", "READ_URL"]
 5. **synthesizer** — Combines findings, resolves contradictions, builds coherent picture. \
-   world_actions: []
+   world_actions: ["SEARCH_WEB"]
 6. **communicator** — Translates findings for the intended audience. \
-   world_actions: []
+   world_actions: ["SEARCH_WEB"]
 
 ## Optional Roles (use if team_size > 6)
 
 - **methodologist** — Evaluates research methods and frameworks. \
-  world_actions: ["READ_URL"]
+  world_actions: ["SEARCH_WEB", "READ_URL"]
 - **second_domain_expert** — Provides an alternative domain perspective. \
-  world_actions: ["READ_URL"]
+  world_actions: ["SEARCH_WEB", "READ_URL"]
 
 ## Team Design Rules
 
@@ -192,6 +236,105 @@ Generate exactly {team_size} agents. Return ONLY valid JSON — no markdown fenc
 no commentary.
 """
 
+_HEALTH_TEAM_GENERATION_PROMPT = """\
+You are a clinical team architect. Given a patient health query, you must compose \
+a team of {team_size} medical agents that collectively cover ALL 6 required clinical \
+roles and can investigate the query with rigorous evidence-based medicine (EBM).
+
+## Patient / Health Query
+{query}
+
+## Required Clinical Roles (every team MUST include exactly 1 agent per role)
+
+1. **medical_researcher** — Searches clinical literature, systematic reviews, and \
+   RCT databases. world_actions: ["SEARCH_WEB"]
+2. **primary_physician** — Provides front-line clinical assessment and diagnosis. \
+   world_actions: ["SEARCH_WEB"]
+3. **clinical_pharmacologist** — Evaluates drug safety, interactions, and dosing. \
+   world_actions: ["SEARCH_WEB"]
+4. **diagnostician** — Specialises in differential diagnosis and test interpretation. \
+   world_actions: ["SEARCH_WEB"]
+5. **medical_synthesizer** — Integrates findings into a coherent clinical picture. \
+   world_actions: []
+6. **patient_advocate** — Challenges recommendations from a patient-safety and \
+   informed-consent perspective. world_actions: []
+
+## Dynamic Specialist Rules (add 1-3 specialists based on query keywords)
+
+Scan the patient query for these signals and add the corresponding specialist:
+- cardiovascular / heart / blood pressure / arrhythmia → **cardiologist**
+- neurological / brain / seizure / stroke / headache → **neurologist**
+- respiratory / lung / asthma / COPD / breathing → **pulmonologist**
+- metabolic / diabetes / thyroid / obesity / insulin → **endocrinologist**
+- gastrointestinal / liver / bowel / gut / digestion → **gastroenterologist**
+- musculoskeletal / joint / bone / arthritis / spine → **rheumatologist**
+- mental health / anxiety / depression / psychiatric → **psychiatrist**
+- kidney / renal / dialysis / nephrology → **nephrologist**
+- oncology / cancer / tumour / chemotherapy → **oncologist**
+- paediatric / child / infant / neonatal → **paediatric_specialist**
+
+If no keyword matches, add 1 general **clinical_consultant** to fill the team to \
+the required {team_size}.
+
+## EBM Evidence Level — MANDATORY on every claim
+
+Every agent's `evidence_priority` field MUST include an EBM level suffix:
+- **_A**: supported by systematic reviews or RCTs
+- **_B**: supported by cohort or case-control studies
+- **_C**: expert opinion, case reports, or consensus only
+
+Example values: "diagnostic_accuracy_A", "pharmacological_safety_B", \
+"clinical_consensus_C"
+
+## Team Design Rules
+
+1. All 6 required clinical roles must be filled before adding specialists.
+2. At least 4 agents must hold `"SEARCH_WEB"` in their world_actions.
+3. At least 2 opposing_pairs must be identified (clinical tension between roles).
+4. Each agent gets a realistic name, 2-3 sentence bio, and a detailed clinical \
+   persona including board certifications or specialisation details.
+5. Assign a `qualification_score` (0.0-1.0) reflecting expertise fit for THIS query.
+6. Assign domain-specific `skills` (3-5 per agent, medical terminology preferred).
+7. The `responsibility` field must be specific to THIS health query.
+
+## Output Format — strict JSON
+
+Return a JSON object with exactly this schema:
+{{
+  "agents": [
+    {{
+      "agent_id": <int starting from 1>,
+      "agent_name": "<full realistic name, e.g. 'Dr. Sarah Chen'>",
+      "entity_name": "<same as agent_name>",
+      "entity_type": "<professional title, e.g. 'Board-Certified Cardiologist'>",
+      "bio": "<2-3 sentence clinical bio>",
+      "persona": "<detailed persona: specialisation, clinical philosophy, \
+communication style, known biases>",
+      "research_role": "<one of the 6 required roles or a dynamic specialist>",
+      "responsibility": "<specific clinical responsibility for THIS query>",
+      "evidence_priority": "<e.g. clinical_evidence_A, diagnostic_accuracy_B, \
+pharmacological_safety_A, patient_safety_C>",
+      "world_actions": ["SEARCH_WEB"],
+      "peer_actions": ["PROPOSE_CLAIM", "CHALLENGE_CLAIM"],
+      "challenge_targets": ["<roles this agent challenges>"],
+      "skills": ["skill1", "skill2", "skill3"],
+      "qualification_score": 0.90
+    }}
+  ],
+  "opposing_pairs": [
+    {{
+      "agent_a_id": 1,
+      "agent_b_id": 3,
+      "tension_description": "<clinical disagreement, e.g. conservative vs \
+aggressive treatment approach>"
+    }}
+  ]
+}}
+
+Generate exactly {team_size} agents. Return ONLY valid JSON — no markdown fences, \
+no commentary.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Generator class
@@ -211,12 +354,16 @@ class ResearchTeamGenerator:
         self,
         query: str,
         team_size: int = 8,
+        mode: str = 'web_research',
     ) -> Dict[str, Any]:
         """Generate a complete research team from a query.
 
         Args:
             query: The research question or topic.
             team_size: Number of agents (minimum 6, clamped).
+            mode: Team generation mode — 'web_research' (default) or 'health'.
+                  In 'health' mode a clinical medical team is assembled using
+                  _HEALTH_TEAM_GENERATION_PROMPT and _HEALTH_ROLE_DEFAULTS.
 
         Returns:
             Dictionary with keys:
@@ -224,16 +371,19 @@ class ResearchTeamGenerator:
                 - research_workflow_config: ResearchWorkflowConfig-compatible dict
                 - team_competency_coverage: mapping of role -> agent_ids
         """
-        team_size = max(team_size, len(REQUIRED_ROLES))
+        is_health = mode == 'health'
+        min_size = len(HEALTH_REQUIRED_ROLES) if is_health else len(REQUIRED_ROLES)
+        team_size = max(team_size, min_size)
         logger.info(
-            "Generating research team for query (size=%d): %.120s",
+            "Generating research team for query (size=%d, mode=%s): %.120s",
             team_size,
+            mode,
             query,
         )
 
-        raw_team = self._call_llm_for_team(query, team_size)
+        raw_team = self._call_llm_for_team(query, team_size, is_health=is_health)
         agents = self._parse_agents(raw_team)
-        agents = self._validate_and_patch(agents, query, team_size)
+        agents = self._validate_and_patch(agents, query, team_size, is_health=is_health)
 
         coverage = self._compute_coverage(agents)
         workflow_config = self._build_workflow_config(query, agents)
@@ -254,9 +404,15 @@ class ResearchTeamGenerator:
     # LLM interaction
     # ------------------------------------------------------------------
 
-    def _call_llm_for_team(self, query: str, team_size: int) -> Dict[str, Any]:
+    def _call_llm_for_team(
+        self,
+        query: str,
+        team_size: int,
+        is_health: bool = False,
+    ) -> Dict[str, Any]:
         """Send the team-generation prompt to the LLM and return parsed JSON."""
-        prompt = _TEAM_GENERATION_PROMPT.format(query=query, team_size=team_size)
+        template = _HEALTH_TEAM_GENERATION_PROMPT if is_health else _TEAM_GENERATION_PROMPT
+        prompt = template.format(query=query, team_size=team_size)
         messages: List[Dict[str, str]] = [
             {
                 "role": "system",
@@ -268,16 +424,53 @@ class ResearchTeamGenerator:
             {"role": "user", "content": prompt},
         ]
 
-        try:
-            result: Dict[str, Any] = self.llm.chat_json(
-                messages=messages,
-                temperature=0.4,
-                max_tokens=6144,
-            )
-            return result
-        except Exception:
-            logger.exception("LLM call for team generation failed")
-            raise
+        from ..utils.llm_client import json as _json
+        import re as _re
+
+        def _repair_json(text: str) -> str:
+            """Fix common LLM JSON errors before parsing."""
+            # Remove trailing commas before } or ]
+            text = _re.sub(r',\s*([}\]])', r'\1', text)
+            # Remove JS-style // comments
+            text = _re.sub(r'//[^\n]*', '', text)
+            # Close unclosed brackets/braces (best-effort)
+            opens = text.count('{') - text.count('}')
+            closes = text.count('[') - text.count(']')
+            if opens > 0:
+                text += '}' * opens
+            if closes > 0:
+                text += ']' * closes
+            return text
+
+        def _try_parse(raw_text: str) -> Dict[str, Any]:
+            cleaned = raw_text.strip()
+            cleaned = _re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=_re.IGNORECASE)
+            cleaned = _re.sub(r'\n?```\s*$', '', cleaned)
+            match = _re.search(r'\{[\s\S]*\}', cleaned)
+            blob = match.group(0) if match else cleaned
+            try:
+                return _json.loads(blob)
+            except (_json.JSONDecodeError, ValueError):
+                repaired = _repair_json(blob)
+                return _json.loads(repaired)
+
+        last_exc: Exception = RuntimeError("No attempts made")
+        for attempt in range(3):
+            try:
+                raw_text = self.llm.chat(
+                    messages=messages,
+                    temperature=0.4 + attempt * 0.1,
+                    max_tokens=6144,
+                )
+                return _try_parse(raw_text)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "LLM team generation attempt %d/3 failed: %s", attempt + 1, exc
+                )
+
+        logger.error("LLM call for team generation failed after 3 attempts")
+        raise last_exc
 
     # ------------------------------------------------------------------
     # Parsing
@@ -321,10 +514,27 @@ class ResearchTeamGenerator:
         agents: List[ResearchAgent],
         query: str,
         team_size: int,
+        is_health: bool = False,
     ) -> List[ResearchAgent]:
         """Ensure all required roles are covered; patch with defaults if not."""
+        # --- Deduplication logic to prevent multiplied agent counts ---
+        seen_names = set()
+        unique_agents = []
+        for a in agents:
+            name_key = a.agent_name.strip().lower()
+            if name_key not in seen_names:
+                seen_names.add(name_key)
+                unique_agents.append(a)
+
+        if len(unique_agents) < len(agents):
+            logger.info("Removed %d duplicate agents from team", len(agents) - len(unique_agents))
+            agents = unique_agents
+
+        required_roles = HEALTH_REQUIRED_ROLES if is_health else REQUIRED_ROLES
+        role_defaults = _HEALTH_ROLE_DEFAULTS if is_health else ROLE_DEFAULTS
+
         covered_roles = {a.research_role for a in agents}
-        missing_roles = [r for r in REQUIRED_ROLES if r not in covered_roles]
+        missing_roles = [r for r in required_roles if r not in covered_roles]
 
         if missing_roles:
             logger.warning(
@@ -332,17 +542,20 @@ class ResearchTeamGenerator:
             )
             next_id = max((a.agent_id for a in agents), default=0) + 1
             for role in missing_roles:
-                agents.append(self._make_default_agent(next_id, role, query))
+                agents.append(self._make_default_agent(next_id, role, query, role_defaults=role_defaults))
                 next_id += 1
 
         # Ensure at least 2 agents have SEARCH_WEB
         search_agents = [a for a in agents if "SEARCH_WEB" in a.world_actions]
         if len(search_agents) < 2:
+            web_roles = (
+                ("medical_researcher", "primary_physician", "diagnostician")
+                if is_health
+                else ("explorer", "fact_checker", "challenger")
+            )
             patched = 0
             for agent in agents:
-                if "SEARCH_WEB" not in agent.world_actions and agent.research_role in (
-                    "explorer", "fact_checker", "challenger",
-                ):
+                if "SEARCH_WEB" not in agent.world_actions and agent.research_role in web_roles:
                     agent.world_actions = list(set(agent.world_actions) | {"SEARCH_WEB"})
                     patched += 1
                     if len(search_agents) + patched >= 2:
@@ -352,12 +565,20 @@ class ResearchTeamGenerator:
                     "Could not ensure 2 SEARCH_WEB agents after patching"
                 )
 
-        # Ensure at least 1 challenger
-        challengers = [a for a in agents if a.research_role == "challenger"]
-        if not challengers:
-            logger.warning("No challenger found — adding default challenger")
-            next_id = max((a.agent_id for a in agents), default=0) + 1
-            agents.append(self._make_default_agent(next_id, "challenger", query))
+        if is_health:
+            # Ensure at least 1 patient_advocate for health mode
+            advocates = [a for a in agents if a.research_role == "patient_advocate"]
+            if not advocates:
+                logger.warning("No patient_advocate found — adding default")
+                next_id = max((a.agent_id for a in agents), default=0) + 1
+                agents.append(self._make_default_agent(next_id, "patient_advocate", query, role_defaults=role_defaults))
+        else:
+            # Ensure at least 1 challenger for web_research mode
+            challengers = [a for a in agents if a.research_role == "challenger"]
+            if not challengers:
+                logger.warning("No challenger found — adding default challenger")
+                next_id = max((a.agent_id for a in agents), default=0) + 1
+                agents.append(self._make_default_agent(next_id, "challenger", query))
 
         # Re-number agent_ids sequentially
         for idx, agent in enumerate(agents):
@@ -370,9 +591,12 @@ class ResearchTeamGenerator:
         agent_id: int,
         role: str,
         query: str,
+        role_defaults: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> ResearchAgent:
         """Create a fallback agent for a missing role."""
-        defaults = ROLE_DEFAULTS.get(role, ROLE_DEFAULTS["explorer"])
+        lookup = role_defaults if role_defaults is not None else ROLE_DEFAULTS
+        fallback_key = next(iter(lookup))  # first key as generic fallback
+        defaults = lookup.get(role, lookup.get(fallback_key, ROLE_DEFAULTS["explorer"]))
         role_label = role.replace("_", " ").title()
 
         return ResearchAgent(

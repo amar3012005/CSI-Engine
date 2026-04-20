@@ -43,7 +43,8 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 4096,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        search_settings: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         发送聊天请求
@@ -53,6 +54,7 @@ class LLMClient:
             temperature: 温度参数
             max_tokens: 最大token数
             response_format: 响应格式（如JSON模式）
+            search_settings: Optional search settings for Groq Compound
             
         Returns:
             模型响应文本
@@ -62,20 +64,34 @@ class LLMClient:
             "messages": messages,
         }
         model_name = (self.model or "").lower()
+        is_groq_compound = model_name == "groq/compound"
         
+        # Support search_settings for Groq Compound without forcing native tool choice.
+        # The research engine handles SEARCH_WEB intent in text form because provider-side
+        # tool registration for groq/compound is inconsistent and caused 400 failures.
+        if search_settings and is_groq_compound:
+            kwargs["extra_body"] = {"search_settings": search_settings}
+            
         # Use Groq reasoning models are stricter on token params.
         if "gpt-oss" in (self.model or ""):
             kwargs["max_completion_tokens"] = max_tokens
-            kwargs["extra_body"] = {"include_reasoning": False}
+            if "extra_body" not in kwargs:
+                kwargs["extra_body"] = {}
+            kwargs["extra_body"]["include_reasoning"] = False
             kwargs["temperature"] = max(0.0, min(temperature, 0.7))
         else:
             kwargs["temperature"] = temperature
             kwargs["max_tokens"] = max_tokens
         
-        # Groq Compound tool registration:
-        # If we are using a compound model, we must provide the tools in the API call
-        # to avoid 'Tool choice is auto, but no tools are provided' or 'failed_generation' errors.
-        if "compound" in model_name and model_name != "groq/compound":
+        # Groq Compound exposes built-in tools and should be called with tool_choice=auto
+        # but without custom tool definitions. Other compound-like adapters still
+        # use the legacy explicit function schema below.
+        if is_groq_compound:
+            # We must NOT pass tool_choice or tools if we want to avoid 400 errors 
+            # when the provider configuration is mismatched.
+            # We let the model output SEARCH_WEB: "..." and parse it in the engine.
+            pass
+        elif "compound" in model_name:
             kwargs["tools"] = [
                 {
                     "type": "function",
@@ -110,9 +126,6 @@ class LLMClient:
                     }
                 }
             ]
-            # Groq Compound models handle search NATIVELY and sometimes reject 
-            # explicit tool definitions. However, if 'tool_choice' is 'auto',
-            # it triggers a search cycle. Let's try simplified tool_choice.
             kwargs["tool_choice"] = "auto"
 
         if response_format:
@@ -122,8 +135,17 @@ class LLMClient:
             response = self.client.chat.completions.create(**kwargs)
         except Exception as e:
             error_str = str(e)
+            # Handle models that don't support tool calling by retrying without tools
+            if "tool calling` is not supported" in error_str or "invalid_request_error" in error_str and "tool calling" in error_str:
+                logger.warning(f"Model {self.model} does not support tool calling. Retrying without tools.")
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                # Also remove search_settings if they were triggering tool use
+                if "extra_body" in kwargs and "search_settings" in kwargs["extra_body"]:
+                    kwargs["extra_body"].pop("search_settings")
+                response = self.client.chat.completions.create(**kwargs)
             # Some providers/models reject response_format=json_object.
-            if response_format:
+            elif response_format:
                 logger.warning(f"LLM JSON模式失败，回退普通文本解析: {e}")
                 kwargs.pop("response_format", None)
                 response = self.client.chat.completions.create(**kwargs)
@@ -134,7 +156,7 @@ class LLMClient:
                 # ``failed_generation``.  Extract it and return it as the response
                 # so the report agent's text-based tool parser can handle it.
                 logger.warning(
-                    "Model attempted native tool call without tools registered — "
+                    "Model attempted native tool call without tools registered or provider rejected the tool cycle — "
                     "extracting failed_generation as response: %s", e,
                 )
                 import json as _json

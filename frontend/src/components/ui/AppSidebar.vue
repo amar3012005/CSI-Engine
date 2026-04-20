@@ -1,117 +1,157 @@
 <template>
   <aside class="app-sidebar" :class="{ collapsed }">
-    <!-- Logo row -->
-    <div class="sb-logo-row">
-      <div class="sb-logo-left" @click="$emit('go-home')">
-        <div class="sb-hex-icon">&#x2B21;</div>
-        <div v-if="!collapsed" class="sb-logo-text">
-          <span class="sb-brand-name">HIVEMIND</span>
-          <span class="sb-brand-sub">Deep Research</span>
-        </div>
+
+    <!-- Top logo row -->
+    <div class="sb-top">
+      <div class="sb-logo" @click="$emit('go-home')">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2C8.5 2 5.5 4.5 5 8C4.5 11 6 13.5 9 15L8 22L12 20L16 22L15 15C18 13.5 19.5 11 19 8C18.5 4.5 15.5 2 12 2Z" fill="#1a1a1a"/>
+        </svg>
       </div>
-      <button class="sb-collapse-btn" @click="$emit('toggle')">
-        <span v-if="collapsed">&#8250;</span>
-        <span v-else>&#8249;</span>
+      <button class="sb-toggle" @click="$emit('toggle')" title="Toggle sidebar">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2"/>
+          <path d="M9 3v18"/>
+        </svg>
       </button>
     </div>
 
-    <!-- Expanded nav -->
-    <nav v-if="!collapsed" class="sb-nav">
-      <!-- New + Agents -->
-      <div class="sb-nav-section">
-        <a class="sb-nav-item" @click="$emit('go-home')">
-          <span class="sb-nav-icon">+</span>
-          <span class="sb-nav-label">New Chat</span>
-        </a>
-        <a class="sb-nav-item">
-          <span class="sb-nav-icon">&#9634;</span>
-          <span class="sb-nav-label">Agents</span>
-        </a>
+    <!-- Nav items -->
+    <nav class="sb-nav">
+      <button class="sb-nav-item new-item" @click="$emit('go-home')">
+        <svg class="sb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+        <span v-if="!collapsed" class="sb-label">New</span>
+      </button>
+
+      <button class="sb-nav-item" @click="$emit('go-home')">
+        <svg class="sb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="4" width="20" height="16" rx="2"/>
+          <path d="M8 20h8M12 16v4"/>
+          <path d="M2 8h20"/>
+        </svg>
+        <span v-if="!collapsed" class="sb-label">Research</span>
+      </button>
+
+      <button class="sb-nav-item">
+        <svg class="sb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 6h18M3 12h18M3 18h18"/>
+        </svg>
+        <span v-if="!collapsed" class="sb-label">Spaces</span>
+      </button>
+
+      <button class="sb-nav-item">
+        <svg class="sb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+        </svg>
+        <span v-if="!collapsed" class="sb-label">Customize</span>
+      </button>
+
+      <div v-if="!collapsed" class="sb-section-label">History</div>
+
+      <button v-if="collapsed" class="sb-nav-item">
+        <svg class="sb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <polyline points="12 6 12 12 16 14"/>
+        </svg>
+      </button>
+
+      <!-- History list -->
+      <div v-if="!collapsed" class="sb-history">
+        <button
+          v-for="item in recentSessions"
+          :key="item.id"
+          class="sb-history-item"
+          @click="$emit('navigate', item)"
+        >
+          {{ item.label }}
+        </button>
+        <div v-if="!recentSessions.length" class="sb-history-empty">No recent sessions</div>
       </div>
-
-      <!-- Sessions section removed - using API key auth instead -->
     </nav>
 
-    <!-- Collapsed icons -->
-    <nav v-else class="sb-nav-collapsed">
-      <button class="sb-icon-btn" @click="$emit('go-home')" title="New Chat">+</button>
-      <button class="sb-icon-btn" title="Agents">&#9634;</button>
-    </nav>
-
-    <!-- Connect to HIVEMIND Footer -->
-    <div class="sb-profile-footer" :class="{ connected: !!userProfile }">
-      <!-- Not connected: show key input -->
-      <div v-if="!userProfile && !collapsed" class="sb-key-connect">
-        <div v-if="!showKeyInput" class="sb-connect-row">
-          <button class="sb-connect-btn" @click="showKeyInput = true">
-            <span class="sb-connect-icon">&#x2B21;</span>
-            <span class="sb-connect-label">Connect HIVEMIND</span>
+    <!-- Footer -->
+    <div class="sb-footer">
+      <!-- Key input when not connected -->
+      <div v-if="!userProfile && !collapsed && showKeyInput" class="sb-key-form">
+        <input
+          v-model="apiKeyInput"
+          type="password"
+          class="sb-key-input"
+          placeholder="Paste API key..."
+          @keydown.enter="handleConnectWithKey"
+          @keydown.esc="showKeyInput = false"
+          autofocus
+        />
+        <div class="sb-key-row">
+          <button class="sb-key-cancel" @click="showKeyInput = false; apiKeyInput = ''">Cancel</button>
+          <button class="sb-key-submit" :disabled="!apiKeyInput.trim() || connecting" @click="handleConnectWithKey">
+            {{ connecting ? '…' : 'Connect' }}
           </button>
         </div>
-        <div v-else class="sb-key-form">
-          <input
-            v-model="apiKeyInput"
-            type="password"
-            class="sb-key-input"
-            placeholder="Paste API key..."
-            @keydown.enter="handleConnectWithKey"
-            @keydown.esc="showKeyInput = false"
-          />
-          <div class="sb-key-actions">
-            <button class="sb-key-cancel" @click="showKeyInput = false; apiKeyInput = ''">Cancel</button>
-            <button class="sb-key-submit" :disabled="!apiKeyInput.trim() || connecting" @click="handleConnectWithKey">
-              {{ connecting ? '...' : 'Connect' }}
-            </button>
-          </div>
-          <span class="sb-key-hint">Get your key from <a href="https://hivemind.davinciai.eu/hivemind/app/keys" target="_blank">HIVEMIND Dashboard</a></span>
-        </div>
+        <div v-if="error" class="sb-key-error">{{ error }}</div>
       </div>
-      <!-- Collapsed: just icon -->
-      <button v-if="!userProfile && collapsed" class="sb-connect-btn" @click="showKeyInput = true; $emit('toggle')">
-        <span class="sb-connect-icon">&#x2B21;</span>
+
+      <!-- Add team / connect row -->
+      <button v-if="!userProfile && !showKeyInput" class="sb-footer-item" @click="showKeyInput = true; if(collapsed) $emit('toggle')">
+        <svg class="sb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>
+        </svg>
+        <span v-if="!collapsed" class="sb-label">Add your team</span>
       </button>
-      <!-- Connected: show profile -->
-      <div v-if="userProfile" class="sb-profile-box" :title="userProfile.display_name">
-        <img :src="userProfile.avatar_url" class="sb-avatar" :alt="userProfile.display_name" />
-        <div v-if="!collapsed" class="sb-profile-meta">
-          <div class="sb-meta-top">
-            <span class="sb-user-name">{{ userProfile.display_name }}</span>
-            <button class="sb-logout-icon" @click="handleLogout" title="Disconnect">&#x23FB;</button>
+
+      <!-- User profile row -->
+      <div v-if="userProfile" class="sb-user-row">
+        <div class="sb-user-left">
+          <div class="sb-avatar">
+            <img v-if="userProfile.avatar_url" :src="userProfile.avatar_url" :alt="userProfile.display_name" />
+            <span v-else class="sb-avatar-fallback">{{ (userProfile.display_name || 'U')[0].toUpperCase() }}</span>
           </div>
-          <span class="sb-user-role">{{ userProfile.organisation_id || 'Connected' }}</span>
+          <div v-if="!collapsed" class="sb-user-info">
+            <span class="sb-user-name">{{ userProfile.display_name }}</span>
+            <span class="sb-user-badge">Pro</span>
+          </div>
+        </div>
+        <div v-if="!collapsed" class="sb-user-right">
+          <button class="sb-icon-btn" title="Notifications">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+          </button>
+          <button class="sb-icon-btn" title="Disconnect" @click="handleLogout">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+              <polyline points="16 17 21 12 16 7"/>
+              <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+          </button>
         </div>
       </div>
-      <div v-if="error && !collapsed" class="sb-error-text">{{ error }}</div>
     </div>
   </aside>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
-import { authService } from '../../utils/auth';
+import { ref, onMounted } from 'vue'
+import { authService } from '../../utils/auth'
 
-const userProfile = ref(null);
-const connecting = ref(false);
-const error = ref('');
-const showKeyInput = ref(false);
-const apiKeyInput = ref('');
-
-defineProps({
-  collapsed: {
-    type: Boolean,
-    default: false
-  }
+const props = defineProps({
+  collapsed: { type: Boolean, default: false },
+  recentSessions: { type: Array, default: () => [] }
 })
 
-const emit = defineEmits(['toggle', 'go-home'])
+const emit = defineEmits(['toggle', 'go-home', 'navigate'])
+
+const userProfile = ref(null)
+const connecting = ref(false)
+const error = ref('')
+const showKeyInput = ref(false)
+const apiKeyInput = ref('')
 
 onMounted(() => {
-  // Load existing profile from API key authentication
-  try {
-    userProfile.value = authService.getProfile()
-  } catch {
-    userProfile.value = null
-  }
+  try { userProfile.value = authService.getProfile() } catch { userProfile.value = null }
 })
 
 const handleConnectWithKey = async () => {
@@ -131,561 +171,230 @@ const handleConnectWithKey = async () => {
 }
 
 const handleLogout = () => {
-  authService.logout();
-  userProfile.value = null;
-};
+  authService.logout()
+  userProfile.value = null
+}
 </script>
 
 <style scoped>
-.sb-error-text {
-  color: #ef4444;
-  font-size: 11px;
-  margin-top: 5px;
-  padding: 0 5px;
-}
-
-/* Key input form */
-.sb-key-connect {
-  width: 100%;
-}
-
-.sb-connect-row {
-  width: 100%;
-}
-
-.sb-key-form {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-}
-
-.sb-key-input {
-  width: 100%;
-  padding: 7px 10px;
-  border: 1px solid #e3e0db;
-  border-radius: 8px;
-  font-size: 12px;
-  font-family: 'JetBrains Mono', monospace;
-  background: #fff;
-  color: #0a0a0a;
-  outline: none;
-  transition: border-color 0.15s;
-}
-
-.sb-key-input:focus {
-  border-color: #117dff;
-}
-
-.sb-key-input::placeholder {
-  color: #a3a3a3;
-}
-
-.sb-key-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.sb-key-cancel {
-  flex: 1;
-  padding: 5px;
-  border: 1px solid #e3e0db;
-  border-radius: 6px;
-  background: #fff;
-  color: #525252;
-  font-size: 11px;
-  font-weight: 500;
-  cursor: pointer;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-}
-
-.sb-key-cancel:hover {
-  background: #faf9f4;
-}
-
-.sb-key-submit {
-  flex: 1;
-  padding: 5px;
-  border: none;
-  border-radius: 6px;
-  background: #117dff;
-  color: #fff;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-}
-
-.sb-key-submit:hover:not(:disabled) {
-  background: #0d5fcc;
-}
-
-.sb-key-submit:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.sb-key-hint {
-  font-size: 10px;
-  color: #a3a3a3;
-  text-align: center;
-}
-
-.sb-key-hint a {
-  color: #117dff;
-  text-decoration: none;
-}
-
-.sb-key-hint a:hover {
-  text-decoration: underline;
-}
-
-.sb-spin {
-  animation: sb-spin-keyframes 1s linear infinite;
-}
-
-@keyframes sb-spin-keyframes {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.sb-profile-footer {
-  margin-top: auto;
-  padding: 1rem;
-  border-top: 1px solid #e3e0db;
-  background: white;
-}
-
-.sb-connect-btn {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  width: 100%;
-  padding: 0.75rem;
-  background: #117dff;
-  color: white;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  font-weight: 600;
-  transition: transform 0.2s;
-  overflow: hidden;
-  white-space: nowrap;
-}
-
-.sb-connect-btn:hover {
-  transform: translateY(-2px);
-  filter: brightness(1.1);
-}
-
-.sb-profile-box {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.sb-avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: #f0f0f0;
-  border: 1px solid #e3e0db;
-}
-
-.sb-profile-meta {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.sb-user-name {
-  font-size: 0.9rem;
-  font-weight: 600;
-  color: #1a1a1a;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.sb-user-role {
-  font-size: 0.75rem;
-  color: #666;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .app-sidebar {
-  width: 260px;
-  background: #faf9f4;
-  border-right: 1px solid #e3e0db;
+  width: 220px;
+  min-width: 220px;
+  height: 100%;
+  background: #f5f4f1;
+  border-right: 1px solid #e8e6e1;
   display: flex;
   flex-direction: column;
-  transition: width 0.2s ease;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13.5px;
+  color: #1a1a1a;
+  transition: width 0.2s ease, min-width 0.2s ease;
   overflow: hidden;
+  user-select: none;
 }
 
 .app-sidebar.collapsed {
-  width: 68px;
+  width: 52px;
+  min-width: 52px;
 }
 
-/* Logo row */
-.sb-logo-row {
-  height: 48px;
+/* Top bar */
+.sb-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 14px;
-  border-bottom: 1px solid #e3e0db;
+  padding: 14px 12px 10px;
   flex-shrink: 0;
 }
 
-.sb-logo-left {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  cursor: pointer;
-}
-
-.sb-hex-icon {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  background: rgba(17, 125, 255, 0.1);
+.sb-logo {
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 14px;
-  color: #117dff;
-  flex-shrink: 0;
-}
-
-.sb-logo-text {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.sb-brand-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: #0a0a0a;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-}
-
-.sb-brand-sub {
-  font-size: 10px;
-  color: #a3a3a3;
-  font-family: 'JetBrains Mono', monospace;
-  white-space: nowrap;
-}
-
-.sb-collapse-btn {
-  padding: 4px;
-  border: none;
-  background: none;
-  color: #a3a3a3;
-  font-size: 16px;
   cursor: pointer;
   border-radius: 6px;
-  transition: all 0.15s;
-  flex-shrink: 0;
+  transition: background 0.15s;
 }
+.sb-logo:hover { background: #ebe9e4; }
 
-.sb-collapse-btn:hover {
-  background: #f3f1ec;
-  color: #525252;
+.sb-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #8c8882;
+  padding: 4px;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s, background 0.15s;
 }
+.sb-toggle:hover { background: #ebe9e4; color: #1a1a1a; }
 
-/* Navigation */
+.collapsed .sb-toggle { margin: 0 auto; }
+
+/* Nav */
 .sb-nav {
   flex: 1;
-  padding: 10px;
+  padding: 4px 8px;
   overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  scrollbar-width: thin;
-  scrollbar-color: #d4d0ca transparent;
-}
-
-.sb-nav::-webkit-scrollbar { width: 3px; }
-.sb-nav::-webkit-scrollbar-thumb { background: #d4d0ca; border-radius: 3px; }
-
-.sb-nav-section {
   display: flex;
   flex-direction: column;
   gap: 1px;
 }
 
-.sb-section-label {
-  font-size: 10px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #a3a3a3;
-  padding: 0 10px;
-  margin-bottom: 4px;
-}
-
 .sb-nav-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  font-size: 13px;
-  color: #525252;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
+  border: none;
+  background: none;
+  border-radius: 7px;
   cursor: pointer;
-  transition: all 0.15s;
-  text-decoration: none;
+  text-align: left;
+  color: #3a3a3a;
+  font-size: 13.5px;
+  font-family: inherit;
+  transition: background 0.12s;
+}
+.sb-nav-item:hover { background: #ebe9e4; }
+.sb-nav-item.new-item { color: #1a1a1a; font-weight: 500; }
+
+.sb-icon { flex-shrink: 0; color: #6b6862; }
+.sb-nav-item.new-item .sb-icon { color: #1a1a1a; }
+
+.sb-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Section label */
+.sb-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #9c9894;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 10px 8px 4px;
 }
 
-.sb-nav-item:hover {
-  background: #f3f1ec;
-  color: #0a0a0a;
+/* History */
+.sb-history {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
 }
 
-.sb-nav-item.active {
-  background: #f3f1ec;
-  color: #0a0a0a;
-  font-weight: 500;
-}
-
-.sb-nav-item.history {
-  padding: 6px 10px;
-  font-size: 12px;
-}
-
-.sb-nav-icon {
-  font-size: 16px;
-  width: 20px;
-  text-align: center;
-  flex-shrink: 0;
-  color: #a3a3a3;
-}
-
-.sb-nav-item.active .sb-nav-icon,
-.sb-nav-item:hover .sb-nav-icon {
-  color: #525252;
-}
-
-.sb-nav-label {
+.sb-history-item {
+  display: block;
+  width: 100%;
+  padding: 5px 8px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  font-size: 12.5px;
+  color: #5c5a57;
+  font-family: inherit;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-/* Current session card */
-.sb-session-card {
-  padding: 8px 10px;
-  background: #fff;
-  border: 1px solid #e3e0db;
-  border-radius: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.sb-session-card.active {
-  border-color: #117dff;
-  background: rgba(17, 125, 255, 0.03);
-}
-
-.sb-session-text {
-  font-size: 12px;
-  font-weight: 500;
-  color: #0a0a0a;
-  line-height: 1.3;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.sb-session-id {
-  font-size: 9px;
-  font-family: 'JetBrains Mono', monospace;
-  color: #a3a3a3;
-}
-
-.sb-checkpoint-list {
-  margin-top: 8px;
-  padding-left: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.sb-checkpoint-item {
-  display: flex;
-  gap: 8px;
-  min-width: 0;
-}
-
-.sb-checkpoint-rail {
-  width: 12px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  flex-shrink: 0;
-}
-
-.sb-checkpoint-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #117dff;
-  margin-top: 4px;
-}
-
-.sb-checkpoint-line {
-  width: 1px;
-  flex: 1;
-  background: #e3e0db;
-  margin-top: 4px;
-}
-
-.sb-checkpoint-item:last-child .sb-checkpoint-line {
-  display: none;
-}
-
-.sb-checkpoint-body {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.sb-checkpoint-id {
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: #737373;
-  font-family: 'JetBrains Mono', monospace;
-}
-
-.sb-checkpoint-query {
-  font-size: 11px;
-  color: #262626;
-  line-height: 1.35;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.sb-checkpoint-meta {
-  font-size: 10px;
-  color: #a3a3a3;
-}
-
-.sb-session-row {
-  display: flex;
-  align-items: center;
-  border-radius: 8px;
   transition: background 0.12s;
 }
+.sb-history-item:hover { background: #ebe9e4; color: #1a1a1a; }
 
-.sb-session-row:hover {
-  background: #f3f1ec;
+.sb-history-empty {
+  font-size: 12px;
+  color: #b0aea9;
+  padding: 6px 8px;
 }
 
-.sb-session-row .sb-nav-item {
-  flex: 1;
-  min-width: 0;
-}
-
-.sb-delete-btn {
-  width: 24px;
-  height: 24px;
-  border: none;
-  background: none;
-  color: transparent;
-  font-size: 14px;
-  cursor: pointer;
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+/* Footer */
+.sb-footer {
   flex-shrink: 0;
-  transition: all 0.12s;
+  padding: 8px;
+  border-top: 1px solid #e8e6e1;
 }
 
-.sb-session-row:hover .sb-delete-btn {
-  color: #a3a3a3;
-}
-
-.sb-delete-btn:hover {
-  color: #dc2626 !important;
-  background: rgba(220, 38, 38, 0.08);
-}
-
-.sb-empty {
-  font-size: 11px;
-  color: #a3a3a3;
-  padding: 4px 10px;
-}
-
-/* Collapsed nav */
-.sb-nav-collapsed {
-  flex: 1;
-  padding: 10px 0;
+.sb-footer-item {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 2px;
-}
-
-.sb-icon-btn {
-  width: 40px;
-  height: 40px;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
   border: none;
   background: none;
-  border-radius: 8px;
-  font-size: 18px;
-  color: #a3a3a3;
+  border-radius: 7px;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
+  text-align: left;
+  color: #5c5a57;
+  font-size: 13.5px;
+  font-family: inherit;
+  transition: background 0.12s;
 }
+.sb-footer-item:hover { background: #ebe9e4; color: #1a1a1a; }
 
-.sb-icon-btn:hover {
-  background: #f3f1ec;
-  color: #525252;
-}
-
-.sb-icon-btn.active {
-  background: #f3f1ec;
-  color: #0a0a0a;
-}
-
-.sb-logout-icon {
-  padding: 4px;
-  border-radius: 4px;
-  cursor: pointer;
-  color: #a3a3a3;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.sb-logout-icon:hover {
-  background: rgba(239, 68, 68, 0.1);
-  color: #ef4444;
-}
-
-.sb-meta-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+/* Key form */
+.sb-key-form { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
+.sb-key-input {
   width: 100%;
+  padding: 7px 10px;
+  border: 1px solid #d4d2cd;
+  border-radius: 7px;
+  background: #fff;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  outline: none;
+  box-sizing: border-box;
 }
+.sb-key-input:focus { border-color: #1a1a1a; }
+.sb-key-row { display: flex; gap: 6px; }
+.sb-key-cancel {
+  flex: 1; padding: 6px; border: 1px solid #d4d2cd; border-radius: 6px;
+  background: none; font-size: 12px; cursor: pointer; font-family: inherit; color: #5c5a57;
+}
+.sb-key-submit {
+  flex: 1; padding: 6px; border: none; border-radius: 6px;
+  background: #1a1a1a; color: #fff; font-size: 12px; cursor: pointer; font-family: inherit;
+  font-weight: 500;
+}
+.sb-key-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+.sb-key-error { font-size: 11px; color: #ef4444; }
+
+/* User row */
+.sb-user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.sb-user-row:hover { background: #ebe9e4; }
+
+.sb-user-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+.sb-avatar {
+  width: 28px; height: 28px; border-radius: 50%; overflow: hidden;
+  background: #d4d2cd; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+}
+.sb-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.sb-avatar-fallback { font-size: 12px; font-weight: 700; color: #5c5a57; }
+
+.sb-user-info { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sb-user-name { font-size: 12.5px; font-weight: 500; color: #1a1a1a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px; }
+.sb-user-badge {
+  font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
+  background: #fef3c7; color: #92400e; flex-shrink: 0; letter-spacing: 0.03em;
+}
+
+.sb-user-right { display: flex; align-items: center; gap: 2px; }
+.sb-icon-btn {
+  width: 26px; height: 26px; border: none; background: none; border-radius: 5px;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  color: #8c8882; transition: background 0.12s, color 0.12s;
+}
+.sb-icon-btn:hover { background: #dddbd6; color: #1a1a1a; }
 </style>

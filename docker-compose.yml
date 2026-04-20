@@ -1,14 +1,28 @@
 services:
   mirofish:
-    image: ghcr.io/666ghj/mirofish:latest
-    # 加速镜像（如拉取缓慢可替换上方地址）
-    # image: ghcr.nju.edu.cn/666ghj/mirofish:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: mirofish
     env_file:
       - .env
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
     ports:
       - "3000:3000"
       - "5001:5001"
     restart: unless-stopped
+    stdin_open: true
+    tty: true
+    command: npm run dev
     volumes:
+      - ./:/app
+      - mirofish_root_node_modules:/app/node_modules
+      - mirofish_frontend_node_modules:/app/frontend/node_modules
+      - mirofish_backend_venv:/app/backend/.venv
       - ./backend/uploads:/app/backend/uploads
+
+volumes:
+  mirofish_root_node_modules:
+  mirofish_frontend_node_modules:
+  mirofish_backend_venv:

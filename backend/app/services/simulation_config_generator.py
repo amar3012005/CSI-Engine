@@ -88,6 +88,13 @@ class AgentActivityConfig:
     entity_summary: str = ""
     research_focus: List[str] = field(default_factory=list)
 
+    # Stage 4: Expert fields derived from evidence
+    domain_tags: List[str] = field(default_factory=list)
+    hard_skills: List[str] = field(default_factory=list)
+    methods: List[str] = field(default_factory=list)
+    disallowed_claims: List[str] = field(default_factory=list)
+    evidence_preferences: List[str] = field(default_factory=list)
+
 
 @dataclass  
 class TimeSimulationConfig:
@@ -387,6 +394,18 @@ class SimulationConfigGenerator:
         
         # ========== 步骤3-N: 分批生成Agent配置 ==========
         all_agent_configs = []
+        
+        # 获取本体信息用于推导领域标签
+        ontology_data = {}
+        try:
+            # 获取项目和图谱 ID 对应的本体 (通常在 project.extraction_diagnostics 或 graph 中)
+            # 这里我们通过 context 部分中的内容进行简单推导，或者如果 self 能够访问 project_id，
+            # 那么在 generate_config 外部注入更好。
+            # 为了保持解耦，我们在 _build_agent_seed 中增强推导逻辑。
+            pass
+        except:
+            pass
+
         for batch_idx in range(num_batches):
             start_idx = batch_idx * self.AGENTS_PER_BATCH
             end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(entities))
@@ -975,10 +994,8 @@ class SimulationConfigGenerator:
             "second_domain_expert"
         ]
 
-        def classify_role(entity_type_str: str, index: int) -> Dict[str, Any]:
-            # Assign one of the 8 roles based on index to ensure full coverage
-            assigned_role = CSI_ROLES[index % len(CSI_ROLES)]
-            
+        def get_role_data(agent: AgentActivityConfig, role_name: str) -> Dict[str, Any]:
+            entity_type_str = agent.entity_type
             role_definitions = {
                 "explorer": {
                     "responsibility": f"Discovers high-quality primary and secondary sources. Entity: {entity_type_str}",
@@ -1029,17 +1046,34 @@ class SimulationConfigGenerator:
                     "challenge_targets": ["domain_expert", "challenger"]
                 }
             }
-            
-            return role_definitions[assigned_role]
+            return role_definitions.get(role_name, role_definitions["explorer"])
 
+        # Stage 5: Scoring based Role Assignment
         assignments: List[ResearchAgentAssignment] = []
+        roles_assigned_count: Dict[str, int] = {r: 0 for r in CSI_ROLES}
+
         for i, agent in enumerate(agent_configs):
-            role_info = classify_role(agent.entity_type, i)
+            etype = agent.entity_type.lower()
             
-            # Synchronize AgentActivityConfig with CSI role
-            agent.role = role_info["research_role"] if "research_role" in role_info else CSI_ROLES[i % len(CSI_ROLES)]
+            # Match domain tags or entity type to roles
+            if any(k in etype for k in ["professor", "physicist", "expert"]) or "expert" in agent.domain_tags:
+                best_role = "domain_expert" if roles_assigned_count["domain_expert"] == 0 else "second_domain_expert"
+            elif any(k in etype for k in ["journal", "media", "journalist"]):
+                best_role = "explorer"
+            elif any(k in etype for k in ["university", "government", "organization"]):
+                best_role = "fact_checker"
+            elif any(k in etype for k in ["student", "alumni"]):
+                best_role = "challenger"
+            else:
+                # Balanced fill for other roles
+                remaining_roles = [r for r in CSI_ROLES if r not in ["domain_expert", "second_domain_expert"]]
+                best_role = remaining_roles[i % len(remaining_roles)]
+            
+            roles_assigned_count[best_role] += 1
+            agent.role = best_role
             agent.research_focus = [agent.entity_type, agent.role]
             
+            role_info = get_role_data(agent, best_role)
             assignments.append(
                 ResearchAgentAssignment(
                     agent_id=agent.agent_id,
@@ -1290,6 +1324,11 @@ class SimulationConfigGenerator:
                 source_priority=seed["source_priority"],
                 entity_summary=seed["entity_summary"],
                 research_focus=seed["research_focus"],
+                domain_tags=seed.get("domain_tags", []),
+                hard_skills=seed.get("hard_skills", []),
+                methods=seed.get("methods", []),
+                disallowed_claims=seed.get("disallowed_claims", []),
+                evidence_preferences=seed.get("evidence_preferences", {})
             )
             configs.append(config)
 
@@ -1348,6 +1387,16 @@ class SimulationConfigGenerator:
         if summary:
             focus_tokens.extend(part.strip() for part in summary.split(",")[:4] if part.strip())
 
+        # Stage 4: Profile Gen - Match Evidence vs Roles
+        # Simple extraction-based domain tag mapping (could be enhanced by passing doc_ontology)
+        domain_tags = []
+        if entity_type_lower in ["physicist", "physicsprofessor", "researcher"]:
+            domain_tags.append("expert")
+        if "physics" in summary.lower() or "physic" in entity_type_lower:
+            domain_tags.append("physics")
+        if any(keyword in summary.lower() for keyword in ["funding", "policy", "admin"]):
+            domain_tags.append("institutional")
+
         return {
             "role": role_map.get(entity_type_lower, entity_type or "Research Specialist"),
             "skills": skills_map.get(
@@ -1359,6 +1408,15 @@ class SimulationConfigGenerator:
             "source_priority": qualification_map.get(entity_type_lower, 0.74),
             "entity_summary": summary[: self.AGENT_SUMMARY_LENGTH] if summary else "",
             "research_focus": focus_tokens[:6],
+            # Stage 4 expert metadata
+            "domain_tags": domain_tags,
+            "hard_skills": skills_map.get(entity_type_lower, []),
+            "methods": ["scientific_method"] if "expert" in domain_tags else ["observation"],
+            "disallowed_claims": ["unverified_hearsay"] if qualification_map.get(entity_type_lower, 0.0) > 0.9 else [],
+            "evidence_preferences": {
+                "min_confidence": 0.8 if qualification_map.get(entity_type_lower, 0.0) > 0.9 else 0.5,
+                "preferred_formats": ["section", "provenance"]
+            }
         }
     
     def _generate_agent_config_by_rule(self, entity: EntityNode) -> Dict[str, Any]:
