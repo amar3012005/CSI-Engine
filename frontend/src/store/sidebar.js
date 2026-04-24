@@ -1,36 +1,26 @@
 import { ref } from 'vue'
+import { safeGet, safeSet } from '../utils/safeStorage'
 
 const sidebarCollapsed = ref(getInitialSidebarState())
 
 function getInitialSidebarState() {
-  try {
-    return localStorage.getItem('sidebar_collapsed') === 'true'
-  } catch (e) {
-    // Falls back to false if storage is disallowed (e.g. some iframe/privacy contexts)
-    return false
-  }
+  return safeGet('sidebar_collapsed') === 'true'
 }
 
 export function useSidebar() {
   const toggleSidebar = () => {
     sidebarCollapsed.value = !sidebarCollapsed.value
-    try {
-      localStorage.setItem('sidebar_collapsed', sidebarCollapsed.value)
-    } catch (e) { /* ignore */ }
+    safeSet('sidebar_collapsed', sidebarCollapsed.value)
   }
 
   const collapseSidebar = () => {
     sidebarCollapsed.value = true
-    try {
-      localStorage.setItem('sidebar_collapsed', 'true')
-    } catch (e) { /* ignore */ }
+    safeSet('sidebar_collapsed', 'true')
   }
 
   const expandSidebar = () => {
     sidebarCollapsed.value = false
-    try {
-      localStorage.setItem('sidebar_collapsed', 'false')
-    } catch (e) { /* ignore */ }
+    safeSet('sidebar_collapsed', 'false')
   }
 
   return {

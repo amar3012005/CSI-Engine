@@ -1,3 +1,5 @@
+import { safeSessionGet, safeSessionSet, safeSessionRemove } from '../utils/safeStorage'
+
 const STORAGE_KEY = 'mirofish_session_token_usage'
 
 let state = {
@@ -6,8 +8,6 @@ let state = {
 }
 
 const listeners = new Set()
-
-const hasSessionStorage = () => typeof window !== 'undefined' && typeof window.sessionStorage !== 'undefined'
 
 const emit = () => {
   for (const listener of listeners) {
@@ -20,14 +20,12 @@ const emit = () => {
 }
 
 const persist = () => {
-  if (!hasSessionStorage()) return
-  window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+  safeSessionSet(STORAGE_KEY, JSON.stringify(state))
 }
 
 const hydrate = () => {
-  if (!hasSessionStorage()) return
   try {
-    const raw = window.sessionStorage.getItem(STORAGE_KEY)
+    const raw = safeSessionGet(STORAGE_KEY)
     if (!raw) return
     const parsed = JSON.parse(raw)
     state = {
@@ -84,8 +82,6 @@ export const getSessionTokenUsage = () => ({ ...state })
 
 export const resetSessionTokenUsage = () => {
   state = { input: 0, output: 0 }
-  if (hasSessionStorage()) {
-    window.sessionStorage.removeItem(STORAGE_KEY)
-  }
+  safeSessionRemove(STORAGE_KEY)
   emit()
 }

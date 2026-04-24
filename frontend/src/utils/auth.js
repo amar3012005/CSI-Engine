@@ -15,47 +15,19 @@
  */
 
 import axios from 'axios';
+import { safeGet, safeSet, safeRemove } from './safeStorage';
 
 const API_BASE = '/api/auth';
 
-/**
- * Robust storage access to handle contexts where storage might be disabled
- * (e.g. iframes with restricted access)
- */
-const inMemoryStore = {};
-
 const safeStore = {
   get(key) {
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        return localStorage.getItem(key);
-      }
-    } catch (e) {
-      console.warn('[auth] localStorage.get denied, falling back to memory');
-    }
-    return inMemoryStore[key] || null;
+    return safeGet(key);
   },
   set(key, val) {
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        localStorage.setItem(key, val);
-        return;
-      }
-    } catch (e) {
-      console.warn('[auth] localStorage.set denied, falling back to memory');
-    }
-    inMemoryStore[key] = val;
+    safeSet(key, val);
   },
   remove(key) {
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        localStorage.removeItem(key);
-        return;
-      }
-    } catch (e) {
-      console.warn('[auth] localStorage.remove denied, falling back to memory');
-    }
-    delete inMemoryStore[key];
+    safeRemove(key);
   }
 };
 

@@ -21,15 +21,13 @@ from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..services.text_processor import TextProcessor
 from .agent_harness import AgentHarness, ActionType, ActionResult
+from .csi_schema import VALID_VERDICTS, relation_type_for_verdict
 
 logger = get_logger("mirofish.csi_research_engine")
 
 # ---------------------------------------------------------------------------
 # Dataclass-like typed dicts for clarity
 # ---------------------------------------------------------------------------
-
-_VALID_VERDICTS = {"supports", "contradicts", "needs_revision"}
-
 
 def _is_access_denied_llm_error(exc: Exception) -> bool:
     message = str(exc).lower()
@@ -1232,7 +1230,7 @@ class CSIResearchEngine:
             return None
 
         verdict = result.data.get("verdict", "needs_revision").lower()
-        if verdict not in _VALID_VERDICTS:
+        if verdict not in VALID_VERDICTS:
             verdict = "needs_revision"
 
         confidence = result.data.get("confidence", 0.5)
@@ -1269,7 +1267,7 @@ class CSIResearchEngine:
         with self._trials_lock:
             self._trials.append(trial_record)
 
-        relation_type = "supports" if verdict == "supports" else "contradicts"
+        relation_type = relation_type_for_verdict(verdict)
         self.store.record_relation(self.simulation_id, {
             "relation_type": relation_type,
             "from_id": trial_record.get("trial_id"),
@@ -1774,12 +1772,8 @@ class CSIResearchEngine:
                 with self._sources_lock:
                     if sid in existing_ids:
                         continue  # deduplicate in case another thread added same id
-                    if normalized_url and normalized_url in existing_urls:
-                        continue
                     self.sources.append(chunk_src)
                     existing_ids.add(sid)
-                    if normalized_url:
-                        existing_urls.add(normalized_url)
                 ingested.append(chunk_src)
 
         # Persist to the store's sources index atomically.

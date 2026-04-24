@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
 from ..utils.logger import get_logger
+from .csi_schema import relation_type_for_verdict
 from .text_processor import TextProcessor
 
 logger = get_logger("mirofish.simulation_csi_local")
@@ -1307,7 +1308,7 @@ class SimulationCSILocalStore:
                 )
                 action_count += 1
 
-                relation_type = "supports" if verdict == "supports" else "contradicts"
+                relation_type = relation_type_for_verdict(verdict)
                 self._append_relation(
                     simulation_id=simulation_id,
                     relation_type=relation_type,

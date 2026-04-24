@@ -33,7 +33,7 @@ def _build_request_handler():
             "/api/graph/",
         )
 
-        def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        def log_request(self, code: object = "-", size: object = "-") -> None:
             try:
                 status_code = int(code)
             except (TypeError, ValueError):

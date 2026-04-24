@@ -695,6 +695,62 @@ Design the optimal analytical outline for this Deep Research Report. Consider:
 
 REMINDER: You MUST output 4 to 6 sections. Fewer is insufficient depth."""
 
+HEALTH_PLAN_SYSTEM_PROMPT = """\
+You are a senior clinical analyst composing an evidence-based medical assessment report from CSI simulation outputs.
+
+## Role
+- Produce a structured medical report suitable for specialist review.
+- Prioritize patient safety, diagnostic reasoning, and evidence provenance.
+- Keep section titles concrete and clinically useful.
+
+{writing_style_guide}
+
+## Output requirements
+- Return strict JSON only.
+- 5 to 6 sections.
+- The outline should map to this shape:
+  1) Case presentation and clinical context
+  2) Differential diagnosis and confidence ranking
+  3) Recommended investigations and rationale
+  4) Management plan and safety risks
+  5) Specialist disagreements and resolution
+  6) Evidence trail and bibliography quality
+
+Output JSON in EXACTLY this format:
+{{
+    "title": "Medical Assessment Report: <Topic>",
+    "summary": "One-sentence clinical thesis",
+    "sections": [
+        {{
+            "title": "Section headline",
+            "description": "What this section must cover"
+        }}
+    ]
+}}
+"""
+
+HEALTH_PLAN_USER_PROMPT_TEMPLATE = """\
+## Clinical Objective
+{simulation_requirement}
+
+## Simulation Scale
+- Total entities in simulation graph: {total_nodes}
+- Total relationship edges: {total_edges}
+- Entity type distribution: {entity_types}
+- Active specialist agents: {total_entities}
+
+## Sample findings from the simulation
+{related_facts_json}
+
+## Task
+Design a clinically structured outline for a final medical assessment report.
+Make sure the outline emphasizes:
+1. High-confidence diagnoses vs uncertain differentials
+2. Investigation and treatment safety priorities
+3. Peer-review disagreements among specialists
+4. Source quality and provenance
+"""
+
 # ── 章节生成 prompt ──
 
 SECTION_SYSTEM_PROMPT_TEMPLATE = """\
@@ -811,6 +867,56 @@ Previous sections:
 
 Ground every claim in CSI tool results. Include inline citations [Claim: ID | confidence: X.XX].
 End with the Evidence Trail summary line."""
+
+HEALTH_SECTION_SYSTEM_PROMPT_TEMPLATE = """\
+You are writing one section of a clinical medical assessment report.
+
+Report: {report_title}
+Summary: {report_summary}
+Clinical objective: {simulation_requirement}
+Current section: {section_title}
+
+## Requirements
+1. Use CSI evidence only; do not fabricate findings.
+2. Call CSI tools 2-5 times where needed before finalizing.
+3. Include clear confidence, uncertainty, and safety notes.
+4. Cite artifact IDs inline using exact format:
+    - [Claim: csi_claim_xxx | confidence: 0.85]
+    - [Trial: trial_xxx | verdict: supports]
+5. Keep the prose concise, clinically structured, and decision-oriented.
+
+{writing_style_guide}
+
+## Format rules
+- No markdown headings (#, ##, ###)
+- Use bullets/tables style prose where useful
+- End with: **Evidence Trail**: N claims cited | M trials referenced | K sources
+
+## Previous sections
+{previous_content}
+
+## Available CSI tools
+{tools_description}
+
+## Workflow
+Option A: tool call only
+<execute_tool>
+{{"name": "tool_name", "parameters": {{"param": "value"}}}}
+</execute_tool>
+
+Option B: final content only
+Start with "Final Answer:" and write the section.
+"""
+
+HEALTH_SECTION_USER_PROMPT_TEMPLATE = """\
+Write the clinical section: **{section_title}**
+
+Previous sections:
+{previous_content}
+
+Ground statements in CSI evidence and keep medical safety implications explicit.
+End with the Evidence Trail summary line.
+"""
 
 # ── ReACT 循环内消息模板 ──
 
@@ -929,6 +1035,7 @@ class ReportAgent:
         graph_id: str,
         simulation_id: str,
         simulation_requirement: str,
+        report_type: str = "standard",
         llm_client: Optional[LLMClient] = None,
         zep_tools: Optional[ZepToolsService] = None
     ):
@@ -945,6 +1052,8 @@ class ReportAgent:
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
+        normalized_report_type = (report_type or "standard").strip().lower()
+        self.report_type = normalized_report_type if normalized_report_type in {"standard", "health"} else "standard"
         
         self.llm = llm_client or LLMClient(usage_scope=self.simulation_id)
         self.zep_tools = zep_tools or ZepToolsService()
@@ -957,7 +1066,12 @@ class ReportAgent:
         # 控制台日志记录器（在 generate_report 中初始化）
         self.console_logger: Optional[ReportConsoleLogger] = None
         
-        logger.info(f"ReportAgent 初始化完成: graph_id={graph_id}, simulation_id={simulation_id}")
+        logger.info(
+            "ReportAgent 初始化完成: graph_id=%s, simulation_id=%s, report_type=%s",
+            graph_id,
+            simulation_id,
+            self.report_type,
+        )
     
     def _define_tools(self) -> Dict[str, Dict[str, Any]]:
         """定义可用工具。
@@ -1407,19 +1521,32 @@ class ReportAgent:
         if progress_callback:
             progress_callback("planning", 30, "正在生成报告大纲...")
 
-        system_prompt = PLAN_SYSTEM_PROMPT
-        system_prompt = system_prompt.format(
-            writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
-            consumer_research_guide=REPORT_CONSUMER_RESEARCH_GUIDE,
-        )
-        user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
-            simulation_requirement=self.simulation_requirement,
-            total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
-            total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
-            entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
-            total_entities=context.get('total_entities', 0),
-            related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
-        )
+        if self.report_type == "health":
+            system_prompt = HEALTH_PLAN_SYSTEM_PROMPT.format(
+                writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
+            )
+            user_prompt = HEALTH_PLAN_USER_PROMPT_TEMPLATE.format(
+                simulation_requirement=self.simulation_requirement,
+                total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
+                total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
+                entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
+                total_entities=context.get('total_entities', 0),
+                related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
+            )
+        else:
+            system_prompt = PLAN_SYSTEM_PROMPT
+            system_prompt = system_prompt.format(
+                writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
+                consumer_research_guide=REPORT_CONSUMER_RESEARCH_GUIDE,
+            )
+            user_prompt = PLAN_USER_PROMPT_TEMPLATE.format(
+                simulation_requirement=self.simulation_requirement,
+                total_nodes=context.get('graph_statistics', {}).get('total_nodes', 0),
+                total_edges=context.get('graph_statistics', {}).get('total_edges', 0),
+                entity_types=list(context.get('graph_statistics', {}).get('entity_types', {}).keys()),
+                total_entities=context.get('total_entities', 0),
+                related_facts_json=json.dumps(context.get('related_facts', [])[:10], ensure_ascii=False, indent=2),
+            )
 
         # Append CSI summary so the LLM knows what claims/trials exist
         if csi_summary and "No CSI artifacts" not in csi_summary:
@@ -1516,21 +1643,35 @@ class ReportAgent:
         else:
             previous_content = "（这是第一个章节）"
         
-        system_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE.format(
-            report_title=outline.title,
-            report_summary=outline.summary,
-            simulation_requirement=self.simulation_requirement,
-            section_title=section.title,
-            tools_description=self._get_tools_description(),
-            previous_content=previous_content,
-            writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
-            consumer_research_guide=REPORT_CONSUMER_RESEARCH_GUIDE,
-        )
-        
-        user_prompt = SECTION_USER_PROMPT_TEMPLATE.format(
-            previous_content=previous_content,
-            section_title=section.title,
-        )
+        if self.report_type == "health":
+            system_prompt = HEALTH_SECTION_SYSTEM_PROMPT_TEMPLATE.format(
+                report_title=outline.title,
+                report_summary=outline.summary,
+                simulation_requirement=self.simulation_requirement,
+                section_title=section.title,
+                tools_description=self._get_tools_description(),
+                previous_content=previous_content,
+                writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
+            )
+            user_prompt = HEALTH_SECTION_USER_PROMPT_TEMPLATE.format(
+                previous_content=previous_content,
+                section_title=section.title,
+            )
+        else:
+            system_prompt = SECTION_SYSTEM_PROMPT_TEMPLATE.format(
+                report_title=outline.title,
+                report_summary=outline.summary,
+                simulation_requirement=self.simulation_requirement,
+                section_title=section.title,
+                tools_description=self._get_tools_description(),
+                previous_content=previous_content,
+                writing_style_guide=REPORT_WRITING_STYLE_GUIDE,
+                consumer_research_guide=REPORT_CONSUMER_RESEARCH_GUIDE,
+            )
+            user_prompt = SECTION_USER_PROMPT_TEMPLATE.format(
+                previous_content=previous_content,
+                section_title=section.title,
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1877,6 +2018,7 @@ class ReportAgent:
             graph_id=self.graph_id,
             simulation_requirement=self.simulation_requirement,
             status=ReportStatus.PENDING,
+            report_type=self.report_type,
             created_at=datetime.now().isoformat()
         )
         
@@ -2840,23 +2982,28 @@ class ReportManager:
         )
     
     @classmethod
-    def get_report_by_simulation(cls, simulation_id: str) -> Optional[Report]:
-        """根据模拟ID获取报告"""
+    def get_report_by_simulation(cls, simulation_id: str, report_type: Optional[str] = None) -> Optional[Report]:
+        """根据模拟ID获取报告，可按报告类型过滤。"""
         cls._ensure_reports_dir()
 
         matches = []
+        normalized_type = (report_type or "").strip().lower() or None
         for item in os.listdir(cls.REPORTS_DIR):
             item_path = os.path.join(cls.REPORTS_DIR, item)
             # 新格式：文件夹
             if os.path.isdir(item_path):
                 report = cls.get_report(item)
                 if report and report.simulation_id == simulation_id:
+                    if normalized_type and (report.report_type or "standard") != normalized_type:
+                        continue
                     matches.append(report)
             # 兼容旧格式：JSON文件
             elif item.endswith('.json'):
                 report_id = item[:-5]
                 report = cls.get_report(report_id)
                 if report and report.simulation_id == simulation_id:
+                    if normalized_type and (report.report_type or "standard") != normalized_type:
+                        continue
                     matches.append(report)
 
         if not matches:

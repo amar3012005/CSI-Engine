@@ -2,7 +2,7 @@ import service, { requestWithRetry } from './index'
 
 /**
  * 开始报告生成
- * @param {Object} data - { simulation_id, force_regenerate? }
+ * @param {Object} data - { simulation_id, force_regenerate?, report_type?: 'standard'|'health' }
  */
 export const generateReport = (data) => {
   return requestWithRetry(() => service.post('/api/report/generate', data), 3, 1000)
@@ -18,10 +18,10 @@ export const generatePaperReport = (data) => {
 
 /**
  * 获取报告生成状态
- * @param {string} reportId
+ * @param {Object} data - { task_id?, simulation_id?, report_type? }
  */
-export const getReportStatus = (reportId) => {
-  return service.get(`/api/report/generate/status`, { params: { report_id: reportId } })
+export const getReportStatus = (data) => {
+  return service.post('/api/report/generate/status', data)
 }
 
 /**
@@ -50,8 +50,9 @@ export const getReport = (reportId) => {
   return service.get(`/api/report/${reportId}`)
 }
 
-export const getReportBySimulation = (simulationId) => {
-  return service.get(`/api/report/by-simulation/${simulationId}`)
+export const getReportBySimulation = (simulationId, reportType = null) => {
+  const params = reportType ? { report_type: reportType } : undefined
+  return service.get(`/api/report/by-simulation/${simulationId}`, { params })
 }
 
 export const getPaperReportBySimulation = (simulationId) => {

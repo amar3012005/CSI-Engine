@@ -92,6 +92,7 @@
 
           <Step3Simulation
             v-if="activeStage === 'simulation'"
+            :key="currentSimulationId"
             :simulationId="currentSimulationId"
             :maxRounds="currentMaxRounds"
             :projectData="projectData"
@@ -490,6 +491,10 @@ const stageStateLabel = (stage) => {
 
 const updateWorkspaceStatus = (status) => {
   workspaceStatus.value = status
+  if (status === 'completed') {
+    simulationCompleted.value = true
+    simulationRunning.value = false
+  }
 }
 
 const persistStage = () => {
@@ -771,6 +776,7 @@ const handleSimulationNext = async (payload = {}) => {
     if (payload.reportId) {
       currentReportId.value = payload.reportId
     }
+    simulationCompleted.value = true // Ensure completed is true when moving to report
     reportStarted.value = true
     reportCompleted.value = false
     autoGenerateReportOnComplete.value = false
@@ -866,7 +872,7 @@ watch(
     simulationUnlocked.value = false
     simulationRunning.value = false
     simulationCompleted.value = false
-    autoGenerateReportOnComplete.value = false
+    autoGenerateReportOnComplete.value = String(route.query.autoReport) === '1'
     await hydrateWorkspace({ initial: true })
     startWorkspacePolling()
   }
@@ -939,12 +945,18 @@ watch(() => route.query.stage, (newStage, oldStage) => {
   }
 })
 
-// Auto-generate report when simulation completes in health mode
+// Update auto-report settings based on mode.
+// In medical mode, always default to auto-report.
+// Otherwise, respect URL or UI-toggled autoReport=1.
 watch([() => activeStage.value, () => isHealthMode.value], ([stage, isHealth]) => {
-  if (stage === 'simulation' && isHealth) {
-    autoGenerateReportOnComplete.value = true
+  if (stage === 'simulation') {
+    if (isHealth) {
+      autoGenerateReportOnComplete.value = true
+    } else {
+      autoGenerateReportOnComplete.value = String(route.query.autoReport) === '1'
+    }
   }
-})
+}, { immediate: true })
 
 // React to URL configMode changes
 watch(() => route.query.configMode, (newMode) => {
@@ -964,6 +976,11 @@ onMounted(async () => {
   const urlStage = String(route.query.stage || '').trim().toLowerCase()
   if (urlStage === 'report' || urlStage === 'simulation') {
     activeStage.value = urlStage
+  }
+
+  // Handle auto-report toggle from URL
+  if (String(route.query.autoReport) === '1') {
+    autoGenerateReportOnComplete.value = true
   }
 
   addLog('Unified simulation workspace initialized')

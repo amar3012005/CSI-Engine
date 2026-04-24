@@ -36,6 +36,20 @@
           </div>
           <div class="rb-right">
             <span v-if="reportData.created_at" class="rb-date">{{ formatDate(reportData.created_at) }}</span>
+            <div class="download-container">
+              <button class="rb-btn download-btn" @click="toggleDownloadMenu">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+              </button>
+              <div v-if="showDownloadMenu" class="download-dropdown">
+                <button @click="downloadAs('pdf')">.pdf</button>
+                <button @click="downloadAs('docx')">.docx</button>
+                <button @click="downloadAs('md')">.md</button>
+              </div>
+            </div>
             <button class="rb-btn" @click="showPaper = true">View Paper</button>
           </div>
         </div>
@@ -116,7 +130,29 @@ const showPaper = ref(false)
 const resolvedHealthMode = ref(props.isHealthMode)
 const error = ref('')
 const currentReportId = ref(props.reportId || '')
+const showDownloadMenu = ref(false)
 let pollTimer = null
+
+const toggleDownloadMenu = (e) => {
+  e.stopPropagation()
+  showDownloadMenu.value = !showDownloadMenu.value
+}
+
+const downloadAs = (format) => {
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
+  const url = `${baseUrl}/api/report/${currentReportId.value}/download?format=${format}`
+  window.open(url, '_blank')
+  showDownloadMenu.value = false
+}
+
+// Close menu on click outside
+onMounted(() => {
+  window.addEventListener('click', () => { showDownloadMenu.value = false })
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('click', () => { showDownloadMenu.value = false })
+})
 
 const paperTitle = computed(() => {
   return reportData.value?.outline?.title || reportData.value?.title || 'Technical Report'
@@ -418,6 +454,44 @@ onBeforeUnmount(() => {
   border-color: #117dff;
   color: #117dff;
   background: rgba(17, 125, 255, 0.04);
+}
+
+.download-container {
+  position: relative;
+  display: flex;
+}
+
+.download-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 5px;
+  background: white;
+  border: 1px solid #e3e0db;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  z-index: 1000;
+  min-width: 90px;
+  overflow: hidden;
+  padding: 4px 0;
+}
+
+.download-dropdown button {
+  width: 100%;
+  padding: 8px 16px;
+  border: none;
+  background: none;
+  text-align: left;
+  font-size: 13px;
+  cursor: pointer;
+  color: #1a1a1a;
+  font-family: inherit;
+  transition: background 0.12s;
+}
+
+.download-dropdown button:hover {
+  background: #f0f7ff;
+  color: #117dff;
 }
 
 /* Intro section */

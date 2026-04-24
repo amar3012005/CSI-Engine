@@ -85,6 +85,10 @@
                       <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
                     </svg>
                   </button>
+                  <label class="auto-report-toggle" title="Auto-generate report after simulation">
+                    <input type="checkbox" v-model="formData.autoReport" />
+                    <span class="auto-report-label">Auto Report</span>
+                  </label>
                   <button
                     class="send-btn"
                     @click="handleSubmit"
@@ -157,7 +161,10 @@ import CsiConfirmCard from '../components/ui/CsiConfirmCard.vue'
 const router = useRouter()
 const { sidebarCollapsed } = useSidebar()
 
-const formData = ref({ simulationRequirement: '' })
+const formData = ref({ 
+  simulationRequirement: '',
+  autoReport: false
+})
 const files = ref([])
 const loading = ref(false)
 const showConfirmCard = ref(false)
@@ -277,7 +284,16 @@ const startSimulation = async () => {
   if (files.value.length > 0 || urls.length > 0) {
     const { setPendingUpload } = await import('../store/pendingUpload.js')
     setPendingUpload(files.value, formData.value.simulationRequirement, urls)
-    router.push({ name: 'Simulation', params: { simulationId: 'new' }, query: { configMode: 'deepresearch', stage: 'environment', pendingUpload: '1' } })
+    router.push({ 
+      name: 'Simulation', 
+      params: { simulationId: 'new' }, 
+      query: { 
+        configMode: 'deepresearch', 
+        stage: 'environment', 
+        pendingUpload: '1',
+        autoReport: formData.value.autoReport ? '1' : undefined
+      } 
+    })
   } else {
     try {
       const { createSimulation } = await import('../api/simulation')
@@ -288,7 +304,14 @@ const startSimulation = async () => {
       })
       if (res.success && res.data?.simulation_id) {
         showConfirmCard.value = false
-        router.push({ name: 'Simulation', params: { simulationId: res.data.simulation_id }, query: { configMode } })
+        router.push({ 
+          name: 'Simulation', 
+          params: { simulationId: res.data.simulation_id }, 
+          query: { 
+            configMode,
+            autoReport: formData.value.autoReport ? '1' : undefined
+          } 
+        })
       } else {
         error.value = res.error || 'Failed to create session'
         loading.value = false
@@ -473,6 +496,26 @@ onMounted(async () => {
 .send-btn.active { background: #1a1a1a; color: #fff; }
 .send-btn.active:hover { background: #333; }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.auto-report-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.auto-report-toggle input {
+  cursor: pointer;
+  width: 14px;
+  height: 14px;
+}
+.auto-report-label {
+  font-size: 12px;
+  color: #6b6862;
+  font-weight: 500;
+  white-space: nowrap;
+}
 
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip {

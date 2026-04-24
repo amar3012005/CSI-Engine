@@ -468,11 +468,6 @@ class SimulationManager:
         }
         for source in sources:
             normalized_url = (source.get("url") or "").strip().lower().rstrip("/")
-            # Check if this URL is already in our persistent index
-            if normalized_url and normalized_url in seen_urls:
-                continue
-            
-            # If not in index, add it to our new set
             sid = source.get("source_id")
             if sid:
                 all_sources[sid] = source

@@ -35,6 +35,7 @@ CANONICAL_ENTITY_TYPES = {
 CANONICAL_RELATION_TYPES = {
     "supports",
     "contradicts",
+    "needs_revision",
     "derived_from",
     "updates",
     "used_in_report",
@@ -493,8 +494,10 @@ class CSIAdapter:
         )["entity"]
 
         relation_type = "supports"
-        if verdict in {"disputed", "contradicted", "false", "reject"}:
+        if verdict in {"contradicts", "contradicted", "disputed", "false", "reject"}:
             relation_type = "contradicts"
+        elif verdict in {"needs_revision", "needs review", "needs-review", "revise", "revision"}:
+            relation_type = "needs_revision"
 
         rel = self.create_relation(
             project_id=project_id,

@@ -6,25 +6,86 @@ const mem = {}
 
 export function safeGet(key, fallback = null) {
   try {
-    const val = localStorage.getItem(key)
-    return val !== null ? val : fallback
+    // Wrap access in try-catch to handle "Access to storage is not allowed" errors
+    const storage = typeof localStorage !== 'undefined' ? localStorage : null
+    if (storage !== null) {
+      const val = storage.getItem(key)
+      return val !== null ? val : fallback
+    }
   } catch {
-    return mem[key] ?? fallback
+    // blocked or unavailable
   }
+  return mem[key] ?? fallback
 }
 
 export function safeSet(key, val) {
   try {
-    localStorage.setItem(key, String(val))
+    const storage = typeof localStorage !== 'undefined' ? localStorage : null
+    if (storage !== null) {
+      storage.setItem(key, String(val))
+      return
+    }
   } catch {
-    mem[key] = String(val)
+    // blocked or unavailable
   }
+  mem[key] = String(val)
 }
 
 export function safeRemove(key) {
   try {
-    localStorage.removeItem(key)
+    const storage = typeof localStorage !== 'undefined' ? localStorage : null
+    if (storage !== null) {
+      storage.removeItem(key)
+      return
+    }
   } catch {
-    delete mem[key]
+    // blocked or unavailable
   }
+  delete mem[key]
 }
+
+/**
+ * Session storage versions
+ */
+
+const sessionMem = {}
+
+export function safeSessionGet(key, fallback = null) {
+  try {
+    const storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null
+    if (storage !== null) {
+      const val = storage.getItem(key)
+      return val !== null ? val : fallback
+    }
+  } catch {
+    // blocked
+  }
+  return sessionMem[key] ?? fallback
+}
+
+export function safeSessionSet(key, val) {
+  try {
+    const storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null
+    if (storage !== null) {
+      storage.setItem(key, String(val))
+      return
+    }
+  } catch {
+    // blocked
+  }
+  sessionMem[key] = String(val)
+}
+
+export function safeSessionRemove(key) {
+  try {
+    const storage = typeof sessionStorage !== 'undefined' ? sessionStorage : null
+    if (storage !== null) {
+      storage.removeItem(key)
+      return
+    }
+  } catch {
+    // blocked
+  }
+  delete sessionMem[key]
+}
+

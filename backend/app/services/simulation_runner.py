@@ -1175,13 +1175,27 @@ class SimulationRunner:
                 on_round_complete=_on_round_complete,
             )
 
-            # 7. Mark as completed
+            # 7. Mark as completed and sync persistent state
             state.csi_research_running = False
             state.csi_research_completed = True
             state.csi_research_current_round = num_rounds
             state.runner_status = RunnerStatus.COMPLETED
             state.completed_at = datetime.now().isoformat()
             cls._save_run_state(state)
+
+            try:
+                from .simulation_manager import SimulationManager, SimulationStatus
+                sm = SimulationManager()
+                sim_state = sm.get_simulation(simulation_id)
+                if sim_state:
+                    sim_state.status = SimulationStatus.COMPLETED
+                    sm._save_simulation_state(sim_state)
+                    logger.info("Successfully synced persistent state.json status to COMPLETED for %s", simulation_id)
+            except Exception as sync_err:
+                logger.error("Failed to sync persistent state.json for %s: %s", simulation_id, sync_err)
+
+            if run_config_mode == "health":
+                cls._start_health_report_generation(simulation_id, sim_requirement)
 
             logger.info("CSI research phase complete for %s: %s", simulation_id, result)
 
@@ -1194,9 +1208,19 @@ class SimulationRunner:
             )
             state.csi_research_running = False
             state.csi_research_error = "CSI research engine not available"
-            state.runner_status = RunnerStatus.COMPLETED
+            state.runner_status = RunnerStatus.FAILED
             state.completed_at = datetime.now().isoformat()
             cls._save_run_state(state)
+            try:
+                from .simulation_manager import SimulationManager, SimulationStatus
+                sm = SimulationManager()
+                sim_state = sm.get_simulation(simulation_id)
+                if sim_state:
+                    sim_state.status = SimulationStatus.FAILED
+                    sim_state.error = state.csi_research_error
+                    sm._save_simulation_state(sim_state)
+            except Exception as sync_err:
+                logger.error("Failed to sync failed CSI state for %s: %s", simulation_id, sync_err)
 
         except Exception as exc:
             logger.error(
@@ -1205,9 +1229,75 @@ class SimulationRunner:
             )
             state.csi_research_running = False
             state.csi_research_error = str(exc)
-            state.runner_status = RunnerStatus.COMPLETED
+            state.runner_status = RunnerStatus.FAILED
             state.completed_at = datetime.now().isoformat()
             cls._save_run_state(state)
+            try:
+                from .simulation_manager import SimulationManager, SimulationStatus
+                sm = SimulationManager()
+                sim_state = sm.get_simulation(simulation_id)
+                if sim_state:
+                    sim_state.status = SimulationStatus.FAILED
+                    sim_state.error = state.csi_research_error
+                    sm._save_simulation_state(sim_state)
+            except Exception as sync_err:
+                logger.error("Failed to sync failed CSI state for %s: %s", simulation_id, sync_err)
+
+    @classmethod
+    def _start_health_report_generation(cls, simulation_id: str, simulation_requirement: str) -> None:
+        """Start health report generation after a successful health CSI run."""
+        def _generate() -> None:
+            try:
+                from .simulation_manager import SimulationManager
+                from .report_agent import ReportAgent, ReportManager, ReportStatus
+                from ..models.project import ProjectManager
+
+                existing = ReportManager.get_report_by_simulation(
+                    simulation_id,
+                    report_type="health",
+                )
+                if existing and existing.status == ReportStatus.COMPLETED:
+                    logger.info("Health report already exists for %s: %s", simulation_id, existing.report_id)
+                    return
+
+                sim_state = SimulationManager().get_simulation(simulation_id)
+                if not sim_state:
+                    logger.warning("Skipping health report generation; simulation state missing for %s", simulation_id)
+                    return
+
+                project = ProjectManager.get_project(sim_state.project_id)
+                graph_id = sim_state.graph_id or (project.graph_id if project else "") or ""
+                requirement = (
+                    simulation_requirement
+                    or sim_state.simulation_requirement
+                    or (project.simulation_requirement if project else "")
+                )
+                if not requirement:
+                    logger.warning("Skipping health report generation; requirement missing for %s", simulation_id)
+                    return
+
+                logger.info("Auto-generating health report for completed CSI simulation %s", simulation_id)
+                agent = ReportAgent(
+                    graph_id=graph_id,
+                    simulation_id=simulation_id,
+                    simulation_requirement=requirement,
+                    report_type="health",
+                )
+                report = agent.generate_report()
+                ReportManager.save_report(report)
+                if report.status == ReportStatus.COMPLETED:
+                    logger.info("Auto-generated health report for %s: %s", simulation_id, report.report_id)
+                else:
+                    logger.error("Auto health report generation failed for %s: %s", simulation_id, report.error)
+            except Exception as exc:
+                logger.error("Auto health report generation crashed for %s: %s", simulation_id, exc, exc_info=True)
+
+        thread = threading.Thread(
+            target=_generate,
+            name=f"health-report-{simulation_id}",
+            daemon=True,
+        )
+        thread.start()
 
     @classmethod
     def _terminate_process(cls, process: subprocess.Popen, simulation_id: str, timeout: int = 10):

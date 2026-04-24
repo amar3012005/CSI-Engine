@@ -394,8 +394,10 @@ const resumeExistingSimulation = async () => {
       await fetchProfiles({ silent: true })
       await fetchRunStatusDetail()
       emit('update-status', 'completed')
-      if (props.autoGenerateReportOnComplete && !props.reportStarted) {
-        addLog('Follow-up run completed, auto-starting report generation')
+      
+      const autoReport = props.autoGenerateReportOnComplete || isHealthMode.value
+      if (autoReport && !props.reportStarted) {
+        addLog('Session restored. Auto-starting report generation...')
         await handleNextStep()
       } else if (!props.reportStarted) {
         // Show report confirmation if no report has been generated yet
@@ -575,20 +577,40 @@ const fetchRunStatus = async () => {
       // Extra check: if backend hasn't updated runner_status yet, but platforms report completion
       // Detect via twitter_completed and reddit_completed status
       const platformsCompleted = checkPlatformsCompleted(data)
+
+      // CSI research phase completion check
+      const researchCompleted = data.csi_research_completed === true
       
-      if (isCompleted || platformsCompleted) {
+      // Effective completion requires platforms AND research (if applicable)
+      // If runner_status is completed, we trust it. 
+      // Otherwise, we wait for platforms + research if in health mode.
+      let finalCompleted = isCompleted
+      if (!isCompleted && platformsCompleted) {
+        if (isHealthMode.value) {
+          finalCompleted = researchCompleted
+        } else {
+          finalCompleted = true
+        }
+      }
+      
+      if (finalCompleted) {
         if (platformsCompleted && !isCompleted) {
           addLog('All platform simulations completed')
+        }
+        if (isHealthMode.value && researchCompleted) {
+          addLog('Medical research phase completed')
         }
         addLog('Simulation completed')
         phase.value = 2
         stopPolling()
         await fetchRunStatusDetail() // Fetch final complete action logs
         emit('update-status', 'completed')
-        if (props.autoGenerateReportOnComplete && !props.reportStarted) {
-          addLog('Follow-up run completed, auto-starting report generation')
+        
+        const autoReport = props.autoGenerateReportOnComplete || isHealthMode.value
+        if (autoReport && !props.reportStarted) {
+          addLog('Transitioning to report generation sequence...')
           await handleNextStep()
-        } else {
+        } else if (!props.reportStarted) {
           // Show confirmation card instead of auto-generating
           showReportConfirm.value = true
         }

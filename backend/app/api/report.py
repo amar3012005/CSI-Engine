@@ -57,6 +57,12 @@ def generate_report():
             }), 400
         
         force_regenerate = data.get('force_regenerate', False)
+        report_type = (data.get('report_type') or 'standard').strip().lower()
+        if report_type not in {'standard', 'health'}:
+            return jsonify({
+                "success": False,
+                "error": "report_type 仅支持 standard 或 health"
+            }), 400
         
         # 获取模拟信息
         manager = SimulationManager()
@@ -70,13 +76,17 @@ def generate_report():
         
         # 检查是否已有报告
         if not force_regenerate:
-            existing_report = ReportManager.get_report_by_simulation(simulation_id)
+            existing_report = ReportManager.get_report_by_simulation(
+                simulation_id,
+                report_type=report_type,
+            )
             if existing_report and existing_report.status == ReportStatus.COMPLETED:
                 return jsonify({
                     "success": True,
                     "data": {
                         "simulation_id": simulation_id,
                         "report_id": existing_report.report_id,
+                        "report_type": existing_report.report_type,
                         "status": "completed",
                         "message": "报告已存在",
                         "already_generated": True
@@ -111,7 +121,8 @@ def generate_report():
             metadata={
                 "simulation_id": simulation_id,
                 "graph_id": graph_id,
-                "report_id": report_id
+                "report_id": report_id,
+                "report_type": report_type,
             }
         )
         
@@ -129,7 +140,8 @@ def generate_report():
                 agent = ReportAgent(
                     graph_id=graph_id,
                     simulation_id=simulation_id,
-                    simulation_requirement=simulation_requirement
+                    simulation_requirement=simulation_requirement,
+                    report_type=report_type,
                 )
                 
                 # 进度回调
@@ -155,6 +167,7 @@ def generate_report():
                         result={
                             "report_id": report.report_id,
                             "simulation_id": simulation_id,
+                            "report_type": report.report_type,
                             "status": "completed"
                         }
                     )
@@ -174,6 +187,7 @@ def generate_report():
             "data": {
                 "simulation_id": simulation_id,
                 "report_id": report_id,
+                "report_type": report_type,
                 "task_id": task_id,
                 "status": "generating",
                 "message": "报告生成任务已启动，请通过 /api/report/generate/status 查询进度",
@@ -217,16 +231,21 @@ def get_generate_status():
         
         task_id = data.get('task_id')
         simulation_id = data.get('simulation_id')
+        report_type = (data.get('report_type') or '').strip().lower() or None
         
         # 如果提供了simulation_id，先检查是否已有完成的报告
         if simulation_id:
-            existing_report = ReportManager.get_report_by_simulation(simulation_id)
+            existing_report = ReportManager.get_report_by_simulation(
+                simulation_id,
+                report_type=report_type,
+            )
             if existing_report and existing_report.status == ReportStatus.COMPLETED:
                 return jsonify({
                     "success": True,
                     "data": {
                         "simulation_id": simulation_id,
                         "report_id": existing_report.report_id,
+                        "report_type": existing_report.report_type,
                         "status": "completed",
                         "progress": 100,
                         "message": "报告已生成",
@@ -321,7 +340,8 @@ def get_report_by_simulation(simulation_id: str):
         }
     """
     try:
-        report = ReportManager.get_report_by_simulation(simulation_id)
+        report_type = (request.args.get('report_type') or '').strip().lower() or None
+        report = ReportManager.get_report_by_simulation(simulation_id, report_type=report_type)
         
         if not report:
             return jsonify({
@@ -363,12 +383,15 @@ def list_reports():
     """
     try:
         simulation_id = request.args.get('simulation_id')
+        report_type = (request.args.get('report_type') or '').strip().lower() or None
         limit = request.args.get('limit', 50, type=int)
         
         reports = ReportManager.list_reports(
             simulation_id=simulation_id,
             limit=limit
         )
+        if report_type:
+            reports = [r for r in reports if (r.report_type or 'standard') == report_type]
         
         return jsonify({
             "success": True,
@@ -388,9 +411,10 @@ def list_reports():
 @report_bp.route('/<report_id>/download', methods=['GET'])
 def download_report(report_id: str):
     """
-    下载报告（Markdown格式）
+    下载报告
     
-    返回Markdown文件
+    Query参数：
+        format: 下载格式 (md|pdf|docx), 默认 md
     """
     try:
         report = ReportManager.get_report(report_id)
@@ -401,26 +425,88 @@ def download_report(report_id: str):
                 "error": f"报告不存在: {report_id}"
             }), 404
         
-        md_path = ReportManager._get_report_markdown_path(report_id)
+        fmt = request.args.get('format', 'md').lower()
         
-        if not os.path.exists(md_path):
-            # 如果MD文件不存在，生成一个临时文件
+        # 1. 下载 Markdown (原始格式)
+        if fmt == 'md':
+            md_path = ReportManager._get_report_markdown_path(report_id)
+            if not os.path.exists(md_path):
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+                    f.write(report.markdown_content)
+                    temp_path = f.name
+                return send_file(temp_path, as_attachment=True, download_name=f"{report_id}.md")
+            
+            return send_file(md_path, as_attachment=True, download_name=f"{report_id}.md")
+            
+        # 2. 下载 DOCX
+        elif fmt == 'docx':
+            from docx import Document
+            from docx.shared import Inches
             import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
-                f.write(report.markdown_content)
+            
+            doc = Document()
+            title = report.outline.get('title', 'Simulation Report') if report.outline else 'Simulation Report'
+            doc.add_heading(title, 0)
+            
+            # 使用简单的 Markdown 解析逻辑（仅处理标题和段落）
+            content = report.markdown_content
+            for line in content.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith('### '):
+                    doc.add_heading(line[4:], level=2)
+                elif line.startswith('## '):
+                    doc.add_heading(line[3:], level=1)
+                elif line.startswith('# '):
+                    doc.add_heading(line[2:], level=0)
+                else:
+                    doc.add_paragraph(line)
+            
+            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as f:
+                doc.save(f.name)
                 temp_path = f.name
             
-            return send_file(
-                temp_path,
-                as_attachment=True,
-                download_name=f"{report_id}.md"
-            )
-        
-        return send_file(
-            md_path,
-            as_attachment=True,
-            download_name=f"{report_id}.md"
-        )
+            return send_file(temp_path, as_attachment=True, download_name=f"{report_id}.docx")
+            
+        # 3. 下载 PDF
+        elif fmt == 'pdf':
+            from fpdf import FPDF
+            import tempfile
+            
+            class PDF(FPDF):
+                def header(self):
+                    self.set_font('Arial', 'B', 12)
+                    self.cell(0, 10, 'Simulation Report', 0, 1, 'C')
+                def footer(self):
+                    self.set_y(-15)
+                    self.set_font('Arial', 'I', 8)
+                    self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+            pdf = PDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+            
+            # PDF 目前只支持 Latin 字符集（标准Arial），如果遇到非Latin字符可能会有问题
+            # 处理简单的换行，避免 FPDF 报错
+            content = report.markdown_content
+            for line in content.split('\n'):
+                # 过滤掉非 Latin1 字符，防止 FPDF 崩溃
+                clean_line = "".join(c if ord(c) < 256 else "?" for c in line)
+                pdf.multi_cell(0, 10, txt=clean_line)
+            
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+                pdf.output(f.name)
+                temp_path = f.name
+                
+            return send_file(temp_path, as_attachment=True, download_name=f"{report_id}.pdf")
+            
+        else:
+            return jsonify({
+                "success": False,
+                "error": f"不支持的格式: {fmt}"
+            }), 400
         
     except Exception as e:
         logger.error(f"下载报告失败: {str(e)}")
@@ -492,6 +578,7 @@ def chat_with_report_agent():
         simulation_id = data.get('simulation_id')
         message = data.get('message')
         chat_history = data.get('chat_history', [])
+        report_type = (data.get('report_type') or 'standard').strip().lower()
         
         if not simulation_id:
             return jsonify({
@@ -530,7 +617,8 @@ def chat_with_report_agent():
         agent = ReportAgent(
             graph_id=graph_id,
             simulation_id=simulation_id,
-            simulation_requirement=simulation_requirement
+            simulation_requirement=simulation_requirement,
+            report_type=report_type,
         )
         
         result = agent.chat(message=message, chat_history=chat_history)
