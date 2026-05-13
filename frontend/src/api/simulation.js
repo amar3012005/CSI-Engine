@@ -252,3 +252,16 @@ export const getBundle = (simulationId) => {
 export const getCloudSessions = () => {
   return service.get('/api/simulation/sessions/cloud')
 }
+
+/** Talk-to-Expert: fetch the agent's opening summary. */
+export const getExpertIntro = (simulationId, agentId) => {
+  return service.get(`/api/simulation/${simulationId}/expert-chat/${agentId}/intro`)
+}
+
+/** Talk-to-Expert: send a chat message; history = [{role,content}, ...]. */
+export const sendExpertMessage = (simulationId, agentId, message, history = []) => {
+  return service.post(`/api/simulation/${simulationId}/expert-chat/${agentId}`, {
+    message,
+    history,
+  })
+}

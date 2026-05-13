@@ -1132,53 +1132,97 @@ class SimulationRunner:
             state.runner_status = RunnerStatus.RUNNING
             cls._save_run_state(state)
 
-            # 6. Create harness and engine
-            from .agent_harness import AgentHarness, ActionBudget
+            # 6. Create harness and execute the mature CSI round engine.
+            # The newer blackboard scheduler is not yet feature-complete enough
+            # for production use: it can derive tasks, but it does not build the
+            # actual reasoning payloads that yield claims/reviews. Route runtime
+            # execution through the round engine until the scheduler path reaches
+            # parity.
+            from ..config import Config
+            from .web_search_client import WebSearchClient
+            from .agent_harness import AgentHarness
+            from .csi_policy import build_csi_policy
             
-            # Standard budget for a simulation run
-            harness_budget = ActionBudget(
-                max_tokens_per_simulation=5000000,
-                max_tokens_per_round=1000000
-            )
-            
-            # Harness acts as the single execution layer
             run_config_mode = config.get("config_mode", "web_research")
+            policy = build_csi_policy(run_config_mode)
 
             harness = AgentHarness(
                 simulation_id=simulation_id,
-                llm_client=LLMClient(usage_scope=simulation_id),
-                budget=harness_budget,
+                policy=policy,
                 store=csi_store,
-                web_client=None,  # CSIResearchEngine has lazy web client initialization
+                llm_client=LLMClient(usage_scope=f"csi_{simulation_id}"),
+                web_client=WebSearchClient(api_key=Config.TAVILY_API_KEY),
                 config_mode=run_config_mode,
             )
-
             engine = CSIResearchEngine(
                 simulation_id=simulation_id,
                 harness=harness,
                 csi_store=csi_store,
                 sources=sources,
-                roster=roster,
+                roster=roster or [{"agent_id": "agent_0", "agent_name": "Default Agent"}],
                 config=research_config,
                 config_mode=run_config_mode,
             )
+            logger.info("Mapped %d agents from roster for %s", len(engine.roster), simulation_id)
 
+            # Define progression callback
             def _on_round_complete(round_idx: int) -> None:
-                """Callback invoked by the engine after each round."""
+                """Callback invoked after each persisted research round."""
                 state.csi_research_current_round = round_idx + 1
                 state.updated_at = datetime.now().isoformat()
                 cls._save_run_state(state)
+                csi_store.refresh_blackboard_state(simulation_id)
 
-            result = engine.run_research_rounds(
+            logger.info("Starting CSI research rounds for %s", simulation_id)
+            summary = engine.run_research_rounds(
                 num_rounds=num_rounds,
                 simulation_requirement=sim_requirement,
                 on_round_complete=_on_round_complete,
             )
+            # Ensure the CSI store's persisted round counter reflects the runtime summary.
+            # This prevents health completion evaluation from seeing "0 rounds" when
+            # claims/trials were recorded but round_count didn't advance cleanly.
+            try:
+                rounds_completed = int(summary.get("rounds_completed", 0) or 0)
+                if rounds_completed and hasattr(csi_store, "advance_round_count"):
+                    csi_store.advance_round_count(simulation_id, rounds_completed, source="runner_summary")
+            except Exception as exc:
+                logger.warning("Failed to sync CSI round_count from runtime summary: %s", exc)
+
+            snapshot = csi_store.build_blackboard_snapshot(simulation_id)
+            last_completion = snapshot.get("completion_criteria", {}) or {}
+            completion_reached = last_completion.get("success", False)
+            if run_config_mode == "health" and summary.get("rounds_completed", 0) < 2:
+                completion_reached = False
+
+            if run_config_mode == "health" and not completion_reached:
+                reason = last_completion.get("reason") or "health CSI did not meet completion criteria"
+                # Soft-fail: only block if there are zero usable claims at all.
+                # Otherwise, log a warning and let the health report generator
+                # render with best-available reviewed claims.
+                claims_total = len(snapshot.get("claims", {}) or {})
+                reviews_total = len(snapshot.get("reviews", {}) or {})
+                if claims_total == 0:
+                    raise RuntimeError(f"Health CSI incomplete: {reason}")
+                logger.warning(
+                    "Health CSI did not meet strict gates (%s) — "
+                    "proceeding with best-available report on %d claims / %d reviews for %s",
+                    reason, claims_total, reviews_total, simulation_id,
+                )
+                # Persist a flag so report generator knows this was a soft-fail
+                try:
+                    csi_store.record_lifecycle_event(  # type: ignore[attr-defined]
+                        simulation_id,
+                        "HEALTH_SOFT_FAIL",
+                        {"reason": reason, "claims_total": claims_total, "reviews_total": reviews_total},
+                    )
+                except Exception:
+                    pass
 
             # 7. Mark as completed and sync persistent state
             state.csi_research_running = False
             state.csi_research_completed = True
-            state.csi_research_current_round = num_rounds
+            state.csi_research_current_round = int(summary.get("rounds_completed", 0) or 0)
             state.runner_status = RunnerStatus.COMPLETED
             state.completed_at = datetime.now().isoformat()
             cls._save_run_state(state)
@@ -1197,14 +1241,20 @@ class SimulationRunner:
             if run_config_mode == "health":
                 cls._start_health_report_generation(simulation_id, sim_requirement)
 
-            logger.info("CSI research phase complete for %s: %s", simulation_id, result)
+            logger.info(
+                "CSI research phase complete for %s: rounds=%d claims=%d trials=%d reviewed_ratio=%s",
+                simulation_id,
+                int(summary.get("rounds_completed", 0) or 0),
+                int(summary.get("total_claims", 0) or 0),
+                int(summary.get("total_trials", 0) or 0),
+                summary.get("reviewed_ratio"),
+            )
 
-        except ImportError:
+        except ImportError as imp_err:
             # CSIResearchEngine module not yet available — skip gracefully.
             logger.warning(
-                "csi_research_engine module not available; "
-                "skipping CSI research phase for %s",
-                simulation_id,
+                "csi_research_engine module NOT available for %s: %s",
+                simulation_id, imp_err,
             )
             state.csi_research_running = False
             state.csi_research_error = "CSI research engine not available"
@@ -1248,47 +1298,38 @@ class SimulationRunner:
         """Start health report generation after a successful health CSI run."""
         def _generate() -> None:
             try:
-                from .simulation_manager import SimulationManager
-                from .report_agent import ReportAgent, ReportManager, ReportStatus
-                from ..models.project import ProjectManager
+                from .health_report_generator import trigger_health_report_generation
 
-                existing = ReportManager.get_report_by_simulation(
-                    simulation_id,
-                    report_type="health",
+                csi_dir_path = os.path.join(
+                    cls._get_local_csi_store()._sim_dir(simulation_id),
+                    "csi",
                 )
-                if existing and existing.status == ReportStatus.COMPLETED:
-                    logger.info("Health report already exists for %s: %s", simulation_id, existing.report_id)
-                    return
-
-                sim_state = SimulationManager().get_simulation(simulation_id)
-                if not sim_state:
-                    logger.warning("Skipping health report generation; simulation state missing for %s", simulation_id)
-                    return
-
-                project = ProjectManager.get_project(sim_state.project_id)
-                graph_id = sim_state.graph_id or (project.graph_id if project else "") or ""
-                requirement = (
-                    simulation_requirement
-                    or sim_state.simulation_requirement
-                    or (project.simulation_requirement if project else "")
-                )
-                if not requirement:
-                    logger.warning("Skipping health report generation; requirement missing for %s", simulation_id)
-                    return
-
-                logger.info("Auto-generating health report for completed CSI simulation %s", simulation_id)
-                agent = ReportAgent(
-                    graph_id=graph_id,
+                logger.info("Auto-generating health report from CSI artifacts for %s", simulation_id)
+                result = trigger_health_report_generation(
                     simulation_id=simulation_id,
-                    simulation_requirement=requirement,
-                    report_type="health",
+                    simulation_requirement=simulation_requirement,
+                    csi_dir_path=csi_dir_path,
                 )
-                report = agent.generate_report()
-                ReportManager.save_report(report)
-                if report.status == ReportStatus.COMPLETED:
-                    logger.info("Auto-generated health report for %s: %s", simulation_id, report.report_id)
+                status = result.get("status")
+                if status == "completed":
+                    logger.info(
+                        "Auto-generated health report for %s: %s",
+                        simulation_id,
+                        result.get("report_id"),
+                    )
+                elif status == "skipped":
+                    logger.info(
+                        "Skipped health auto-report for %s: %s (%s)",
+                        simulation_id,
+                        result.get("reason"),
+                        result.get("report_id"),
+                    )
                 else:
-                    logger.error("Auto health report generation failed for %s: %s", simulation_id, report.error)
+                    logger.error(
+                        "Auto health report generation failed for %s: %s",
+                        simulation_id,
+                        result.get("error"),
+                    )
             except Exception as exc:
                 logger.error("Auto health report generation crashed for %s: %s", simulation_id, exc, exc_info=True)
 

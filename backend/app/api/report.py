@@ -6,17 +6,19 @@ Report API路由
 import os
 import traceback
 import threading
+from datetime import datetime
 from flask import request, jsonify, send_file
 
 from . import report_bp
 from ..config import Config
-from ..services.report_agent import ReportAgent, ReportManager, ReportStatus
+from ..services.report_agent import Report, ReportAgent, ReportManager, ReportStatus
 from ..services.simulation_manager import SimulationManager
 from ..models.project import ProjectManager
 from ..models.task import TaskManager, TaskStatus
 from ..utils.logger import get_logger
 
 logger = get_logger('mirofish.api.report')
+_REPORT_GENERATE_LOCK = threading.Lock()
 
 
 # ============== 报告生成接口 ==============
@@ -74,7 +76,9 @@ def generate_report():
                 "error": f"模拟不存在: {simulation_id}"
             }), 404
         
-        # 检查是否已有报告
+        task_manager = TaskManager()
+
+        # 检查是否已有报告或正在生成的同类型报告，避免自动生成与前端手动触发并发。
         if not force_regenerate:
             existing_report = ReportManager.get_report_by_simulation(
                 simulation_id,
@@ -90,6 +94,54 @@ def generate_report():
                         "status": "completed",
                         "message": "报告已存在",
                         "already_generated": True
+                    }
+                })
+            if existing_report and existing_report.status in {
+                ReportStatus.PENDING,
+                ReportStatus.PLANNING,
+                ReportStatus.GENERATING,
+            }:
+                existing_task = task_manager.find_task_by_metadata(
+                    "report_generate",
+                    {
+                        "simulation_id": simulation_id,
+                        "report_type": report_type,
+                        "report_id": existing_report.report_id,
+                    },
+                    statuses=[TaskStatus.PENDING, TaskStatus.PROCESSING],
+                )
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "simulation_id": simulation_id,
+                        "report_id": existing_report.report_id,
+                        "report_type": existing_report.report_type,
+                        "task_id": existing_task.task_id if existing_task else None,
+                        "status": existing_report.status.value,
+                        "message": "报告生成任务已存在",
+                        "already_generated": False
+                    }
+                })
+
+            existing_task = task_manager.find_task_by_metadata(
+                "report_generate",
+                {
+                    "simulation_id": simulation_id,
+                    "report_type": report_type,
+                },
+                statuses=[TaskStatus.PENDING, TaskStatus.PROCESSING],
+            )
+            if existing_task:
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "simulation_id": simulation_id,
+                        "report_id": existing_task.metadata.get("report_id"),
+                        "report_type": report_type,
+                        "task_id": existing_task.task_id,
+                        "status": existing_task.status.value,
+                        "message": "报告生成任务已存在",
+                        "already_generated": False
                     }
                 })
         
@@ -110,21 +162,83 @@ def generate_report():
                 "error": "缺少模拟需求描述"
             }), 400
         
-        # 提前生成 report_id，以便立即返回给前端
-        import uuid
-        report_id = f"report_{uuid.uuid4().hex[:12]}"
-        
-        # 创建异步任务
-        task_manager = TaskManager()
-        task_id = task_manager.create_task(
-            task_type="report_generate",
-            metadata={
-                "simulation_id": simulation_id,
-                "graph_id": graph_id,
-                "report_id": report_id,
-                "report_type": report_type,
-            }
-        )
+        with _REPORT_GENERATE_LOCK:
+            if not force_regenerate:
+                existing_report = ReportManager.get_report_by_simulation(
+                    simulation_id,
+                    report_type=report_type,
+                )
+                if existing_report and existing_report.status in {
+                    ReportStatus.PENDING,
+                    ReportStatus.PLANNING,
+                    ReportStatus.GENERATING,
+                    ReportStatus.COMPLETED,
+                }:
+                    existing_task = task_manager.find_task_by_metadata(
+                        "report_generate",
+                        {
+                            "simulation_id": simulation_id,
+                            "report_type": report_type,
+                            "report_id": existing_report.report_id,
+                        },
+                        statuses=[TaskStatus.PENDING, TaskStatus.PROCESSING],
+                    )
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "simulation_id": simulation_id,
+                            "report_id": existing_report.report_id,
+                            "report_type": existing_report.report_type,
+                            "task_id": existing_task.task_id if existing_task else None,
+                            "status": existing_report.status.value,
+                            "message": "报告生成任务已存在" if existing_report.status != ReportStatus.COMPLETED else "报告已存在",
+                            "already_generated": existing_report.status == ReportStatus.COMPLETED
+                        }
+                    })
+
+                existing_task = task_manager.find_task_by_metadata(
+                    "report_generate",
+                    {
+                        "simulation_id": simulation_id,
+                        "report_type": report_type,
+                    },
+                    statuses=[TaskStatus.PENDING, TaskStatus.PROCESSING],
+                )
+                if existing_task:
+                    return jsonify({
+                        "success": True,
+                        "data": {
+                            "simulation_id": simulation_id,
+                            "report_id": existing_task.metadata.get("report_id"),
+                            "report_type": report_type,
+                            "task_id": existing_task.task_id,
+                            "status": existing_task.status.value,
+                            "message": "报告生成任务已存在",
+                            "already_generated": False
+                        }
+                    })
+
+            # 提前生成 report_id，以便立即返回给前端
+            import uuid
+            report_id = f"report_{uuid.uuid4().hex[:12]}"
+            task_id = task_manager.create_task(
+                task_type="report_generate",
+                metadata={
+                    "simulation_id": simulation_id,
+                    "graph_id": graph_id,
+                    "report_id": report_id,
+                    "report_type": report_type,
+                }
+            )
+            ReportManager.save_report(Report(
+                report_id=report_id,
+                simulation_id=simulation_id,
+                graph_id=graph_id,
+                simulation_requirement=simulation_requirement,
+                status=ReportStatus.PENDING,
+                report_type=report_type,
+                created_at=datetime.now().isoformat(),
+            ))
         
         # 定义后台任务
         def run_generate():
@@ -233,24 +347,57 @@ def get_generate_status():
         simulation_id = data.get('simulation_id')
         report_type = (data.get('report_type') or '').strip().lower() or None
         
-        # 如果提供了simulation_id，先检查是否已有完成的报告
+        task_manager = TaskManager()
+
+        # 如果提供了simulation_id，优先合并 report meta、progress.json 和内存任务状态，
+        # 避免只返回粗糙的 0/100 进度。
         if simulation_id:
+            existing_task = task_manager.find_task_by_metadata(
+                "report_generate",
+                {
+                    "simulation_id": simulation_id,
+                    **({"report_type": report_type} if report_type else {}),
+                },
+                statuses=[TaskStatus.PENDING, TaskStatus.PROCESSING],
+            )
             existing_report = ReportManager.get_report_by_simulation(
                 simulation_id,
                 report_type=report_type,
             )
-            if existing_report and existing_report.status == ReportStatus.COMPLETED:
+            if existing_report:
+                progress_data = ReportManager.get_progress(existing_report.report_id) or {}
+                task_dict = existing_task.to_dict() if existing_task else {}
+                progress = progress_data.get("progress")
+                if progress is None and task_dict:
+                    progress = task_dict.get("progress")
+                if progress is None:
+                    progress = 100 if existing_report.status == ReportStatus.COMPLETED else 0
+
+                status = progress_data.get("status") or task_dict.get("status") or existing_report.status.value
+                message = (
+                    progress_data.get("message")
+                    or task_dict.get("message")
+                    or existing_report.error
+                    or ("报告已生成" if existing_report.status == ReportStatus.COMPLETED else "报告生成中")
+                )
                 return jsonify({
                     "success": True,
                     "data": {
                         "simulation_id": simulation_id,
                         "report_id": existing_report.report_id,
                         "report_type": existing_report.report_type,
-                        "status": "completed",
-                        "progress": 100,
-                        "message": "报告已生成",
-                        "already_completed": True
+                        "status": status,
+                        "progress": progress,
+                        "message": message,
+                        "task_id": existing_task.task_id if existing_task else None,
+                        "already_completed": existing_report.status == ReportStatus.COMPLETED
                     }
+                })
+
+            if existing_task:
+                return jsonify({
+                    "success": True,
+                    "data": existing_task.to_dict()
                 })
         
         if not task_id:
@@ -258,8 +405,7 @@ def get_generate_status():
                 "success": False,
                 "error": "请提供 task_id 或 simulation_id"
             }), 400
-        
-        task_manager = TaskManager()
+
         task = task_manager.get_task(task_id)
         
         if not task:

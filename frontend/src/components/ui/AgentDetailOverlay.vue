@@ -11,14 +11,48 @@
           </div>
           <h2 class="overlay-name">{{ agent.name }}</h2>
           <span class="overlay-entity-type">{{ agent.entityType }}</span>
+          <span v-if="agent.affiliation" class="overlay-affiliation">{{ agent.affiliation }}</span>
+          <div class="overlay-meta-row">
+            <span v-if="agent.location" class="overlay-meta-chip">📍 {{ agent.location }}</span>
+            <span v-if="agent.yearsExperience" class="overlay-meta-chip">🎓 {{ agent.yearsExperience }} yrs experience</span>
+            <span v-if="agent.languages && agent.languages.length" class="overlay-meta-chip">🗣 {{ agent.languages.join(', ') }}</span>
+          </div>
           <div class="overlay-score-bar">
             <div class="score-fill" :style="{ width: `${(agent.qualificationScore || 0) * 100}%`, background: scoreColor }"></div>
           </div>
           <span class="overlay-score-label">{{ ((agent.qualificationScore || 0) * 100).toFixed(0) }}% qualified</span>
         </div>
 
+        <div v-if="agent.credentials" class="overlay-section">
+          <span class="cap-header">Credentials</span>
+          <p class="overlay-line">{{ agent.credentials }}</p>
+        </div>
+
+        <div v-if="agent.bio" class="overlay-section">
+          <span class="cap-header">Bio</span>
+          <p class="overlay-line">{{ agent.bio }}</p>
+        </div>
+
         <div class="overlay-section">
+          <span class="cap-header">Persona</span>
           <p class="overlay-persona">{{ agent.persona }}</p>
+        </div>
+
+        <div v-if="agent.signaturePerspective" class="overlay-section">
+          <span class="cap-header">Signature Perspective</span>
+          <p class="overlay-quote">“{{ agent.signaturePerspective }}”</p>
+        </div>
+
+        <div v-if="agent.communicationStyle" class="overlay-section">
+          <span class="cap-header">Communication Style</span>
+          <p class="overlay-line">{{ agent.communicationStyle }}</p>
+        </div>
+
+        <div v-if="agent.notableWork && agent.notableWork.length" class="overlay-section">
+          <span class="cap-header">Notable Work</span>
+          <ul class="overlay-list">
+            <li v-for="(w, i) in agent.notableWork" :key="i">{{ w }}</li>
+          </ul>
         </div>
 
         <div class="overlay-section">
@@ -224,8 +258,58 @@ onBeforeUnmount(() => {
   font-size: 14px;
   color: rgba(255, 255, 255, 0.8);
   line-height: 1.6;
-  margin: 0;
+  margin: 6px 0 0;
 }
+
+.overlay-affiliation {
+  display: block;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  margin-top: 2px;
+  font-style: italic;
+}
+
+.overlay-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  justify-content: center;
+}
+
+.overlay-meta-chip {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.overlay-line {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.78);
+  line-height: 1.55;
+  margin: 6px 0 0;
+}
+
+.overlay-quote {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.85);
+  line-height: 1.55;
+  margin: 6px 0 0;
+  font-style: italic;
+  border-left: 2px solid rgba(255, 255, 255, 0.3);
+  padding-left: 10px;
+}
+
+.overlay-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.overlay-list li { margin: 2px 0; }
 
 .overlay-role-badge {
   display: inline-block;

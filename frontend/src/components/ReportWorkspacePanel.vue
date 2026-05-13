@@ -50,6 +50,12 @@
                 <button @click="downloadAs('md')">.md</button>
               </div>
             </div>
+            <button
+              class="rb-btn talk-btn"
+              :disabled="!agentProfiles || agentProfiles.length === 0"
+              :title="agentProfiles && agentProfiles.length ? 'Open a POV chat with one of the experts' : 'Experts loading…'"
+              @click="showExpertChat = true"
+            >🎙 Talk to Expert</button>
             <button class="rb-btn" @click="showPaper = true">View Paper</button>
           </div>
         </div>
@@ -85,7 +91,25 @@
         :report-data="reportData"
         :loading="loading"
       />
+
     </template>
+
+    <!-- Floating Talk-to-Expert FAB (both modes) -->
+    <button
+      v-if="!showExpertChat && agentProfiles && agentProfiles.length > 0"
+      class="talk-fab"
+      type="button"
+      title="Open POV chat with one of the experts"
+      @click="showExpertChat = true"
+    >🎙 Talk to Expert</button>
+
+    <!-- Sliding Talk-to-Expert panel (both modes) -->
+    <ExpertChatPanel
+      :open="showExpertChat"
+      :simulation-id="simulationId"
+      :profiles="agentProfiles"
+      @close="showExpertChat = false"
+    />
   </div>
 </template>
 
@@ -97,6 +121,7 @@ import { getPaperReportBySimulation, getReport } from '../api/report'
 import { getSimulation } from '../api/simulation'
 import FullPaperModal from './FullPaperModal.vue'
 import HealthReportPanel from './HealthReportPanel.vue'
+import ExpertChatPanel from './ExpertChatPanel.vue'
 
 const props = defineProps({
   simulationId: {
@@ -118,6 +143,10 @@ const props = defineProps({
   simulationConfigMode: {
     type: String,
     default: ''
+  },
+  agentProfiles: {
+    type: Array,
+    default: () => []
   }
 })
 
@@ -126,6 +155,7 @@ const emit = defineEmits(['report-loaded'])
 const reportData = ref(null)
 const loading = ref(false)
 const showPaper = ref(false)
+const showExpertChat = ref(false)
 // Self-determined health mode — verified from simulation API, not relying solely on prop
 const resolvedHealthMode = ref(props.isHealthMode)
 const error = ref('')
@@ -327,7 +357,30 @@ onBeforeUnmount(() => {
   font-family: 'Space Grotesk', system-ui, sans-serif;
   display: flex;
   flex-direction: column;
+  position: relative; /* anchor for sliding ExpertChatPanel */
+  overflow: hidden;
 }
+
+.talk-btn { background: linear-gradient(90deg, #2563eb, #6366f1); color: #fff; border: 0; }
+.talk-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.talk-fab {
+  position: absolute;
+  bottom: 22px;
+  right: 22px;
+  z-index: 40;
+  padding: 12px 18px;
+  border-radius: 999px;
+  border: 0;
+  background: linear-gradient(135deg, #2563eb, #6366f1);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 8px 22px rgba(37, 99, 235, 0.35);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.talk-fab:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(37, 99, 235, 0.45); }
 
 /* ─── Loading / Error states ──────────────────── */
 .report-state {

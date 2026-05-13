@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
@@ -123,6 +125,38 @@ def _csi_dir(simulation_id: str) -> str:
         os.path.dirname(__file__), "..", "uploads", "simulations"
     )
     return os.path.join(base, simulation_id, "csi")
+
+
+def _resolve_csi_context(
+    simulation_id: Optional[str] = None,
+    csi_dir_path: Optional[str] = None,
+) -> Tuple[str, str]:
+    if csi_dir_path:
+        resolved_dir = os.path.abspath(csi_dir_path)
+        if os.path.basename(resolved_dir.rstrip(os.sep)) != "csi":
+            raise ValueError(f"Expected CSI folder path ending in 'csi', got: {csi_dir_path}")
+        resolved_simulation_id = simulation_id or os.path.basename(os.path.dirname(resolved_dir))
+        if not resolved_simulation_id:
+            raise ValueError(f"Unable to infer simulation_id from CSI folder: {csi_dir_path}")
+        return resolved_simulation_id, resolved_dir
+
+    if not simulation_id:
+        raise ValueError("Either simulation_id or csi_dir_path is required")
+
+    return simulation_id, _csi_dir(simulation_id)
+
+
+def _resolve_csi_path(
+    simulation_id: Optional[str] = None,
+    csi_folder_path: Optional[str] = None,
+    csi_dir_path: Optional[str] = None,
+) -> str:
+    """Resolve CSI folder path from explicit path or simulation id."""
+    _, resolved_path = _resolve_csi_context(
+        simulation_id=simulation_id,
+        csi_dir_path=csi_dir_path or csi_folder_path,
+    )
+    return resolved_path
 
 
 def _build_source_map(sources_index: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -331,12 +365,19 @@ def _build_bibliography(source_map: Dict[str, Dict[str, Any]]) -> List[Dict[str,
     return refs
 
 
-def generate_health_report(simulation_id: str) -> Dict[str, Any]:
+def generate_health_report(
+    simulation_id: Optional[str] = None,
+    csi_folder_path: Optional[str] = None,
+    csi_dir_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Main entry point. Reads all CSI artifacts for simulation_id and builds
     a comprehensive structured medical report with per-agent sections.
     """
-    csi_path = _csi_dir(simulation_id)
+    inferred_simulation_id, csi_path = _resolve_csi_context(
+        simulation_id=simulation_id,
+        csi_dir_path=csi_dir_path or csi_folder_path,
+    )
 
     claims = _read_jsonl(os.path.join(csi_path, "claims.jsonl"))
     reviews = _read_jsonl(os.path.join(csi_path, "reviews.jsonl"))
@@ -345,7 +386,75 @@ def generate_health_report(simulation_id: str) -> Dict[str, Any]:
     state = _load_json(os.path.join(csi_path, "state.json"))
 
     if not claims:
-        return {"status": "in_progress"}
+        return {
+            "status": "failed",
+            "error": (
+                "Health report generation failed: no CSI claims were found in bundle. "
+                "Re-run simulation or provide a valid CSI bundle path."
+            ),
+            "simulation_id": inferred_simulation_id,
+            "csi_folder_path": csi_path,
+            "csi_dir_path": csi_path,
+        }
+
+    # Use effective lifecycle snapshot for validated status accuracy.
+    # Deferred import avoids circular-import risk at module load time.
+    try:
+        from .simulation_csi_local import SimulationCSILocalStore  # noqa: PLC0415
+        _eff = SimulationCSILocalStore().get_effective_snapshot(inferred_simulation_id)
+        # Effective snapshot returns claims as dict{claim_id: claim}, convert to list
+        _eff_claims = _eff.get("claims", {})
+        if isinstance(_eff_claims, dict) and _eff_claims:
+            claims = list(_eff_claims.values())
+    except Exception:
+        pass  # use base claims as fallback
+
+    # Strict tier — fully validated claims only.
+    validated_claims = []
+    for claim in claims:
+        status = str(claim.get("status") or "").strip().lower()
+        try:
+            confidence = float(claim.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if status == "validated" and confidence >= 0.7:
+            validated_claims.append(claim)
+
+    soft_fail = False
+    if not validated_claims:
+        # Fallback tier — accept reviewed / verified / supported claims with any
+        # confidence, ranked by confidence desc, capped at top 25. Report is
+        # marked as preliminary so frontend / downstream readers know it did not
+        # pass strict EBM gates.
+        scored = []
+        for claim in claims:
+            status = str(claim.get("status") or "").strip().lower()
+            try:
+                confidence = float(claim.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            reviews_for_claim = list(claim.get("reviews") or [])
+            if status in {"validated", "verified", "supported", "revised", "under_review"} \
+               or reviews_for_claim or confidence > 0:
+                scored.append((confidence, claim))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        validated_claims = [c for _, c in scored[:25]]
+        soft_fail = bool(validated_claims)
+
+    if not validated_claims:
+        return {
+            "status": "failed",
+            "error": (
+                "Health report generation blocked: CSI bundle has zero usable claims."
+            ),
+            "simulation_id": inferred_simulation_id,
+            "csi_folder_path": csi_path,
+            "summary_stats": {
+                "total_claims": len(claims),
+                "validated_claims": 0,
+                "total_reviews": len(reviews),
+            },
+        }
 
     source_map = _build_source_map(sources_index)
 
@@ -480,7 +589,11 @@ def generate_health_report(simulation_id: str) -> Dict[str, Any]:
 
     return {
         "status": "completed",
-        "simulation_id": simulation_id,
+        "report_quality": "preliminary" if soft_fail else "validated",
+        "soft_fail": soft_fail,
+        "simulation_id": inferred_simulation_id,
+        "csi_folder_path": csi_path,
+        "csi_dir_path": csi_path,
         "case_query": case_query,
         "summary_stats": {
             "agents_count": agents_count,
@@ -504,4 +617,232 @@ def generate_health_report(simulation_id: str) -> Dict[str, Any]:
             "Always consult a qualified healthcare provider for medical decisions. "
             "All cited sources should be independently verified."
         ),
+    }
+
+
+def generate_health_report_from_csi_path(
+    csi_dir_path: str,
+    simulation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Offline-bundle wrapper for callers that already have a CSI folder path."""
+    return generate_health_report(
+        simulation_id=simulation_id,
+        csi_dir_path=csi_dir_path,
+    )
+
+
+def _to_health_markdown(assessment: Dict[str, Any]) -> str:
+    """Render structured assessment into markdown for ReportManager persistence."""
+    section_map = _to_health_sections(assessment)
+    lines: List[str] = []
+    lines.append("# Health CSI Report")
+    lines.append("")
+    for title, body in section_map:
+        lines.append(f"## {title}")
+        lines.append("")
+        lines.append(body)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _to_health_sections(assessment: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Render structured assessment into report sections."""
+    simulation_id = assessment.get("simulation_id", "")
+    case_query = (assessment.get("case_query") or "").strip()
+    stats = assessment.get("summary_stats", {}) or {}
+    differential = assessment.get("differential_diagnoses", []) or []
+    investigations = assessment.get("recommended_investigations", []) or []
+    management = assessment.get("management_plan", []) or []
+    safety = assessment.get("safety_alerts", []) or []
+    reasoning = (assessment.get("clinical_reasoning") or "").strip()
+    bibliography = assessment.get("bibliography", []) or []
+
+    overview_lines: List[str] = []
+    overview_lines.append(f"- Simulation ID: `{simulation_id}`")
+    if case_query:
+        overview_lines.append(f"- Case Query: {case_query}")
+    overview_lines.append(f"- Claims: {int(stats.get('total_claims', 0) or 0)}")
+    overview_lines.append(f"- Reviews: {int(stats.get('total_reviews', 0) or 0)}")
+    overview_lines.append(f"- Rounds: {int(stats.get('total_rounds', 0) or 0)}")
+
+    differential_lines: List[str] = []
+    if differential:
+        for idx, item in enumerate(differential, start=1):
+            differential_lines.append(f"{idx}. {str(item)}")
+    else:
+        differential_lines.append("No differential diagnosis output available.")
+
+    investigation_lines: List[str] = []
+    if investigations:
+        for inv in investigations:
+            investigation_lines.append(f"- {inv}")
+    else:
+        investigation_lines.append("No recommended investigations available.")
+
+    management_lines: List[str] = []
+    if management:
+        for step in management:
+            management_lines.append(f"- {step}")
+    else:
+        management_lines.append("No management plan available.")
+
+    safety_lines: List[str] = []
+    if safety:
+        for alert in safety:
+            safety_lines.append(f"- {alert}")
+    else:
+        safety_lines.append("No safety alerts identified.")
+
+    bibliography_lines: List[str] = []
+    if bibliography:
+        for ref in bibliography:
+            title = ref.get("title") or ref.get("url") or "Untitled"
+            url = ref.get("url") or ""
+            tier = ref.get("tier") or "tier3"
+            bibliography_lines.append(f"- [{tier}] {title}: {url}")
+    else:
+        bibliography_lines.append("No bibliography available.")
+
+    sections: List[Tuple[str, str]] = [
+        ("Overview", "\n".join(overview_lines)),
+        ("Clinical Reasoning", reasoning or "No synthesized clinical reasoning available."),
+        ("Differential Diagnosis", "\n".join(differential_lines)),
+        ("Recommended Investigations", "\n".join(investigation_lines)),
+        ("Management Plan", "\n".join(management_lines)),
+        ("Safety Alerts", "\n".join(safety_lines)),
+        ("Evidence Trail", "\n".join(bibliography_lines)),
+    ]
+    disclaimer = assessment.get("disclaimer")
+    if disclaimer:
+        sections.append(("Disclaimer", str(disclaimer)))
+    return sections
+
+
+def trigger_health_report_generation(
+    simulation_id: Optional[str] = None,
+    simulation_requirement: str = "",
+    csi_dir_path: Optional[str] = None,
+    graph_id: str = "",
+) -> Dict[str, Any]:
+    """Canonical health report trigger.
+
+    Generates a persisted report from either a simulation id or an explicit CSI bundle path.
+    """
+    from .simulation_manager import SimulationManager
+    from ..models.project import ProjectManager
+    from .report_agent import Report, ReportManager, ReportStatus, ReportOutline, ReportSection
+
+    resolved_simulation_id, resolved_csi_dir = _resolve_csi_context(
+        simulation_id=simulation_id,
+        csi_dir_path=csi_dir_path,
+    )
+
+    existing = ReportManager.get_report_by_simulation(resolved_simulation_id, report_type="health")
+    if existing and existing.status != ReportStatus.FAILED:
+        return {
+            "status": "skipped",
+            "reason": "existing_report",
+            "report_id": existing.report_id,
+        }
+
+    sim_state = SimulationManager().get_simulation(resolved_simulation_id) if resolved_simulation_id else None
+    project = ProjectManager.get_project(sim_state.project_id) if sim_state else None
+    resolved_graph_id = graph_id or (sim_state.graph_id if sim_state else "") or (project.graph_id if project else "") or ""
+    requirement = (
+        simulation_requirement
+        or (sim_state.simulation_requirement if sim_state else "")
+        or (project.simulation_requirement if project else "")
+        or ""
+    )
+
+    report = Report(
+        report_id=f"report_{uuid.uuid4().hex[:12]}",
+        simulation_id=resolved_simulation_id,
+        graph_id=resolved_graph_id,
+        simulation_requirement=requirement,
+        status=ReportStatus.PENDING,
+        report_type="health",
+        created_at=datetime.now().isoformat(),
+        completed_at="",
+        error=None,
+        markdown_content="",
+    )
+    ReportManager._ensure_report_folder(report.report_id)
+    ReportManager.save_report(report)
+    ReportManager.update_progress(
+        report.report_id,
+        "pending",
+        0,
+        "Initializing health report from CSI artifacts...",
+        completed_sections=[],
+    )
+
+    assessment = generate_health_report(
+        simulation_id=resolved_simulation_id,
+        csi_dir_path=resolved_csi_dir,
+    )
+    if assessment.get("status") != "completed":
+        report.status = ReportStatus.FAILED
+        report.completed_at = datetime.now().isoformat()
+        report.error = str(assessment.get("error") or "Health report generation failed from CSI artifacts.")
+        ReportManager.save_report(report)
+        ReportManager.update_progress(
+            report.report_id,
+            "failed",
+            0,
+            report.error,
+            completed_sections=[],
+        )
+        return {
+            "status": "failed",
+            "error": report.error,
+            "report_id": report.report_id,
+        }
+
+    markdown = _to_health_markdown(assessment)
+    section_pairs = _to_health_sections(assessment)
+    outline = ReportOutline(
+        title="Health CSI Report",
+        summary=(assessment.get("case_query") or "Structured report generated from CSI health artifacts."),
+        sections=[ReportSection(title=title, content="") for title, _ in section_pairs],
+    )
+    report.status = ReportStatus.COMPLETED
+    report.completed_at = datetime.now().isoformat()
+    report.markdown_content = markdown
+    report.outline = outline
+    report.golden_trail = {
+        "source_count": len(assessment.get("bibliography", []) or []),
+        "csi_dir_path": resolved_csi_dir,
+        "source_mode": "offline_bundle" if csi_dir_path else "simulation",
+    }
+    ReportManager.save_report(report)
+    ReportManager.save_outline(report.report_id, outline)
+    completed_sections: List[str] = []
+    total_sections = max(len(section_pairs), 1)
+    for idx, (title, body) in enumerate(section_pairs, start=1):
+        ReportManager.save_section(
+            report.report_id,
+            idx,
+            ReportSection(title=title, content=body),
+        )
+        completed_sections.append(title)
+        progress = 20 + int((idx / total_sections) * 70)
+        ReportManager.update_progress(
+            report.report_id,
+            "generating",
+            progress,
+            f"Saved section {idx}/{len(section_pairs)}: {title}",
+            completed_sections=completed_sections,
+        )
+    ReportManager.update_progress(
+        report.report_id,
+        "completed",
+        100,
+        "Health report generated successfully",
+        completed_sections=completed_sections,
+    )
+    return {
+        "status": "completed",
+        "report_id": report.report_id,
+        "summary_stats": assessment.get("summary_stats", {}),
     }

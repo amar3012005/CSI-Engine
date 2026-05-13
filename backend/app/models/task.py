@@ -97,6 +97,27 @@ class TaskManager:
             self._tasks[task_id] = task
         
         return task_id
+
+    def find_task_by_metadata(
+        self,
+        task_type: str,
+        metadata_match: Dict[str, Any],
+        statuses: Optional[list[TaskStatus]] = None
+    ) -> Optional[Task]:
+        """Find the newest task matching a metadata subset."""
+        allowed_statuses = set(statuses or [])
+        with self._task_lock:
+            matches = []
+            for task in self._tasks.values():
+                if task.task_type != task_type:
+                    continue
+                if allowed_statuses and task.status not in allowed_statuses:
+                    continue
+                if all(task.metadata.get(key) == value for key, value in metadata_match.items()):
+                    matches.append(task)
+            if not matches:
+                return None
+            return sorted(matches, key=lambda item: item.created_at, reverse=True)[0]
     
     def get_task(self, task_id: str) -> Optional[Task]:
         """获取任务"""
@@ -157,6 +178,7 @@ class TaskManager:
         self.update_task(
             task_id,
             status=TaskStatus.FAILED,
+            progress=0,
             message="任务失败",
             error=error
         )
@@ -181,4 +203,3 @@ class TaskManager:
             ]
             for tid in old_ids:
                 del self._tasks[tid]
-

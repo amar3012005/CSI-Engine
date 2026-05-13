@@ -490,7 +490,7 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - failed: 运行失败（但准备是完成的）
         prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
-            if config_mode in {"deepresearch", "csi", "web_research"} and not csi_artifacts_ready:
+            if config_mode in {"deepresearch", "csi", "web_research", "health"} and not csi_artifacts_ready:
                 return False, {
                     "reason": "CSI 种子证据尚未准备完成",
                     "status": status,
@@ -624,9 +624,27 @@ def prepare_simulation():
         # 检查是否强制重新生成
         force_regenerate = data.get('force_regenerate', False)
         logger.info(f"开始处理 /prepare 请求: simulation_id={simulation_id}, force_regenerate={force_regenerate}")
+        task_manager = TaskManager()
         
         # 检查是否已经准备完成（避免重复生成）
         if not force_regenerate:
+            existing_prepare_task = task_manager.find_task_by_metadata(
+                "simulation_prepare",
+                {"simulation_id": simulation_id},
+                statuses=[TaskStatus.PENDING, TaskStatus.PROCESSING],
+            )
+            if existing_prepare_task:
+                return jsonify({
+                    "success": True,
+                    "data": {
+                        "simulation_id": simulation_id,
+                        "task_id": existing_prepare_task.task_id,
+                        "status": existing_prepare_task.status.value,
+                        "message": "准备任务已存在，请通过 /api/simulation/prepare/status 查询进度",
+                        "already_prepared": False
+                    }
+                })
+
             logger.debug(f"检查模拟 {simulation_id} 是否已准备完成...")
             is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
             logger.debug(f"检查结果: is_prepared={is_prepared}, prepare_info={prepare_info}")
@@ -747,8 +765,6 @@ def prepare_simulation():
                 logger.warning(f"同步获取实体数量失败（将在后台任务中重试）: {e}")
                 # 失败不影响后续流程，后台任务会重新获取
         
-        # 创建异步任务
-        task_manager = TaskManager()
         task_id = task_manager.create_task(
             task_type="simulation_prepare",
             metadata={
@@ -1891,6 +1907,21 @@ def get_local_csi_graph(simulation_id: str):
         }), 500
 
 
+@simulation_bp.route('/<simulation_id>/csi/blackboard', methods=['GET'])
+def get_simulation_blackboard(simulation_id: str):
+    """Get the current full blackboard snapshot including tasks and queues."""
+    try:
+        store = _get_csi_store()
+        snapshot = store.refresh_blackboard_state(simulation_id)
+        
+        return jsonify({
+            "success": True,
+            "data": snapshot
+        }), 200
+    except Exception as e:
+        logger.error(f"获取Blackboard快照失败: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 @simulation_bp.route('/<simulation_id>/csi/artifacts', methods=['GET'])
 def get_local_csi_artifacts(simulation_id: str):
     """Get one artifact collection from the simulation-scoped local CSI store."""
@@ -1903,15 +1934,18 @@ def get_local_csi_artifacts(simulation_id: str):
             }), 404
 
         artifact_type = (request.args.get("type") or "claims").strip().lower()
-        snapshot = store.get_snapshot(simulation_id)
+        snapshot = store.refresh_blackboard_state(simulation_id)
+        
+        # New Blackboard Read Model Mapping
         mapping = {
-            "claims": snapshot.get("claims", []),
-            "trials": snapshot.get("trials", []),
-            "relations": snapshot.get("relations", []),
-            "sources": snapshot.get("sources_index", {}).get("sources", []),
-            "recalls": snapshot.get("recalls", []),
-            "agent_actions": snapshot.get("agent_actions", []),
+            "claims": list(snapshot.get("claims", {}).values()),
+            "reviews": list(snapshot.get("reviews", {}).values()),
+            "tasks": list(snapshot.get("tasks", {}).values()),
+            "contradictions": list(snapshot.get("contradictions", {}).values()),
+            "sources": list(snapshot.get("sources", {}).values()),
+            "trials": snapshot.get("trials", []), # Backward compatibility
         }
+        
         if artifact_type not in mapping:
             return jsonify({
                 "success": False,
@@ -1998,19 +2032,39 @@ def run_local_csi_rounds(simulation_id: str):
             project = ProjectManager.get_project(state.project_id)
             simulation_requirement = (project.simulation_requirement if project else "") or ""
 
+        # Transitioning to task-driven loop governed by CSIPolicy
+        from ..services.csi_research_engine import CSIBlackboardScheduler
+        from ..services.csi_policy import build_csi_policy
+        
+        sim_config = manager.get_simulation_config(simulation_id) or {}
+        config_mode = sim_config.get("config", {}).get("config_mode", "deepresearch")
+        if config_mode == "social": config_mode = "deepresearch"
+
+        policy = build_csi_policy(config_mode)
         store = _get_csi_store()
-        result = store.run_local_rounds(
-            simulation_id=simulation_id,
-            simulation_requirement=simulation_requirement,
-            rounds=rounds,
-            preferred_target_agent_id=preferred_target_agent_id,
-        )
+        scheduler = CSIBlackboardScheduler(simulation_id, policy, store)
+        
+        # Run cycles instead of rounds
+        progress = False
+        for cycle in range(rounds):
+            if scheduler.run_cycle(state.csi_rounds + cycle + 1):
+                progress = True
+            else:
+                break
+        
         state.csi_initialized = True
         state.csi_artifacts_ready = True
-        state.csi_rounds = result.get("state", {}).get("round_count", state.csi_rounds)
+        state.csi_rounds += (cycle + 1)
         manager._save_simulation_state(state)
+        
+        # Return current blackboard snapshot as result
+        result = store.refresh_blackboard_state(simulation_id)
 
-        return jsonify({"success": True, "data": result}), 200
+        return jsonify({"success": True, "data": {
+            "simulation_id": simulation_id,
+            "state": result,
+            "progress_made": progress
+        }}), 200
     except Exception as e:
         logger.error(f"运行本地CSI轮次失败: {str(e)}")
         return jsonify({
@@ -3630,6 +3684,15 @@ def get_health_report(simulation_id: str):
     try:
         from ..services.health_report_generator import generate_health_report
 
+        csi_folder_path = (request.args.get("csi_folder_path") or "").strip() or None
+        if csi_folder_path:
+            assessment = generate_health_report(
+                simulation_id=simulation_id or None,
+                csi_folder_path=csi_folder_path,
+            )
+            http_status = 200 if assessment.get("status") == "completed" else 400
+            return jsonify(assessment), http_status
+
         manager = SimulationManager()
         sim = manager.get_simulation(simulation_id)
         if not sim:
@@ -3638,9 +3701,43 @@ def get_health_report(simulation_id: str):
         if sim.config_mode != 'health':
             return jsonify({'error': 'Not a health mode simulation'}), 400
 
-        assessment = generate_health_report(simulation_id)
-        return jsonify(assessment), 200
+        assessment = generate_health_report(simulation_id=simulation_id)
+        http_status = 200 if assessment.get("status") == "completed" else 400
+        return jsonify(assessment), http_status
 
     except Exception as exc:
         logger.error(f"Health report error for {simulation_id}: {exc}")
         return jsonify({'error': str(exc)}), 500
+
+
+@simulation_bp.route('/<simulation_id>/expert-chat/<agent_id>/intro', methods=['GET'])
+def expert_chat_intro(simulation_id: str, agent_id: str):
+    """Return the expert agent's opening summary for a 'Talk to Expert' session."""
+    try:
+        from ..services.expert_chat_service import generate_intro
+        result = generate_intro(simulation_id, agent_id)
+        return jsonify({"success": True, "data": result}), 200
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    except Exception as exc:
+        logger.error(f"Expert intro error for sim={simulation_id}, agent={agent_id}: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@simulation_bp.route('/<simulation_id>/expert-chat/<agent_id>', methods=['POST'])
+def expert_chat_message(simulation_id: str, agent_id: str):
+    """Continue a Talk to Expert chat. Body: {message: str, history: [{role,content}, ...]}."""
+    try:
+        from ..services.expert_chat_service import chat as expert_chat
+        body = request.get_json(silent=True) or {}
+        user_message = (body.get("message") or "").strip()
+        if not user_message:
+            return jsonify({"success": False, "error": "Empty message"}), 400
+        history = body.get("history") or []
+        result = expert_chat(simulation_id, agent_id, user_message, history)
+        return jsonify({"success": True, "data": result}), 200
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    except Exception as exc:
+        logger.error(f"Expert chat error for sim={simulation_id}, agent={agent_id}: {exc}")
+        return jsonify({"success": False, "error": str(exc)}), 500

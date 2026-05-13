@@ -28,7 +28,7 @@
 
           <!-- Input card -->
           <div v-if="!showConfirmCard" key="input" class="input-wrap">
-            <div class="chat-card" :class="{ focused: isFocused, 'health-card': isHealthMode }">
+            <div class="chat-card" :class="{ focused: isFocused, 'health-card': isHealthMode, 'deep-card': isDeepMode }">
               <!-- Mode pills row inside card top -->
               <div class="card-modes">
                 <button
@@ -39,7 +39,7 @@
                   @click="selectedMode = mode.key"
                 >
                   <span class="mode-icon">{{ mode.icon }}</span>
-                  {{ mode.label }}
+                  <span class="mode-label-text">{{ mode.label }}</span>
                 </button>
               </div>
 
@@ -136,12 +136,14 @@
             :visible="true"
             :query="formData.simulationRequirement"
             :loading="loading"
-            :title="isHealthMode ? 'Medical Assessment' : 'Cognitive Swarm Intelligence'"
-            :icon="isHealthMode ? '🩺' : '⊡'"
+            :title="isHealthMode ? 'Medical Assessment' : (isDeepMode ? 'Deep Research' : 'Cognitive Swarm Intelligence')"
+            :icon="isHealthMode ? '🩺' : (isDeepMode ? '⊡' : '🔬')"
             :stats="isHealthMode
               ? [{ value: '9', label: 'Specialists' }, { value: 'Health', label: 'Mode' }, { value: 'EBM', label: 'Evidence' }]
-              : [{ value: '8', label: 'Agents' }, { value: 'CSI', label: 'Mode' }, { value: 'Deep', label: 'Research' }]"
-            :continueLabel="isHealthMode ? 'Start Assessment' : 'Continue'"
+              : (isDeepMode 
+                  ? [{ value: '12', label: 'Sources' }, { value: 'Deep', label: 'Mode' }, { value: 'Auto', label: 'Agent' }]
+                  : [{ value: '8', label: 'Agents' }, { value: 'CSI', label: 'Mode' }, { value: 'Deep', label: 'Research' }])"
+            :continueLabel="isHealthMode ? 'Start Assessment' : (isDeepMode ? 'Launch Research' : 'Continue')"
             @back="showConfirmCard = false"
             @continue="startSimulation"
           />
@@ -179,14 +181,16 @@ const selectedMode = ref('web_research')
 const MODES = [
   { key: 'web_research', label: 'Research', icon: '🔬' },
   { key: 'health',       label: 'Health',   icon: '🩺' },
+  { key: 'deepresearch', label: 'Deep',     icon: '⊡' },
 ]
 const isHealthMode = computed(() => selectedMode.value === 'health')
+const isDeepMode = computed(() => selectedMode.value === 'deepresearch')
 
-const chatPlaceholder = computed(() =>
-  isHealthMode.value
-    ? 'Describe the patient case — chief complaint, history, symptoms...'
-    : 'Type / for search modes and shortcuts'
-)
+const chatPlaceholder = computed(() => {
+  if (isHealthMode.value) return 'Describe the patient case — chief complaint, history, symptoms...'
+  if (isDeepMode.value) return 'Enter a complex topic for autonomous deep research...'
+  return 'Type / for search modes and shortcuts'
+})
 
 // Suggestion cards
 const researchCards = ref([
@@ -198,9 +202,9 @@ const researchCards = ref([
   },
   {
     icon: '🖥️', bg: 'linear-gradient(135deg, #f3f4f6, #e5e7eb)',
-    title: 'Start Deep Research',
-    desc: 'Research works on any topic: market analysis, technical deep dives, competitive intelligence.',
-    query: 'Synthesize the latest research on transformer-alternative architectures'
+    title: 'Market Analysis',
+    desc: 'Get a comprehensive view of any industry or market vertical.',
+    query: 'Current state of the global hydrogen fuel cell vehicle market'
   },
 ])
 
@@ -219,10 +223,26 @@ const healthCards = ref([
   },
 ])
 
+const deepCards = ref([
+  {
+    icon: '⊡', bg: 'linear-gradient(135deg, #e0e7ff, #c7d2fe)',
+    title: 'Technical Deep Dive',
+    desc: 'Exhaustive exploration of complex technical systems and architectures.',
+    query: 'Synthesize the latest research on transformer-alternative architectures (Mamba, RWKV, etc.)'
+  },
+  {
+    icon: '📊', bg: 'linear-gradient(135deg, #fef3c7, #fde68a)',
+    title: 'Competitive Intelligence',
+    desc: 'Map out the landscape of any product or service category.',
+    query: 'Comparative analysis of the top 5 vector database engines for high-scale RAG'
+  },
+])
+
 const dismissedCards = ref([])
 const currentCards = computed(() => {
-  const cards = isHealthMode.value ? healthCards.value : researchCards.value
-  return cards.filter((_, i) => !dismissedCards.value.includes(`${selectedMode.value}-${i}`))
+  if (isHealthMode.value) return healthCards.value.filter((_, i) => !dismissedCards.value.includes(`health-${i}`))
+  if (isDeepMode.value) return deepCards.value.filter((_, i) => !dismissedCards.value.includes(`deepresearch-${i}`))
+  return researchCards.value.filter((_, i) => !dismissedCards.value.includes(`web_research-${i}`))
 })
 
 const dismissCard = (i) => dismissedCards.value.push(`${selectedMode.value}-${i}`)
@@ -413,36 +433,41 @@ onMounted(async () => {
 }
 .chat-card.health-card.focused {
   border-color: #6ee7b7;
-  box-shadow: 0 4px 20px rgba(16,185,129,0.1);
+  box-shadow: 0 4px 20px rgba(16,185,129,0.12);
+}
+.chat-card.deep-card.focused {
+  border-color: #818cf8;
+  box-shadow: 0 4px 20px rgba(99,102,241,0.12);
 }
 
 /* Mode pills row */
 .card-modes {
   display: flex;
-  gap: 6px;
-  padding: 10px 12px 0;
+  gap: 8px;
+  padding: 12px 14px 4px;
 }
 
 .mode-pill {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 11px 3px 8px;
-  border: 1px solid #e0ddd8;
-  border-radius: 20px;
-  background: transparent;
-  font-size: 12px;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: #f7f6f3;
+  font-size: 13px;
   font-weight: 500;
   color: #6b6862;
   cursor: pointer;
   font-family: inherit;
-  transition: all 0.12s;
-  line-height: 1.5;
+  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  line-height: 1;
 }
-.mode-pill:hover { border-color: #b8b5af; color: #1a1a1a; background: #f5f4f1; }
-.mode-pill.active { background: #1a1a1a; border-color: #1a1a1a; color: #fff; }
-.mode-pill.mode-health.active { background: #064e3b; border-color: #064e3b; }
-.mode-icon { font-size: 12px; line-height: 1; }
+.mode-pill:hover { background: #efece6; color: #1a1a1a; }
+.mode-pill.active { background: #1a1a1a; color: #fff; }
+.mode-pill.active.mode-health { background: #059669; }
+.mode-pill.active.mode-deepresearch { background: #4f46e5; }
+.mode-icon { font-size: 14px; }
 
 /* Textarea */
 .card-body { padding: 10px 14px 8px; }

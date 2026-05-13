@@ -117,6 +117,7 @@
             :reportStarted="reportStarted"
             :isHealthMode="isHealthMode"
             :simulationConfigMode="simulationData?.config_mode"
+            :agentProfiles="agentProfiles"
             @report-loaded="handleReportLoaded"
           />
         </div>
@@ -417,6 +418,14 @@ const normalizeProfiles = (rawProfiles) => {
       peerActions: profile.peer_actions || [],
       challengeTargets: profile.challenge_targets || [],
       qualificationScore: profile.qualification_score || 0,
+      credentials: profile.credentials || '',
+      affiliation: profile.affiliation || '',
+      yearsExperience: profile.years_experience || 0,
+      notableWork: profile.notable_work || [],
+      signaturePerspective: profile.signature_perspective || '',
+      communicationStyle: profile.communication_style || '',
+      location: profile.location || '',
+      languages: profile.languages || [],
       avatarPath: getAvatarUrl(index),
       initials: String(name)
         .split(/\s+/)

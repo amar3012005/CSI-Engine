@@ -5,6 +5,10 @@ LLM客户端封装
 
 import json
 import re
+import random
+import threading
+import time
+import ast
 from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
@@ -17,6 +21,8 @@ logger = get_logger("mirofish.llm_client")
 
 class LLMClient:
     """LLM客户端"""
+    _model_semaphores: Dict[str, threading.Semaphore] = {}
+    _semaphore_lock = threading.Lock()
     
     def __init__(
         self,
@@ -37,6 +43,54 @@ class LLMClient:
             api_key=self.api_key,
             base_url=self.base_url
         )
+
+    @classmethod
+    def _get_model_semaphore(cls, model: str) -> threading.Semaphore:
+        key = model or "default"
+        with cls._semaphore_lock:
+            if key not in cls._model_semaphores:
+                cls._model_semaphores[key] = threading.Semaphore(2)
+            return cls._model_semaphores[key]
+
+    def _create_completion_with_retry(self, kwargs: Dict[str, Any]):
+        delay = 2.0
+        semaphore = self._get_model_semaphore(self.model)
+        with semaphore:
+            for attempt in range(6):
+                try:
+                    return self.client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    error_str = str(e)
+                    is_rate_limit = (
+                        "rate_limit_exceeded" in error_str
+                        or "Rate limit" in error_str
+                        or "429" in error_str
+                    )
+                    if not is_rate_limit or attempt >= 5:
+                        raise
+
+                    retry_after = None
+                    body = getattr(e, "body", None)
+                    if isinstance(body, dict):
+                        message = str(body.get("message") or body.get("error", {}).get("message") or "")
+                    else:
+                        message = error_str
+                    match = re.search(r"try again in\s+([0-9.]+)s", message, re.IGNORECASE)
+                    if match:
+                        try:
+                            retry_after = float(match.group(1))
+                        except ValueError:
+                            retry_after = None
+
+                    wait = max(retry_after or 0, delay) + random.uniform(0, 0.5)
+                    logger.warning(
+                        "LLM rate limited for model %s; retrying in %.1fs (%d/5)",
+                        self.model,
+                        wait,
+                        attempt + 1,
+                    )
+                    time.sleep(wait)
+                    delay = min(delay * 2, 30.0)
     
     def chat(
         self,
@@ -132,7 +186,7 @@ class LLMClient:
             kwargs["response_format"] = response_format
 
         try:
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._create_completion_with_retry(kwargs)
         except Exception as e:
             error_str = str(e)
             # Handle models that don't support tool calling by retrying without tools
@@ -143,12 +197,12 @@ class LLMClient:
                 # Also remove search_settings if they were triggering tool use
                 if "extra_body" in kwargs and "search_settings" in kwargs["extra_body"]:
                     kwargs["extra_body"].pop("search_settings")
-                response = self.client.chat.completions.create(**kwargs)
+                response = self._create_completion_with_retry(kwargs)
             # Some providers/models reject response_format=json_object.
             elif response_format:
                 logger.warning(f"LLM JSON模式失败，回退普通文本解析: {e}")
                 kwargs.pop("response_format", None)
-                response = self.client.chat.completions.create(**kwargs)
+                response = self._create_completion_with_retry(kwargs)
             elif any(sig in error_str for sig in ("tool_use_failed", "output_parse_failed", "failed_generation")) or "tool_choice" in error_str.lower():
                 # Groq / some providers reject when model generates a native tool
                 # call but no tools are registered in the request.  The error body
@@ -186,14 +240,28 @@ class LLMClient:
                     try:
                         parsed = _json.loads(failed_gen)
                         if isinstance(parsed, dict):
-                            inner_args = parsed.get("arguments", {})
-                            if isinstance(inner_args, dict) and "name" in inner_args:
-                                real_name = inner_args["name"]
-                                real_params = inner_args.get("parameters", {})
-                                failed_gen = _json.dumps({
-                                    "name": real_name,
-                                    "parameters": real_params,
-                                }, ensure_ascii=False)
+                            cur = parsed
+                            # Peel common provider wrappers:
+                            # {name, arguments:{name, parameters:{...}}}
+                            # {name, arguments:{name, arguments:{...}}}
+                            for _ in range(4):
+                                args = cur.get("arguments")
+                                if isinstance(args, dict) and "name" in args:
+                                    cur = args
+                                    continue
+                                break
+                            if isinstance(cur, dict) and "name" in cur:
+                                real_name = cur.get("name")
+                                real_params = cur.get("parameters")
+                                if real_params is None and isinstance(cur.get("arguments"), dict):
+                                    # Some models nest parameters under "arguments"
+                                    real_params = cur.get("arguments")
+                                if not isinstance(real_params, dict):
+                                    real_params = {}
+                                failed_gen = _json.dumps(
+                                    {"name": real_name, "parameters": real_params},
+                                    ensure_ascii=False,
+                                )
                     except (_json.JSONDecodeError, TypeError):
                         pass
                     # Wrap as XML tool_call so the report agent parser can pick it up
@@ -232,6 +300,72 @@ class LLMClient:
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content
+
+    def chat_with_tools(
+        self,
+        messages: List[Dict[str, str]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> Dict[str, Any]:
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+
+        if "gpt-oss" in (self.model or ""):
+            kwargs["max_completion_tokens"] = max_tokens
+            kwargs["extra_body"] = {"include_reasoning": False}
+            kwargs["temperature"] = max(0.0, min(temperature, 0.7))
+        else:
+            kwargs["temperature"] = temperature
+            kwargs["max_tokens"] = max_tokens
+
+        try:
+            response = self._create_completion_with_retry(kwargs)
+        except Exception as e:
+            error_str = str(e)
+            if "tool calling" in error_str.lower() or "tools" in error_str.lower():
+                logger.warning("Tool calling unavailable for model %s; falling back to text protocol.", self.model)
+                return {
+                    "content": self.chat(messages=messages, temperature=temperature, max_tokens=max_tokens),
+                    "tool_calls": [],
+                }
+            raise
+
+        usage = getattr(response, "usage", None)
+        if usage and self.usage_scope:
+            TokenUsageTracker.record_usage(
+                self.usage_scope,
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+                model=self.model,
+                source="llm_client_tools",
+            )
+
+        message = response.choices[0].message
+        parsed_tool_calls = []
+        for tool_call in getattr(message, "tool_calls", None) or []:
+            function = getattr(tool_call, "function", None)
+            if not function:
+                continue
+            arguments = getattr(function, "arguments", "") or "{}"
+            try:
+                parameters = json.loads(arguments)
+            except json.JSONDecodeError:
+                parameters = {}
+            parsed_tool_calls.append({
+                "id": getattr(tool_call, "id", ""),
+                "name": getattr(function, "name", ""),
+                "parameters": parameters,
+            })
+
+        content = getattr(message, "content", None) or ""
+        content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
+        return {"content": content, "tool_calls": parsed_tool_calls}
     
     def chat_json(
         self,
@@ -262,14 +396,69 @@ class LLMClient:
         cleaned_response = re.sub(r'\n?```\s*$', '', cleaned_response)
         cleaned_response = cleaned_response.strip()
 
-        try:
-            return json.loads(cleaned_response)
-        except json.JSONDecodeError:
-            # 兜底：尝试提取首个JSON对象
-            match = re.search(r'\{[\s\S]*\}', cleaned_response)
+        def _strip_to_json_blob(text: str) -> str:
+            """Extract a likely JSON blob from a mixed response."""
+            text = (text or "").strip()
+            if not text:
+                return ""
+            first_obj = text.find("{")
+            first_arr = text.find("[")
+            if first_obj == -1 and first_arr == -1:
+                return text
+            start = min([i for i in (first_obj, first_arr) if i != -1])
+            end_obj = text.rfind("}")
+            end_arr = text.rfind("]")
+            end = max(end_obj, end_arr)
+            if end != -1 and end > start:
+                return text[start : end + 1].strip()
+            return text[start:].strip()
+
+        def _repair_common_json(text: str) -> str:
+            # Remove trailing commas before } or ]
+            text = re.sub(r",\s*([}\]])", r"\1", text)
+            # Remove JS-style // comments
+            text = re.sub(r"//[^\n]*", "", text)
+            # Normalize smart quotes
+            text = (
+                text.replace("\u201c", "\"")
+                .replace("\u201d", "\"")
+                .replace("\u2018", "'")
+                .replace("\u2019", "'")
+            )
+            # Remove leading BOM / control chars
+            text = re.sub(r"^[\ufeff\000-\010\013\014\016-\037]+", "", text)
+            return text.strip()
+
+        def _lenient_loads(text: str) -> Dict[str, Any]:
+            blob = _repair_common_json(_strip_to_json_blob(text))
+            if not blob:
+                raise ValueError("LLM returned empty response")
+
+            # 1) Strict JSON
+            try:
+                parsed = json.loads(blob)
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"data": parsed}
+            except Exception:
+                pass
+
+            # 2) Try extracting the first {...} block
+            match = re.search(r"\{[\s\S]*\}", blob)
             if match:
+                candidate = _repair_common_json(match.group(0))
                 try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    pass
-            raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
+                    return json.loads(candidate)
+                except Exception:
+                    blob = candidate
+
+            # 3) Python literal fallback (single quotes, etc.)
+            lit = ast.literal_eval(blob)
+            if isinstance(lit, dict):
+                return lit
+            return {"data": lit}
+
+        try:
+            return _lenient_loads(cleaned_response)
+        except Exception as exc:
+            raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}") from exc

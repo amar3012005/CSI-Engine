@@ -147,6 +147,15 @@ class ResearchAgent:
     challenge_targets: List[str] = field(default_factory=list)
     skills: List[str] = field(default_factory=list)
     qualification_score: float = 0.0
+    # Rich persona fields — drive the "round table of experts" UI
+    credentials: str = ""              # e.g. "PhD, International Relations (Yale)"
+    affiliation: str = ""              # e.g. "Senior Fellow, Brookings Institution"
+    years_experience: int = 0          # realistic non-zero integer
+    notable_work: List[str] = field(default_factory=list)  # 2-3 publications / projects
+    signature_perspective: str = ""    # 1 sentence stance for THIS query
+    communication_style: str = ""      # 1 sentence on tone, quirks
+    location: str = ""                 # city / region — e.g. "Tehran, Iran"
+    languages: List[str] = field(default_factory=list)  # spoken languages
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -195,11 +204,31 @@ competencies and can investigate the query rigorously.
 2. At least 2 agents must have SEARCH_WEB in their world_actions.
 3. At least 2 agents must hold genuinely **opposing perspectives** on the query \
    (built-in intellectual tension — identify which agents oppose each other).
-4. Each agent gets a realistic name, a 2-3 sentence bio, and a detailed persona.
+4. Each agent gets a realistic full name (first + last), a 3-4 sentence bio, and a \
+   detailed persona. Names must reflect plausible cultural / regional diversity \
+   relevant to the query (e.g. for a US–Iran question, include Iranian, American, \
+   and at least one third-country name).
 5. Assign a `qualification_score` (0.0-1.0) reflecting how well each agent \
    matches their role for THIS specific query.
-6. Assign domain-specific `skills` (3-5 per agent).
+6. Assign domain-specific `skills` (4-6 per agent).
 7. The `responsibility` field must be specific to THIS query — not generic.
+8. Each agent must read like a real human at a round table:
+   - `credentials`: real-sounding degree + institution (e.g. "PhD International \
+     Relations, Johns Hopkins SAIS").
+   - `affiliation`: current role + institution (e.g. "Senior Fellow, Carnegie \
+     Endowment for International Peace"). Mix think tanks, universities, news \
+     outlets, government advisors, NGOs.
+   - `years_experience`: integer between 6 and 35.
+   - `notable_work`: 2-3 short titles of papers / books / projects / postings \
+     (plausible, not generic). Use realistic publication names.
+   - `signature_perspective`: ONE sentence describing this expert's distinctive \
+     stance on THIS specific query.
+   - `communication_style`: ONE sentence on how they speak (e.g. "Speaks in \
+     measured paragraphs, cites primary sources, avoids speculation.").
+   - `location`: city + country.
+   - `languages`: 1-3 spoken languages.
+9. No two agents may share the same affiliation or country of focus. Make the \
+   panel feel like a real expert roundtable across institutions and viewpoints.
 
 ## Output Format — strict JSON
 
@@ -210,16 +239,24 @@ Return a JSON object with exactly this schema:
       "agent_id": <int starting from 1>,
       "agent_name": "<full realistic name>",
       "entity_name": "<same as agent_name>",
-      "entity_type": "<professional title, e.g. 'AI Researcher'>",
-      "bio": "<2-3 sentence bio>",
-      "persona": "<detailed persona: background, beliefs, communication style, biases>",
+      "entity_type": "<professional title, e.g. 'Senior Middle East Analyst'>",
+      "bio": "<3-4 sentence bio with concrete career arc>",
+      "persona": "<detailed persona: upbringing, intellectual lineage, beliefs, biases, what makes them tick>",
       "research_role": "<one of the 6 required or 2 optional roles>",
       "responsibility": "<specific responsibility for THIS query>",
       "evidence_priority": "<e.g. technical_correctness, market_data, peer_reviewed, counter_evidence, source_diversity, clarity, coherence, methodological_rigor>",
+      "credentials": "<degree + institution, e.g. 'PhD Political Science, Stanford'>",
+      "affiliation": "<current role + institution>",
+      "years_experience": 17,
+      "notable_work": ["<paper or book title>", "<paper or report title>", "<project or column>"],
+      "signature_perspective": "<one sentence stance on THIS query>",
+      "communication_style": "<one sentence on tone and tics>",
+      "location": "<city, country>",
+      "languages": ["English", "Farsi"],
       "world_actions": ["SEARCH_WEB", "READ_URL"],
       "peer_actions": ["PROPOSE_CLAIM", "CHALLENGE_CLAIM"],
       "challenge_targets": ["<roles this agent challenges>"],
-      "skills": ["skill1", "skill2", "skill3"],
+      "skills": ["skill1", "skill2", "skill3", "skill4"],
       "qualification_score": 0.85
     }}
   ],
@@ -291,11 +328,25 @@ Example values: "diagnostic_accuracy_A", "pharmacological_safety_B", \
 1. All 6 required clinical roles must be filled before adding specialists.
 2. At least 4 agents must hold `"SEARCH_WEB"` in their world_actions.
 3. At least 2 opposing_pairs must be identified (clinical tension between roles).
-4. Each agent gets a realistic name, 2-3 sentence bio, and a detailed clinical \
-   persona including board certifications or specialisation details.
+4. Each agent gets a realistic full name (first + last), a 3-4 sentence bio, and \
+   a detailed clinical persona including board certifications or sub-specialty \
+   training. Mix of cultural backgrounds and institutions.
 5. Assign a `qualification_score` (0.0-1.0) reflecting expertise fit for THIS query.
-6. Assign domain-specific `skills` (3-5 per agent, medical terminology preferred).
+6. Assign domain-specific `skills` (4-6 per agent, medical terminology preferred).
 7. The `responsibility` field must be specific to THIS health query.
+8. Each agent must read like a real clinician at a multidisciplinary tumour \
+   board / case conference:
+   - `credentials`: e.g. "MD, Harvard Medical School; Board-certified, Internal \
+     Medicine and Cardiology".
+   - `affiliation`: current institution, e.g. "Director of Cardiac Imaging, \
+     Cleveland Clinic". Mix academic, private practice, public health.
+   - `years_experience`: integer between 6 and 35.
+   - `notable_work`: 2-3 plausible publications or guideline contributions.
+   - `signature_perspective`: ONE sentence stance on THIS query.
+   - `communication_style`: ONE sentence (e.g. "Direct, prefers checklists, \
+     pushes for the highest level of evidence before recommending action.").
+   - `location`: city + country.
+   - `languages`: 1-3 spoken languages.
 
 ## Output Format — strict JSON
 
@@ -307,17 +358,25 @@ Return a JSON object with exactly this schema:
       "agent_name": "<full realistic name, e.g. 'Dr. Sarah Chen'>",
       "entity_name": "<same as agent_name>",
       "entity_type": "<professional title, e.g. 'Board-Certified Cardiologist'>",
-      "bio": "<2-3 sentence clinical bio>",
-      "persona": "<detailed persona: specialisation, clinical philosophy, \
+      "bio": "<3-4 sentence clinical bio>",
+      "persona": "<detailed persona: training pathway, clinical philosophy, \
 communication style, known biases>",
       "research_role": "<one of the 6 required roles or a dynamic specialist>",
       "responsibility": "<specific clinical responsibility for THIS query>",
       "evidence_priority": "<e.g. clinical_evidence_A, diagnostic_accuracy_B, \
 pharmacological_safety_A, patient_safety_C>",
+      "credentials": "<degree + board certifications>",
+      "affiliation": "<current institutional role>",
+      "years_experience": 14,
+      "notable_work": ["<paper title>", "<guideline contribution>", "<trial or fellowship>"],
+      "signature_perspective": "<one sentence stance>",
+      "communication_style": "<one sentence>",
+      "location": "<city, country>",
+      "languages": ["English"],
       "world_actions": ["SEARCH_WEB"],
       "peer_actions": ["PROPOSE_CLAIM", "CHALLENGE_CLAIM"],
       "challenge_targets": ["<roles this agent challenges>"],
-      "skills": ["skill1", "skill2", "skill3"],
+      "skills": ["skill1", "skill2", "skill3", "skill4"],
       "qualification_score": 0.90
     }}
   ],
@@ -424,8 +483,8 @@ class ResearchTeamGenerator:
             {"role": "user", "content": prompt},
         ]
 
-        from ..utils.llm_client import json as _json
         import re as _re
+        import ast as _ast
 
         def _repair_json(text: str) -> str:
             """Fix common LLM JSON errors before parsing."""
@@ -449,20 +508,36 @@ class ResearchTeamGenerator:
             match = _re.search(r'\{[\s\S]*\}', cleaned)
             blob = match.group(0) if match else cleaned
             try:
-                return _json.loads(blob)
-            except (_json.JSONDecodeError, ValueError):
+                return json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
                 repaired = _repair_json(blob)
-                return _json.loads(repaired)
+                try:
+                    return json.loads(repaired)
+                except (json.JSONDecodeError, ValueError):
+                    # Very common failure mode: single quotes / python-ish dict.
+                    parsed = _ast.literal_eval(repaired)
+                    if isinstance(parsed, dict):
+                        return parsed
+                    return {"data": parsed}
 
         last_exc: Exception = RuntimeError("No attempts made")
         for attempt in range(3):
             try:
-                raw_text = self.llm.chat(
-                    messages=messages,
-                    temperature=0.4 + attempt * 0.1,
-                    max_tokens=6144,
-                )
-                return _try_parse(raw_text)
+                # Prefer JSON mode when available; LLMClient already falls back
+                # to text if the provider rejects response_format.
+                try:
+                    return self.llm.chat_json(
+                        messages=messages,
+                        temperature=0.4 + attempt * 0.1,
+                        max_tokens=6144,
+                    )
+                except Exception:
+                    raw_text = self.llm.chat(
+                        messages=messages,
+                        temperature=0.4 + attempt * 0.1,
+                        max_tokens=6144,
+                    )
+                    return _try_parse(raw_text)
             except Exception as exc:
                 last_exc = exc
                 logger.warning(
@@ -498,6 +573,14 @@ class ResearchTeamGenerator:
                     challenge_targets=entry.get("challenge_targets", []),
                     skills=entry.get("skills", []),
                     qualification_score=float(entry.get("qualification_score", 0.5)),
+                    credentials=str(entry.get("credentials", "") or ""),
+                    affiliation=str(entry.get("affiliation", "") or ""),
+                    years_experience=int(entry.get("years_experience", 0) or 0),
+                    notable_work=list(entry.get("notable_work", []) or []),
+                    signature_perspective=str(entry.get("signature_perspective", "") or ""),
+                    communication_style=str(entry.get("communication_style", "") or ""),
+                    location=str(entry.get("location", "") or ""),
+                    languages=list(entry.get("languages", []) or []),
                 )
                 agents.append(agent)
             except (TypeError, ValueError):

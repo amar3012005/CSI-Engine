@@ -71,71 +71,158 @@ class ActionResult:
     @property
     def trace_id(self) -> str:
         return self.payload.get("trace_id", str(uuid.uuid4()))
+
 class AgentHarness:
     """
     Unified agent action execution layer.
-    Owns routing, budgeting, validation, and telemetry.
+    Enforces policies, task-backed execution, and role contracts.
     """
 
     def __init__(
         self,
         simulation_id: str,
-        llm_client: LLMClient,
-        budget: Optional[ActionBudget] = None,
-        store: Optional[Any] = None,
+        policy: Any, # CSIPolicy
+        store: Any,
         web_client: Optional[Any] = None,
-        config_mode: str = 'web_research',
+        llm_client: Optional[LLMClient] = None,
+        config_mode: str = "web_research"
     ):
         self.simulation_id = simulation_id
-        self.llm = llm_client
-        self.budget = budget or ActionBudget()
+        self.policy = policy
         self.store = store
         self.web_client = web_client
+        self.llm = llm_client
         self.config_mode = config_mode
-        
-        # Model mapping
-        self.MODEL_SEARCH = "groq/compound"
-        self.MODEL_REASONING = "gpt-oss-20b" # Default for most actions
+        self.budget_usage = {} # agent_id -> {search_count, token_count}
 
-    def execute(
-        self,
-        action_type: Union[ActionType, str],
-        agent: Dict[str, Any],
-        payload: Dict[str, Any],
-        round_num: int = 1
-    ) -> ActionResult:
-        """EntryPoint for all agent actions."""
-        if isinstance(action_type, str):
-            try:
-                action_type = ActionType(action_type)
-            except ValueError:
-                return ActionResult(ActionType.SYNTHESIZE, str(agent.get("agent_id")), "failed", error=f"Unknown action type: {action_type}")
+    def execute(self, *args, **kwargs) -> ActionResult:
+        """Execute either the new task-backed call shape or the legacy engine call shape."""
+        legacy_mode = "agent" in kwargs or "payload" in kwargs
 
-        # 1. Budget check
-        if self.budget.current_tokens_sim >= self.budget.max_tokens_per_simulation:
-            return ActionResult(action_type, str(agent.get("agent_id")), "budget_exceeded", error="Simulation token budget exceeded")
+        if legacy_mode:
+            agent = kwargs.get("agent") or {}
+            action_type = kwargs.get("action_type", ActionType.PROPOSE_CLAIM)
+            payload = dict(kwargs.get("payload") or {})
+            round_num = int(kwargs.get("round_num", 0) or 0)
+            agent_id = str(agent.get("agent_id") or "agent_0")
+            task = {"status": "running", **payload}
+        else:
+            agent_id = str(args[0]) if len(args) > 0 else str(kwargs.get("agent_id") or "agent_0")
+            action_type = args[1] if len(args) > 1 else kwargs.get("action_type", ActionType.PROPOSE_CLAIM)
+            task = dict(args[2]) if len(args) > 2 and isinstance(args[2], dict) else dict(kwargs.get("task") or {})
+            round_num = int(args[3]) if len(args) > 3 else int(kwargs.get("round_num", 0) or 0)
+            agent = dict(task.get("agent") or {})
+            agent.setdefault("agent_id", agent_id)
 
-        # 2. Routing & Model Selection
-        target_model = self.MODEL_REASONING
-        if action_type == ActionType.SEARCH_WEB:
-            target_model = self.MODEL_SEARCH
+        normalized_action = self._normalize_action_name(action_type)
+        result_type = self._coerce_action_type(action_type)
 
-        # 3. Action Execution Dispatch
+        role_contract = self._resolve_role_contract(agent, normalized_action)
+        if role_contract and normalized_action not in role_contract.allowed_actions:
+            return ActionResult(
+                result_type,
+                agent_id,
+                "failed",
+                error=f"Action {normalized_action} not allowed for role {role_contract.role_id}",
+            )
+
+        if not legacy_mode and (not task or task.get("status") != "running"):
+            return ActionResult(
+                result_type,
+                agent_id,
+                "failed",
+                error="Execution attempt without running task",
+            )
+
+        if normalized_action in {"SEARCH_EVIDENCE", "SEARCH_WEB"}:
+            usage = self.budget_usage.get(agent_id, {"search_count": 0})
+            if self.policy and usage["search_count"] >= self.policy.search.max_search_per_task:
+                return ActionResult(result_type, agent_id, "failed", error="Search limit exceeded for task")
+            usage["search_count"] += 1
+            self.budget_usage[agent_id] = usage
+
         try:
-            handler = self._get_handler(action_type)
-            result = handler(agent, payload, round_num, target_model)
-            
-            # 4. Telemetry Update
-            self._update_budgets(result)
-            
-            # 5. Record action if store is available
-            if self.store and hasattr(self.store, "record_agent_action"):
-                self._record_telemetry(agent, result, round_num)
-                
-            return result
+            return self._dispatch(agent, normalized_action, task, round_num)
         except Exception as e:
-            logger.exception(f"Action {action_type} failed for agent {agent.get('agent_id')}")
-            return ActionResult(action_type, str(agent.get("agent_id")), "failed", error=str(e))
+            logger.exception(f"Harness execution failed: {e}")
+            return ActionResult(result_type, agent_id, "failed", error=str(e))
+
+    def _dispatch(self, agent: Dict[str, Any], action_type: str, task: Dict[str, Any], round_num: int) -> ActionResult:
+        """Dispatches to actual tool handlers with result validation."""
+        agent_data = {"agent_id": str(agent.get("agent_id") or "agent_0"), **agent}
+        model = "gpt-4o" # default
+
+        # 1. Dispatch
+        if action_type in {"SEARCH_EVIDENCE", "SEARCH_WEB"}:
+            # Pass to health-aware search if in health mode
+            result = self._handle_search_web(agent_data, task, round_num, model)
+        else:
+            # Carry action type into the payload so downstream parsing can be action-aware.
+            enriched = dict(task or {})
+            enriched.setdefault("action_type", action_type)
+            result = self._handle_reasoning_action(agent_data, enriched, round_num, model)
+
+        # 2. VALIDATE RESULTS (Health Providence Enforcement)
+        if result.success and self.policy and self.policy.mode == "health":
+            if action_type == "SEARCH_EVIDENCE" :
+                # Filter results by allowed domains
+                allowed = set(self.policy.provenance.allowed_domains)
+                raw_results = result.payload.get("search_results", [])
+                filtered = [
+                    res for res in raw_results 
+                    if any(domain in res.get("url", "") for domain in allowed)
+                ]
+                
+                if not filtered and raw_results:
+                    result.status = "failed"
+                    result.error = "All search results violated clinical domain policy."
+                else:
+                    result.payload["search_results"] = filtered
+                    
+        return result
+
+    @staticmethod
+    def _normalize_action_name(action_type: Union[str, ActionType]) -> str:
+        if isinstance(action_type, ActionType):
+            return action_type.value
+        return str(action_type or "").upper()
+
+    @staticmethod
+    def _coerce_action_type(action_type: Union[str, ActionType]) -> ActionType:
+        if isinstance(action_type, ActionType):
+            return action_type
+        normalized = str(action_type or "").upper()
+        if normalized in ActionType.__members__:
+            return ActionType[normalized]
+        for member in ActionType:
+            if member.value == normalized:
+                return member
+        return ActionType.PROPOSE_CLAIM
+
+    def _resolve_role_contract(self, agent: Dict[str, Any], action_type: str):
+        if not self.policy:
+            return None
+
+        policy_roles = self.policy.roles or {}
+        candidate_keys = []
+        for raw_value in (
+            agent.get("research_role"),
+            agent.get("role"),
+            agent.get("profession"),
+        ):
+            value = str(raw_value or "").strip().lower().replace(" ", "_").replace("-", "_")
+            if value:
+                candidate_keys.append(value)
+
+        for key in candidate_keys:
+            if key in policy_roles:
+                return policy_roles[key]
+
+        for contract in policy_roles.values():
+            if action_type in contract.allowed_actions:
+                return contract
+
+        return None
 
     def _get_handler(self, action_type: ActionType) -> Callable:
         handlers = {
@@ -213,8 +300,11 @@ class AgentHarness:
             # Record tokens using the tracker (which should be updated by llm.chat)
             tokens = {"prompt": 0, "completion": 0, "total": 0}
             
-            # Extraction logic (migrated from engine)
-            extracted_data = self._parse_response(response_text)
+            # Extraction logic (action-aware best-effort parse).
+            extracted_data = self._parse_response(
+                response_text,
+                action_type=str(payload.get("action_type") or ""),
+            )
             
             # Handle SEARCH_WEB intent even when the provider returns a rejected tool-call payload.
             upper_response = response_text.upper()
@@ -276,16 +366,84 @@ class AgentHarness:
         
         return None
 
-    def _parse_response(self, text: str) -> Dict[str, Any]:
-        """Unified parser for agent responses."""
-        # Simple JSON extraction as baseline
-        match = re.search(r'\{[\s\S]*\}', text)
+    def _parse_response(self, text: str, action_type: str = "") -> Dict[str, Any]:
+        """Best-effort parser for agent responses.
+
+        Many models will drift from strict JSON even when prompted. For CSI we
+        still want to persist a usable claim/verdict rather than dropping work.
+        """
+        raw = (text or "").strip()
+
+        # 1) JSON extraction (if present)
+        match = re.search(r"\{[\s\S]*\}", raw)
         if match:
+            blob = match.group(0)
             try:
-                return json.loads(match.group(0))
-            except:
+                parsed = json.loads(blob)
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"data": parsed, "raw": raw}
+            except Exception:
                 pass
-        return {"raw": text}
+
+        upper_action = (action_type or "").upper().strip()
+
+        def _extract_confidence(s: str) -> Optional[float]:
+            m = re.search(r"(?:confidence|conf)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)%?", s, re.IGNORECASE)
+            if not m:
+                return None
+            try:
+                val = float(m.group(1))
+            except ValueError:
+                return None
+            if val > 1.0:
+                val = val / 100.0 if val <= 100.0 else 1.0
+            return max(0.0, min(val, 1.0))
+
+        def _first_paragraph(s: str) -> str:
+            parts = [p.strip() for p in re.split(r"\n\s*\n", s) if p.strip()]
+            return parts[0] if parts else s.strip()
+
+        # 2) Claim-like actions: extract a claim string and optional confidence.
+        if upper_action in {"PROPOSE_CLAIM", "SYNTHESIZE", "DRAFT_REPORT"}:
+            claim = ""
+            for pat in (
+                r"^\s*CLAIM\s*:\s*(.+)$",
+                r"^\s*FINAL\s+ANSWER\s*:\s*(.+)$",
+            ):
+                m = re.search(pat, raw, re.IGNORECASE | re.MULTILINE)
+                if m:
+                    claim = m.group(1).strip()
+                    break
+            if not claim:
+                claim = _first_paragraph(raw)
+            claim = re.sub(r"^\s*[-*\d\.\)\]]+\s*", "", claim).strip()
+            conf = _extract_confidence(raw)
+            out: Dict[str, Any] = {"claim": claim, "raw": raw}
+            if conf is not None:
+                out["confidence"] = conf
+            return out
+
+        # 3) Verification/review-like actions: extract verdict + rationale.
+        if upper_action in {"VERIFY_CLAIM", "CHALLENGE_CLAIM", "REVISE_CLAIM"}:
+            verdict = None
+            m = re.search(r"VERDICT\s*:\s*(supports|contradicts|needs_revision)", raw, re.IGNORECASE)
+            if m:
+                verdict = m.group(1).lower()
+            else:
+                lowered = raw.lower()
+                # Heuristic: pick the strongest explicit label if present.
+                for v in ("contradicts", "supports", "needs_revision"):
+                    if re.search(rf"\b{v}\b", lowered):
+                        verdict = v
+                        break
+            conf = _extract_confidence(raw)
+            out = {"verdict": verdict or "needs_revision", "raw": raw}
+            if conf is not None:
+                out["confidence"] = conf
+            return out
+
+        return {"raw": raw}
 
     def _update_budgets(self, result: ActionResult):
         self.budget.current_tokens_sim += result.tokens.get("total", 0)

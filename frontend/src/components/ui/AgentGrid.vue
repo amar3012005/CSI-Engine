@@ -15,6 +15,7 @@
         </div>
         <span class="grid-agent-name">{{ agent.name }}</span>
         <span class="grid-agent-type">{{ agent.entityType }}</span>
+        <span v-if="agent.affiliation" class="grid-agent-affil">{{ agent.affiliation }}</span>
         <div class="grid-score-bar">
           <div
             class="grid-score-fill"
@@ -140,6 +141,18 @@ const scoreColor = (score) => {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 100%;
+}
+
+.grid-agent-affil {
+  font-size: 10px;
+  color: #999;
+  text-align: center;
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  margin-top: 2px;
 }
 
 .grid-score-bar {

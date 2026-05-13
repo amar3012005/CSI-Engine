@@ -13,6 +13,7 @@ import re
 import json
 import uuid
 import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,8 +23,137 @@ from ..utils.logger import get_logger
 from ..services.text_processor import TextProcessor
 from .agent_harness import AgentHarness, ActionType, ActionResult
 from .csi_schema import VALID_VERDICTS, relation_type_for_verdict
+from .csi_policy import CSIPolicy, CSIMode, build_csi_policy, WorkflowType
+from .simulation_csi_local import SimulationCSILocalStore
+
+# NOTE: Post-review lifecycle recalculation is delegated to csi_quality.
+# After each peer-review round, recompute_claim_quality() is called to update
+# claim confidence and status deterministically.  The import is deferred inside
+# the call-site (try/except block) so that this engine never hard-depends on
+# csi_quality at module load time.
 
 logger = get_logger("mirofish.csi_research_engine")
+
+class CSIBlackboardScheduler:
+    """Engine driving work from persisted blackboard tasks."""
+    
+    def __init__(self, simulation_id: str, policy: CSIPolicy, store: SimulationCSILocalStore):
+        self.simulation_id = simulation_id
+        self.policy = policy
+        self.store = store
+        
+        # Initialize LLM client for the harness
+        llm_client = LLMClient(usage_scope=f"csi_{simulation_id}")
+        
+        # Initialize web client
+        from .web_search_client import WebSearchClient
+        web_client = WebSearchClient(api_key=Config.TAVILY_API_KEY)
+        
+        self.harness = AgentHarness(
+            simulation_id=simulation_id, 
+            policy=policy, 
+            store=store,
+            llm_client=llm_client,
+            web_client=web_client,
+            config_mode=policy.mode
+        )
+
+    def run_cycle(self, round_num: int, agent_pool: List[str] = None) -> bool:
+        """Execute one scheduling cycle. Returns True if progress was made."""
+        snapshot = self.store.build_blackboard_snapshot(self.simulation_id)
+        tasks = self._derive_tasks(snapshot, round_num)
+        
+        if not tasks:
+            logger.info(f"[{self.simulation_id}] No runnable tasks remain.")
+            # Check stop gates here
+            return False
+
+        # Sort by priority
+        tasks.sort(key=lambda x: x.get("priority", 0), reverse=True)
+        
+        # Determine available agents
+        pool = agent_pool or ["agent_0"]
+        
+        progress = False
+        # Parallel execution of tasks per round caps
+        with ThreadPoolExecutor(max_workers=min(5, len(pool))) as executor:
+            futures = []
+            for i, task in enumerate(tasks[:10]): # Cap concurrent tasks
+                agent_id = pool[i % len(pool)]
+                futures.append(executor.submit(self._execute_task, task, snapshot, round_num, agent_id))
+            
+            for future in as_completed(futures):
+                if future.result():
+                    progress = True
+                
+        return progress
+
+    def _derive_tasks(self, snapshot: Dict[str, Any], round_num: int) -> List[Dict[str, Any]]:
+        tasks = []
+        
+        # 1. Contradiction Resolution (Priority 100)
+        for cid, contra in snapshot["contradictions"].items():
+            if contra["status"] == "open":
+                tasks.append(self._create_task("RESOLVE_CONTRADICTION", contra, priority=100))
+
+        # 2. Claim Reviews (Priority 80)
+        for cid, claim in snapshot["claims"].items():
+            if claim["status"] == "proposed" or claim["status"] == "under_review":
+                # Check reviews coverage
+                reviews = claim.get("reviews", [])
+                needed = self.policy.reviews.min_reviews_per_claim - len(reviews)
+                if needed > 0:
+                    tasks.append(self._create_task("REVIEW_CLAIM", claim, priority=80))
+
+        # 3. New Proposals (Priority 50)
+        if len(snapshot["claims"]) < self.policy.gates.min_claims_for_synthesis:
+            tasks.append(self._create_task("PROPOSE_CLAIM", {}, priority=50))
+
+        # Deduplicate tasks already in snapshot tasks as 'pending' or 'running'
+        pending_entity_ids = {
+            t["entity_id"] for t in snapshot["tasks"].values() 
+            if t["status"] in ["pending", "running"]
+        }
+        
+        return [t for t in tasks if t["entity_id"] not in pending_entity_ids]
+
+    def _create_task(self, task_type: str, entity: Dict[str, Any], priority: int) -> Dict[str, Any]:
+        return {
+            "task_id": str(uuid.uuid4()),
+            "task_type": task_type,
+            "priority": priority,
+            "entity_id": entity.get("id") or entity.get("event_id") or entity.get("claim_id") or "new",
+            "status": "pending",
+            "created_at": datetime.now().isoformat()
+        }
+
+    def _execute_task(self, task: Dict[str, Any], snapshot: Dict[str, Any], round_num: int, agent_id: str) -> bool:
+        # Implementation of task execution through harness
+        roles_allowed = [
+            rid for rid, r in self.policy.roles.items()
+            if task["task_type"] in r.allowed_actions
+        ]
+        
+        if not roles_allowed:
+            return False
+
+        # pick first valid role
+        # We record the task start
+        self.store.log_event(self.simulation_id, "TASK_UPDATED", {
+            "entity_id": task["task_id"],
+            "status": "running",
+            "agent_id": agent_id
+        }, round_num)
+
+        result = self.harness.execute(agent_id, task["task_type"], task, round_num)
+        
+        self.store.log_event(self.simulation_id, "TASK_UPDATED", {
+            "entity_id": task["task_id"],
+            "status": "completed" if result.success else "failed",
+            "result": result.data if result.success else result.error
+        }, round_num)
+        
+        return result.success
 
 # ---------------------------------------------------------------------------
 # Dataclass-like typed dicts for clarity
@@ -152,7 +282,7 @@ def _build_propose_messages(
         "{\n"
         '  "action": "propose_claim",\n'
         '  "claim": "Your specific finding (2-4 sentences, matching your profession\'s tone)",\n'
-        '  "confidence": 0.95,\n'
+        '  "confidence": 0.5,\n'
         '  "evidence": "Which specific sources support this"\n'
         "}\n\n"
         "Action 2 (SEARCH_WEB):\n"
@@ -462,6 +592,11 @@ class CSIResearchEngine:
         self._trials: List[Dict[str, Any]] = []
         self._unpublished_findings: List[Dict[str, Any]] = [] # For findings before finalized claims
         self._unique_sources_cited: set[str] = set()
+        # Track per-source citation count to enforce diversity quota.
+        from collections import Counter as _Counter
+        self._source_citation_counts: _Counter = _Counter()
+        # Hard cap: a single source may back at most this many claims across the whole sim.
+        self._max_citations_per_source: int = 5
 
         # Concurrency locks for shared state mutations
         self._claims_lock = threading.Lock()
@@ -1115,8 +1250,11 @@ class CSIResearchEngine:
         if not self._is_valid_claim_text(claim_text):
             return None
 
-        confidence = result.data.get("confidence", 0.5)
-        
+        # Discard LLM-stated confidence — it consistently picks round numbers
+        # (0.7, 0.85, 0.92) lifted from prompt examples. Initialise to 0 and
+        # let recompute_claim_quality calibrate from actual evidence below.
+        confidence = 0.0
+
         claim_record = self.store.record_claim(self.simulation_id, {
             "agent_id": agent.get("agent_id"),
             "agent_name": agent.get("agent_name"),
@@ -1157,9 +1295,27 @@ class CSIResearchEngine:
                 "to_id": sid,
             })
 
+        # Initial quality calibration: override LLM-hallucinated confidence with evidence-based score
+        try:
+            from .csi_quality import recompute_claim_quality
+            calibrated = recompute_claim_quality(
+                store=self.store,
+                simulation_id=self.simulation_id,
+                claim_id=claim_record.get("claim_id"),
+                policy=self.policy,
+            )
+            if calibrated:
+                claim_record["confidence"] = float(calibrated.get("new_confidence", 0.0))
+                claim_record["status"] = calibrated.get("new_status", "proposed")
+        except Exception as _qe:
+            logger.debug("Initial claim quality calibration skipped: %s", _qe)
+
         with self._claims_lock:
             self._claims.append(claim_record)
             self._unique_sources_cited.update(s for s in source_ids if s)
+            for s in source_ids:
+                if s:
+                    self._source_citation_counts[s] += 1
         return claim_record
 
     def _run_peer_review_phase(
@@ -1266,6 +1422,18 @@ class CSIResearchEngine:
 
         with self._trials_lock:
             self._trials.append(trial_record)
+
+        # Post-review: recompute claim quality deterministically
+        try:
+            from .csi_quality import recompute_claim_quality
+            recompute_claim_quality(
+                store=self.store,
+                simulation_id=self.simulation_id,
+                claim_id=claim.get("claim_id"),
+                policy=self.policy,
+            )
+        except Exception as _qe:
+            logger.debug("Quality recomputation skipped: %s", _qe)
 
         relation_type = relation_type_for_verdict(verdict)
         self.store.record_relation(self.simulation_id, {
@@ -1422,7 +1590,8 @@ class CSIResearchEngine:
         # Extract synthesized data
         # Use full raw output for synthesis — JSON output should not be truncated
         claim_text = result.data.get("claim", result.raw)
-        confidence = result.data.get("confidence", result.data.get("confidence_score", 0.7))
+        # Synth confidence also discarded — calibrated from evidence after record.
+        confidence = 0.0
 
         # Normalize and validate the synthesized claim
         synth_text = self._normalize_claim_text(claim_text)
@@ -1486,6 +1655,9 @@ class CSIResearchEngine:
         with self._claims_lock:
             self._claims.append(synth_record)
             self._unique_sources_cited.update(s for s in all_source_ids if s)
+            for s in all_source_ids:
+                if s:
+                    self._source_citation_counts[s] += 1
         return synth_record
 
     # ------------------------------------------------------------------
@@ -2186,15 +2358,24 @@ class CSIResearchEngine:
                 # Non-web sources pass through
                 validated_sources.append(src)
         
-        # Rank by enhanced scoring
-        # Penalty for already cited sources to encourage exploration of all chunks
+        # Rank by enhanced scoring with diversity enforcement.
+        cap = getattr(self, "_max_citations_per_source", 5)
+        usage = getattr(self, "_source_citation_counts", None)
+
+        # Hard cap: drop sources that have already been cited >= cap times.
+        if usage is not None:
+            capped_pool = [s for s in validated_sources if usage.get(s.get("source_id"), 0) < cap]
+            # If the cap empties the pool (very small bundle), fall back to full pool.
+            if capped_pool:
+                validated_sources = capped_pool
+
         def _score_with_novelty(s: Dict[str, Any]) -> float:
             base = self._score_source(s, query_terms)
             sid = s.get("source_id")
-            # If this source id has been used in self._unique_sources_cited, apply a slight penalty
-            # so other agents look at the 'tail' of the research pool.
-            if sid in self._unique_sources_cited:
-                base *= 0.4  # Significant penalty to force novelty
+            used = usage.get(sid, 0) if usage is not None else (1 if sid in self._unique_sources_cited else 0)
+            # Steep diminishing returns per additional citation: 1, 0.4, 0.16, 0.064...
+            if used > 0:
+                base *= max(0.05, 0.4 ** used)
             if blackboard_context:
                 contradicted_source_ids = blackboard_context.get("contradicted_source_ids") or set()
                 supported_source_ids = blackboard_context.get("supported_source_ids") or set()
@@ -2212,7 +2393,7 @@ class CSIResearchEngine:
             key=_score_with_novelty,
             reverse=True,
         )
-        
+
         selected = ranked[:max(1, limit)]
         logger.debug(
             "Selected %d/%d sources for investigation (avg score: %.2f)",

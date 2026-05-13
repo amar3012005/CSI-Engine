@@ -72,9 +72,9 @@ def main():
     # 获取运行配置
     host = os.environ.get('FLASK_HOST', '0.0.0.0')
     try:
-        port = int(os.environ.get('FLASK_PORT', 5001))
+        port = int(os.environ.get('FLASK_PORT', 5000))
     except (ValueError, TypeError):
-        port = 5001
+        port = 5000
         
     debug = Config.DEBUG
 

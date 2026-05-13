@@ -1864,11 +1864,30 @@ class ZepToolsService:
         min_confidence: float = 0.0,
         agent_name: Optional[str] = None,
         limit: int = 20,
+        effective_only: bool = True,
     ) -> str:
-        """Query claims from CSI store, optionally filtered by status/confidence/agent."""
+        """Query claims from CSI store, optionally filtered by status/confidence/agent.
+
+        Args:
+            effective_only: When True (default), fetches claims via the effective lifecycle
+                snapshot which patches status/confidence from append-only lifecycle events,
+                giving accurate post-validation values. When False, reads raw claims.jsonl
+                directly (legacy path, may have stale status values).
+        """
         try:
             store = self._get_csi_store()
-            claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+
+            if effective_only:
+                # Use effective lifecycle snapshot for accurate status/confidence values.
+                # Deferred import avoids circular-import risk at module load time.
+                from .simulation_csi_local import SimulationCSILocalStore  # noqa: PLC0415
+                _eff_store = SimulationCSILocalStore()
+                snapshot = _eff_store.get_effective_snapshot(simulation_id)
+                claims = list(snapshot.get("claims", {}).values())
+            else:
+                # Legacy path: read raw claims.jsonl (status may be stale).
+                claims = store._read_jsonl(store._path(simulation_id, "claims.jsonl"))
+
             if not claims:
                 return "No CSI claims found for this simulation."
 
@@ -1890,11 +1909,17 @@ class ZepToolsService:
 
             parts: List[str] = [f"## CSI Claims ({len(filtered)} of {len(claims)} total)"]
             for i, c in enumerate(filtered, 1):
-                parts.append(
+                claim_line = (
                     f"{i}. [{c.get('status', 'unknown')}] (confidence={c.get('confidence', '?')}) "
                     f"Agent: {c.get('agent_name', 'unknown')} | ID: {c.get('claim_id', '?')}\n"
                     f"   \"{c.get('text', '')}\""
                 )
+                parts.append(claim_line)
+                # Append evidence source IDs if present (first 3, truncated to 80 chars each).
+                source_ids: List[str] = c.get("source_ids") or []
+                if source_ids:
+                    truncated = [str(sid)[:80] for sid in source_ids[:3]]
+                    parts.append(f"   Sources: {truncated}")
             return "\n".join(parts)
         except Exception as exc:
             logger.error("query_csi_claims failed: %s", exc)

@@ -229,48 +229,323 @@ class SimulationCSILocalStore:
     def _manifest_path(self, simulation_id: str) -> str:
         return self._path(simulation_id, "manifest.json")
 
+    def log_event(self, simulation_id: str, event_type: str, payload: Dict[str, Any], round_num: int = 0) -> str:
+        with self._lock:
+            event_id = str(uuid.uuid4())
+            event = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "entity_type": payload.get("entity_type"),
+                "entity_id": payload.get("entity_id") or payload.get("id"),
+                "simulation_id": simulation_id,
+                "run_id": payload.get("run_id"),
+                "round_num": round_num,
+                "phase": payload.get("phase"),
+                "actor_agent_id": payload.get("agent_id"),
+                "actor_agent_name": payload.get("agent_name"),
+                "idempotency_key": payload.get("idempotency_key") or self._stable_hash(payload),
+                "causation_id": payload.get("causation_id"),
+                "correlation_id": payload.get("correlation_id"),
+                "created_at": self._now(),
+                "payload": payload
+            }
+            self._append_jsonl(self._path(simulation_id, "events.jsonl"), event)
+            # Check if this is a known entity type to also write legacy files
+            if event_type == "CLAIM_PROPOSED":
+                self._append_jsonl(self._path(simulation_id, "claims.jsonl"), payload)
+            elif event_type == "CLAIM_REVIEWED":
+                self._append_jsonl(self._path(simulation_id, "reviews.jsonl"), payload)
+                # Keep trials for legacy UI
+                trial = {**payload, "claim_id": payload.get("entity_id")}
+                self._append_jsonl(self._path(simulation_id, "trials.jsonl"), trial)
+            elif event_type == "AGENT_ACTION":
+                self._append_jsonl(self._path(simulation_id, "agent_actions.jsonl"), payload)
+            elif event_type == "EVIDENCE_RECALLED":
+                self._append_jsonl(self._path(simulation_id, "recalls.jsonl"), payload)
+            
+            return event_id
+
     def _ensure_manifest(self, simulation_id: str) -> Dict[str, Any]:
         manifest = self._load_json(self._manifest_path(simulation_id), {
             "simulation_id": simulation_id,
-            "version": 1,
+            "version": 2,
             "created_at": self._now(),
             "updated_at": self._now(),
             "files": {
                 "state": "state.json",
                 "sources_index": "sources_index.json",
                 "source_manifest": "source.jsol",
+                "events": "events.jsonl",
                 "claims": "claims.jsonl",
                 "trials": "trials.jsonl",
                 "reviews": "reviews.jsonl",
                 "agent_actions": "agent_actions.jsonl",
                 "recalls": "recalls.jsonl",
                 "relations": "relations.jsonl",
+                "tasks": "entities/tasks.jsonl",
+                "contradictions": "entities/contradictions.jsonl",
+                "claim_status_updates": "entities/claim_status_updates.jsonl",
+                "snapshot": "blackboard_snapshot.json"
             },
         })
         self._write_json(self._manifest_path(simulation_id), manifest)
         return manifest
 
+    def build_blackboard_snapshot(self, simulation_id: str) -> Dict[str, Any]:
+        with self._lock:
+            events = self._read_jsonl(self._path(simulation_id, "events.jsonl"))
+            sources_index = self._load_sources_index(simulation_id)
+            state = self._load_state(simulation_id)
+            legacy_claims = self._read_jsonl(self._path(simulation_id, "claims.jsonl"))
+            legacy_trials = self._read_jsonl(self._path(simulation_id, "trials.jsonl"))
+            legacy_reviews = self._read_jsonl(self._path(simulation_id, "reviews.jsonl"))
+            legacy_actions = self._read_jsonl(self._path(simulation_id, "agent_actions.jsonl"))
+            legacy_recalls = self._read_jsonl(self._path(simulation_id, "recalls.jsonl"))
+            legacy_relations = self._read_jsonl(self._path(simulation_id, "relations.jsonl"))
+            reviewed_claim_ids: set[str] = set()
+            unique_source_ids: set[str] = set()
+            active_agent_ids: set[str] = set()
+            latest_round = 0
+            
+            snapshot = {
+                "simulation_id": simulation_id,
+                "updated_at": self._now(),
+                "claims": {},
+                "sources": {s["source_id"]: s for s in sources_index.get("sources", [])},
+                "reviews": {},
+                "contradictions": {},
+                "tasks": {},
+                "queues": {
+                    "source_validation_queue": [],
+                    "claim_review_queue": [],
+                    "claim_revision_queue": [],
+                    "contradiction_resolution_queue": [],
+                    "synthesis_queue": [],
+                    "report_queue": []
+                },
+                "agent_stats": {},
+                "idempotency_index": {}
+            }
+
+            for event in events:
+                etype = event["event_type"]
+                payload = event["payload"]
+                entity_id = event["entity_id"]
+                
+                # Track idempotency
+                if event["idempotency_key"]:
+                    snapshot["idempotency_index"][event["idempotency_key"]] = entity_id
+
+                try:
+                    latest_round = max(latest_round, int(event.get("round_num", 0) or 0))
+                except (TypeError, ValueError):
+                    pass
+
+                actor_agent_id = event.get("actor_agent_id")
+                if actor_agent_id:
+                    active_agent_ids.add(str(actor_agent_id))
+
+                if etype == "CLAIM_PROPOSED":
+                    snapshot["claims"][entity_id] = {**payload, "status": "proposed", "reviews": []}
+                    proposer_id = payload.get("agent_id")
+                    if proposer_id:
+                        active_agent_ids.add(str(proposer_id))
+                    for source_id in payload.get("source_ids") or []:
+                        if source_id:
+                            unique_source_ids.add(str(source_id))
+                elif etype == "CLAIM_REVIEWED":
+                    cid = payload.get("entity_id") or payload.get("claim_id")
+                    if cid in snapshot["claims"]:
+                        snapshot["claims"][cid]["reviews"].append(payload)
+                        # Logic to update status based on policy would be in the engine, but here we record it
+                    snapshot["reviews"][entity_id] = payload
+                    reviewed_claim_ids.add(str(cid or entity_id))
+                    reviewer_id = payload.get("agent_id")
+                    if reviewer_id:
+                        active_agent_ids.add(str(reviewer_id))
+                elif etype == "CONTRADICTION_DETECTED":
+                    snapshot["contradictions"][entity_id] = {**payload, "status": "open"}
+                elif etype == "TASK_CREATED":
+                    snapshot["tasks"][entity_id] = {**payload, "status": "pending"}
+                elif etype == "TASK_UPDATED":
+                    if entity_id in snapshot["tasks"]:
+                        snapshot["tasks"][entity_id].update(payload)
+
+            if not snapshot["claims"] and legacy_claims:
+                for claim in legacy_claims:
+                    claim_id = str(claim.get("claim_id") or claim.get("id") or "")
+                    if not claim_id:
+                        continue
+                    snapshot["claims"][claim_id] = {**claim, "reviews": list(claim.get("reviews") or [])}
+
+            if not snapshot["reviews"] and (legacy_reviews or legacy_trials):
+                if legacy_reviews:
+                    review_source = legacy_reviews
+                else:
+                    review_source = legacy_trials
+                for review in review_source:
+                    review_id = str(review.get("review_id") or review.get("trial_id") or review.get("id") or "")
+                    if not review_id:
+                        continue
+                    snapshot["reviews"][review_id] = review
+                    cid = review.get("claim_id") or review.get("entity_id")
+                    if cid and cid in snapshot["claims"]:
+                        snapshot["claims"][cid].setdefault("reviews", []).append(review)
+                        reviewed_claim_ids.add(str(cid))
+
+            if not snapshot["tasks"]:
+                legacy_tasks = self._read_jsonl(self._path(simulation_id, "entities/tasks.jsonl"))
+                for task in legacy_tasks:
+                    task_id = str(task.get("task_id") or task.get("id") or "")
+                    if task_id:
+                        snapshot["tasks"][task_id] = task
+
+            if not snapshot["contradictions"]:
+                legacy_contradictions = self._read_jsonl(self._path(simulation_id, "entities/contradictions.jsonl"))
+                for contradiction in legacy_contradictions:
+                    contradiction_id = str(contradiction.get("contradiction_id") or contradiction.get("id") or "")
+                    if contradiction_id:
+                        snapshot["contradictions"][contradiction_id] = contradiction
+
+            if legacy_actions and not any(event.get("event_type") == "AGENT_ACTION" for event in events):
+                for action in legacy_actions:
+                    actor_agent_id = action.get("agent_id")
+                    if actor_agent_id:
+                        active_agent_ids.add(str(actor_agent_id))
+
+            if legacy_recalls and not any(event.get("event_type") == "EVIDENCE_RECALLED" for event in events):
+                for recall in legacy_recalls:
+                    actor_agent_id = recall.get("agent_id")
+                    if actor_agent_id:
+                        active_agent_ids.add(str(actor_agent_id))
+
+            if legacy_relations and not snapshot["reviews"]:
+                for relation in legacy_relations:
+                    relation_id = str(relation.get("relation_id") or relation.get("id") or "")
+                    if relation_id:
+                        snapshot["contradictions"].setdefault(
+                            relation_id,
+                            {
+                                **relation,
+                                "status": relation.get("status", "open"),
+                            },
+                        )
+
+            for source_id in snapshot["sources"].keys():
+                if source_id:
+                    unique_source_ids.add(str(source_id))
+
+            for value in (
+                [claim.get("round_num") for claim in legacy_claims]
+                + [trial.get("round_num") for trial in legacy_trials]
+                + [action.get("round_num") for action in legacy_actions]
+                + [recall.get("round_num") for recall in legacy_recalls]
+                + [state.get("round_count")]
+            ):
+                try:
+                    latest_round = max(latest_round, int(value or 0))
+                except (TypeError, ValueError):
+                    continue
+
+            # Calculate counts
+            snapshot["counts"] = {
+                "claims": len(snapshot["claims"]),
+                "reviews": len(snapshot["reviews"]),
+                "contradictions": len(snapshot["contradictions"]),
+                "tasks": len(snapshot["tasks"]),
+                "sources": len(snapshot["sources"]),
+                "trials": len(legacy_trials) if legacy_trials else len(snapshot["reviews"]),
+                "agent_actions": sum(1 for event in events if event.get("event_type") == "AGENT_ACTION") or len(legacy_actions),
+                "recalls": sum(1 for event in events if event.get("event_type") == "EVIDENCE_RECALLED") or len(legacy_recalls),
+                "relations": len(legacy_relations) if legacy_relations else 0,
+            }
+
+            snapshot["reviewed_claim_ids"] = sorted(reviewed_claim_ids)
+            snapshot["unique_source_ids"] = sorted(unique_source_ids)
+            snapshot["active_agent_ids"] = sorted(active_agent_ids)
+            snapshot["latest_round"] = latest_round
+
+            # Materialize completion criteria based on current blackboard state
+            snapshot["completion_criteria"] = self._evaluate_completion(snapshot)
+            
+            self._write_json(self._path(simulation_id, "blackboard_snapshot.json"), snapshot)
+            return snapshot
+
     def _build_blackboard_snapshot(self, simulation_id: str) -> Dict[str, Any]:
-        claims = self._read_jsonl(self._path(simulation_id, "claims.jsonl"))
-        trials = self._read_jsonl(self._path(simulation_id, "trials.jsonl"))
-        reviews = self._read_jsonl(self._path(simulation_id, "reviews.jsonl"))
-        actions = self._read_jsonl(self._path(simulation_id, "agent_actions.jsonl"))
-        recalls = self._read_jsonl(self._path(simulation_id, "recalls.jsonl"))
-        relations = self._read_jsonl(self._path(simulation_id, "relations.jsonl"))
-        sources_index = self._load_sources_index(simulation_id)
-        sources = sources_index.get("sources", [])
+        """Backward-compatible alias for older callers."""
+        return self.build_blackboard_snapshot(simulation_id)
 
-        reviewed_claim_ids = {
-            str(trial.get("claim_id"))
-            for trial in trials
-            if trial.get("claim_id")
-        }
-
-        reviewed_claim_ids = {
-            str(trial.get("claim_id"))
-            for trial in trials
-            if trial.get("claim_id")
-        }
+    def _evaluate_completion(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """Check if simulation meets policy goals (Health vs Research)."""
+        # Load policy if available
+        sim_id = snapshot.get("simulation_id")
+        if not sim_id:
+            return {"success": False, "reason": "Missing simulation_id in snapshot"}
+            
+        policy_path = self._path(sim_id, "policy.json")
+        policy = {}
+        if os.path.exists(policy_path):
+            try:
+                with open(policy_path, 'r') as f:
+                    policy = json.load(f)
+            except: pass
+        if not policy:
+            config_snapshot = self._load_json(self._path(sim_id, "simulation_config_snapshot.json"), {})
+            config_mode = str(config_snapshot.get("config_mode") or "").strip().lower()
+            if config_mode == "health":
+                policy = {
+                    "mode": "health",
+                    "gates": {"min_rounds_for_completion": 2},
+                }
+            elif config_mode in {"deepresearch", "web_research"}:
+                policy = {
+                    "mode": "deepresearch",
+                    "gates": {"min_rounds_for_completion": 1},
+                }
+        
+        mode = policy.get("mode", "deepresearch")
+        claims = snapshot.get("claims", {})
+        min_rounds_for_completion = int(policy.get("gates", {}).get("min_rounds_for_completion", 1) or 1)
+        current_round = int(snapshot.get("latest_round", 0) or 0)
+        
+        if mode == "health":
+            # Apply lifecycle events inline — avoids re-entrant build_blackboard_snapshot.
+            # Read claim_status_updates.jsonl and patch statuses before filtering.
+            patched_claims = {cid: dict(c) for cid, c in claims.items()}
+            try:
+                csu_events = self._read_jsonl(
+                    self._path(sim_id, "entities/claim_status_updates.jsonl")
+                )
+                latest_evt: dict = {}
+                for e in csu_events:
+                    cid = e.get("claim_id")
+                    if cid:
+                        latest_evt[cid] = e
+                for cid, evt in latest_evt.items():
+                    if cid in patched_claims:
+                        patched_claims[cid]["status"] = evt.get("new_status", patched_claims[cid].get("status"))
+                        patched_claims[cid]["confidence"] = evt.get("new_confidence", patched_claims[cid].get("confidence"))
+            except Exception:
+                pass
+            validated_claims = [c for c in patched_claims.values() if c.get("status") == "validated"]
+            contradictions = [ctr for ctr in snapshot.get("contradictions", {}).values() if ctr.get("status") == "open"]
+            
+            if current_round < min_rounds_for_completion:
+                return {
+                    "success": False,
+                    "reason": f"Need at least {min_rounds_for_completion} rounds before health completion (have {current_round})"
+                }
+            if not validated_claims:
+                return {"success": False, "reason": "No claims with status=validated found in effective lifecycle state"}
+            if contradictions:
+                return {"success": False, "reason": f"Open clinical contradictions exist ({len(contradictions)})"}
+            
+            return {"success": True, "reason": "Health policy satisfied"}
+        else:
+            # Research requirements: At least 3 claims
+            if len(claims) < 3:
+                return {"success": False, "reason": f"Insufficient claims for research (found {len(claims)}, need 3)"}
+            return {"success": True, "reason": "Research targets met"}
         unique_sources_cited = self._unique([
             str(source_id)
             for claim in claims
@@ -325,6 +600,7 @@ class SimulationCSILocalStore:
             state = self._load_state(simulation_id)
             blackboard = self._build_blackboard_snapshot(simulation_id)
             counts = blackboard.get("counts", {})
+            completion = blackboard.get("completion_criteria", {}) or {}
             state["source_count"] = int(counts.get("sources", 0))
             state["claim_count"] = int(counts.get("claims", 0))
             state["trial_count"] = int(counts.get("trials", 0))
@@ -339,8 +615,12 @@ class SimulationCSILocalStore:
                 "unique_source_ids": blackboard.get("unique_source_ids", []),
                 "active_agent_ids": blackboard.get("active_agent_ids", []),
                 "counts": counts,
+                "completion_criteria": completion,
                 "updated_at": blackboard.get("updated_at"),
             }
+            state["counts"] = counts
+            state["latest_round"] = int(blackboard.get("latest_round", 0) or 0)
+            state["completion_criteria"] = completion
             self._save_state(simulation_id, state)
 
             manifest = self._ensure_manifest(simulation_id)
@@ -356,8 +636,10 @@ class SimulationCSILocalStore:
             manifest["blackboard"] = {
                 "latest_round": state["blackboard"]["latest_round"],
                 "counts": counts,
+                "completion_criteria": completion,
                 "updated_at": state["blackboard"].get("updated_at"),
             }
+            manifest["completion_criteria"] = completion
             self._write_json(self._manifest_path(simulation_id), manifest)
             return state
 
@@ -748,13 +1030,13 @@ class SimulationCSILocalStore:
 
     def _agent_query_terms(self, agent: Dict[str, Any], simulation_requirement: str) -> List[str]:
         parts = [
-            agent.get("role", ""),
-            " ".join(agent.get("skills", []) or []),
-            " ".join(agent.get("research_focus", []) or []),
-            agent.get("entity_name", ""),
-            agent.get("entity_type", ""),
-            agent.get("entity_summary", ""),
-            simulation_requirement or "",
+            str(agent.get("role") or ""),
+            " ".join(str(s) for s in (agent.get("skills", []) or []) if str(s).strip()),
+            " ".join(str(s) for s in (agent.get("research_focus", []) or []) if str(s).strip()),
+            str(agent.get("entity_name") or ""),
+            str(agent.get("entity_type") or ""),
+            str(agent.get("entity_summary") or ""),
+            str(simulation_requirement or ""),
         ]
         return self._tokenize(" ".join(parts))
 
@@ -1407,6 +1689,11 @@ class SimulationCSILocalStore:
 
             # Run template bootstrap rounds (0 = skip entirely)
             effective_rounds = max(0, int(bootstrap_rounds))
+            if (
+                effective_rounds == 0
+                and str((simulation_config or {}).get("config_mode", "")).strip().lower() == "health"
+            ):
+                effective_rounds = 1
             if effective_rounds > 0:
                 bootstrap = self._run_working_rounds(
                     simulation_id=simulation_id,
@@ -1480,6 +1767,53 @@ class SimulationCSILocalStore:
             self._save_state(simulation_id, state)
             return record
 
+    def update_claim_fields(
+        self,
+        simulation_id: str,
+        claim_id: str,
+        updates: Dict[str, Any],
+    ) -> bool:
+        """Rewrite a single claim row in claims.jsonl with new fields.
+
+        Used by quality calibration to overwrite raw LLM-provided confidence/status
+        with calibrated, evidence-based values so downstream readers (reports,
+        analytics) see the calibrated numbers without needing the lifecycle patch.
+        """
+        if not claim_id or not updates:
+            return False
+        path = self._path(simulation_id, "claims.jsonl")
+        if not os.path.exists(path):
+            return False
+        with self._lock:
+            try:
+                rows: List[Dict[str, Any]] = []
+                changed = False
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if str(row.get("claim_id")) == str(claim_id):
+                            row.update({k: v for k, v in updates.items() if v is not None})
+                            row["updated_at"] = self._now()
+                            changed = True
+                        rows.append(row)
+                if not changed:
+                    return False
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    for row in rows:
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                os.replace(tmp, path)
+                return True
+            except OSError as exc:
+                logger.warning("update_claim_fields failed for %s/%s: %s", simulation_id, claim_id, exc)
+                return False
+
     def record_trial(self, simulation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             record = {
@@ -1526,7 +1860,177 @@ class SimulationCSILocalStore:
             state = self._load_state(simulation_id)
             state["review_count"] = int(state.get("review_count", 0)) + 1
             self._save_state(simulation_id, state)
-            return record
+
+        # Contradiction detection — runs outside the main lock to avoid
+        # re-entrant deadlock since record_lifecycle_event acquires self._lock.
+        claim_id = record.get("claim_id")
+        verdict = record.get("verdict")
+
+        if verdict == "contradicts" and claim_id:
+            # Explicit contradicts verdict — always emit.
+            self.record_lifecycle_event(simulation_id, "CONTRADICTION_DETECTED", {
+                "claim_id": claim_id,
+                "conflicting_claim_id": None,
+                "reason": f"Explicit contradicts verdict from {record.get('agent_name', 'unknown')}",
+                "status": "open",
+            })
+        elif claim_id:
+            # Mixed-verdict detection: check if both supports and contradicts exist on this claim.
+            all_reviews = self._read_jsonl(self._path(simulation_id, "reviews.jsonl"))
+            verdicts_for_claim = {
+                r.get("verdict")
+                for r in all_reviews
+                if r.get("claim_id") == claim_id and r.get("verdict") in ("supports", "contradicts")
+            }
+            if "supports" in verdicts_for_claim and "contradicts" in verdicts_for_claim:
+                # Guard: only emit once — check for existing open contradiction with same claim_id.
+                existing = self._read_jsonl(self._path(simulation_id, "entities/contradictions.jsonl"))
+                already_open = any(
+                    e.get("claim_id") == claim_id
+                    and e.get("event_type") == "CONTRADICTION_DETECTED"
+                    and e.get("status") == "open"
+                    for e in existing
+                )
+                if not already_open:
+                    self.record_lifecycle_event(simulation_id, "CONTRADICTION_DETECTED", {
+                        "claim_id": claim_id,
+                        "conflicting_claim_id": None,
+                        "reason": "Mixed verdict pattern (supports+contradicts on same claim)",
+                        "status": "open",
+                    })
+
+        return record
+
+    def record_lifecycle_event(self, simulation_id: str, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Append-only lifecycle event recording.
+
+        Supported event_type values:
+          - CLAIM_STATUS_UPDATED  -> entities/claim_status_updates.jsonl
+          - CONTRADICTION_DETECTED -> entities/contradictions.jsonl
+          - CONTRADICTION_RESOLVED -> entities/contradictions.jsonl
+        """
+        now = self._now()
+        if event_type == "CLAIM_STATUS_UPDATED":
+            event_id = self._entity_id(simulation_id, "csu", uuid.uuid4().hex)
+            record: Dict[str, Any] = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "claim_id": payload.get("claim_id"),
+                "old_status": payload.get("old_status"),
+                "new_status": payload.get("new_status"),
+                "old_confidence": payload.get("old_confidence"),
+                "new_confidence": payload.get("new_confidence"),
+                "created_at": now,
+            }
+            with self._lock:
+                self._append_jsonl(
+                    self._path(simulation_id, "entities/claim_status_updates.jsonl"),
+                    record,
+                )
+        elif event_type in ("CONTRADICTION_DETECTED", "CONTRADICTION_RESOLVED"):
+            contradiction_id = payload.get("contradiction_id") or self._entity_id(
+                simulation_id, "contradiction", uuid.uuid4().hex
+            )
+            if event_type == "CONTRADICTION_DETECTED":
+                record = {
+                    "contradiction_id": contradiction_id,
+                    "event_type": event_type,
+                    "claim_id": payload.get("claim_id"),
+                    "conflicting_claim_id": payload.get("conflicting_claim_id"),
+                    "reason": payload.get("reason", ""),
+                    "status": payload.get("status", "open"),
+                    "created_at": now,
+                }
+            else:
+                record = {
+                    "contradiction_id": contradiction_id,
+                    "event_type": event_type,
+                    "resolution_type": payload.get("resolution_type", "superseded"),
+                    "resolved_by_claim_id": payload.get("resolved_by_claim_id"),
+                    "created_at": now,
+                }
+            with self._lock:
+                self._append_jsonl(
+                    self._path(simulation_id, "entities/contradictions.jsonl"),
+                    record,
+                )
+        else:
+            record = {}
+        return record
+
+    def get_effective_snapshot(self, simulation_id: str) -> Dict[str, Any]:
+        """Return a snapshot patched with append-only lifecycle event state.
+
+        Calls build_blackboard_snapshot (which has its own lock) outside
+        self._lock, then applies lifecycle overrides without holding the lock
+        across the entire operation.
+        """
+        # Step 1: base snapshot — build_blackboard_snapshot manages its own lock.
+        snapshot = self.build_blackboard_snapshot(simulation_id)
+
+        # Step 2: apply latest CLAIM_STATUS_UPDATED events per claim.
+        csu_path = self._path(simulation_id, "entities/claim_status_updates.jsonl")
+        csu_events = self._read_jsonl(csu_path)
+        # Keep only the latest event per claim_id (events are append-only, last wins).
+        latest_csu: Dict[str, Dict[str, Any]] = {}
+        for event in csu_events:
+            cid = event.get("claim_id")
+            if cid:
+                latest_csu[cid] = event
+
+        claims = snapshot.get("claims", {})
+        for cid, event in latest_csu.items():
+            if cid in claims:
+                if event.get("new_status") is not None:
+                    claims[cid]["status"] = event["new_status"]
+                if event.get("new_confidence") is not None:
+                    claims[cid]["confidence"] = event["new_confidence"]
+
+        # Step 3: rebuild contradictions from lifecycle events.
+        contradiction_events = self._read_jsonl(
+            self._path(simulation_id, "entities/contradictions.jsonl")
+        )
+        if contradiction_events:
+            # Only rebuild if lifecycle events exist — avoids wiping snapshot
+            # contradictions when no lifecycle events have been written yet.
+            rebuilt: Dict[str, Dict[str, Any]] = {}
+            for event in contradiction_events:
+                eid = event.get("contradiction_id")
+                if not eid:
+                    continue
+                etype = event.get("event_type")
+                if etype == "CONTRADICTION_DETECTED":
+                    rebuilt[eid] = {**event, "status": event.get("status", "open")}
+                elif etype == "CONTRADICTION_RESOLVED":
+                    if eid in rebuilt:
+                        rebuilt[eid]["status"] = "resolved"
+                        rebuilt[eid]["resolution_type"] = event.get("resolution_type")
+                        rebuilt[eid]["resolved_by_claim_id"] = event.get("resolved_by_claim_id")
+                    else:
+                        # Resolution arrived without a prior detection record in events;
+                        # store the resolved marker so callers see it.
+                        rebuilt[eid] = {**event, "status": "resolved"}
+            snapshot["contradictions"] = rebuilt
+
+        return snapshot
+
+    def update_claim_lifecycle(
+        self,
+        simulation_id: str,
+        claim_id: str,
+        old_status: str,
+        new_status: str,
+        old_confidence: float,
+        new_confidence: float,
+    ) -> None:
+        """Called by csi_quality.recompute_claim_quality to persist status transitions."""
+        self.record_lifecycle_event(simulation_id, "CLAIM_STATUS_UPDATED", {
+            "claim_id": claim_id,
+            "old_status": old_status,
+            "new_status": new_status,
+            "old_confidence": old_confidence,
+            "new_confidence": new_confidence,
+        })
 
     def record_agent_action(self, simulation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
@@ -1598,39 +2102,46 @@ class SimulationCSILocalStore:
         rounds: int = 1,
         preferred_target_agent_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        with self._lock:
-            simulation_config = self._load_json(self._path(simulation_id, "simulation_config_snapshot.json"), {})
-            if not simulation_config:
-                simulation_config = self._load_json(
-                    os.path.join(self._sim_dir(simulation_id), "simulation_config.json"),
-                    {},
-                )
-            profiles = self._load_profiles(simulation_id)
-            sources_index = self._load_sources_index(simulation_id)
-            roster = self._build_roster(simulation_config, profiles)
-            result = self._run_working_rounds(
-                simulation_id=simulation_id,
-                simulation_requirement=simulation_requirement,
-                roster=roster,
-                sources=sources_index.get("sources", []),
-                rounds=max(1, int(rounds)),
-                preferred_target_agent_id=preferred_target_agent_id,
-            )
+        """
+        DEPRECATED: Use CSIResearchEngine.run_research_rounds instead.
+        This remains as a thin wrapper for backward compatibility if needed,
+        but for internal use, prefer the blackboard-driven engine.
+        """
+        from .csi_research_engine import CSIResearchEngine
+        from .agent_harness import AgentHarness, ActionBudget
+        from ..utils.llm_client import LLMClient
 
-            state = self._load_state(simulation_id)
-            state["round_count"] = int(state.get("round_count", 0)) + max(1, int(rounds))
-            state["claim_count"] = int(state.get("claim_count", 0)) + result.get("claims", 0)
-            state["trial_count"] = int(state.get("trial_count", 0)) + result.get("trials", 0)
-            state["agent_action_count"] = int(state.get("agent_action_count", 0)) + result.get("agent_actions", 0)
-            state["recall_count"] = int(state.get("recall_count", 0)) + result.get("recalls", 0)
-            state["relation_count"] = int(state.get("relation_count", 0)) + result.get("relations", 0)
-            self._save_state(simulation_id, state)
-            state = self.refresh_blackboard_state(simulation_id)
-            return {
-                "simulation_id": simulation_id,
-                "state": state,
-                "result": result,
-            }
+        sim_config = self._load_json(self._path(simulation_id, "simulation_config_snapshot.json"), {})
+        config_mode = sim_config.get("config_mode", "web_research")
+        
+        harness = AgentHarness(
+            simulation_id=simulation_id,
+            llm_client=LLMClient(usage_scope=simulation_id),
+            budget=ActionBudget(max_tokens_per_round=1000000),
+            store=self,
+            config_mode=config_mode
+        )
+        
+        engine = CSIResearchEngine(
+            simulation_id=simulation_id,
+            harness=harness,
+            csi_store=self,
+            sources=[],
+            roster=[],
+            config={},
+            config_mode=config_mode
+        )
+        
+        result = engine.run_research_rounds(
+            num_rounds=rounds,
+            simulation_requirement=simulation_requirement
+        )
+        state = self.refresh_blackboard_state(simulation_id)
+        return {
+            "simulation_id": simulation_id,
+            "state": state,
+            "result": result,
+        }
 
     def get_state(self, simulation_id: str) -> Dict[str, Any]:
         return self._load_state(simulation_id)

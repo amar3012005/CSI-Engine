@@ -396,11 +396,14 @@ class ReportConsoleLogger:
 
 class ReportStatus(str, Enum):
     """报告状态"""
+    NOT_READY = "not_ready"
+    READY_FOR_GENERATION = "ready_for_generation"
     PENDING = "pending"
     PLANNING = "planning"
     GENERATING = "generating"
     COMPLETED = "completed"
     FAILED = "failed"
+    GENERATED_WITH_WARNINGS = "generated_with_warnings"
 
 
 @dataclass
@@ -1134,10 +1137,11 @@ class ReportAgent:
             "description": (
                 "Search claims produced by simulation agents. Claims are evidence-grounded "
                 "findings proposed, peer-reviewed, and revised during the simulation. "
-                "Filter by status (proposed/revised/synthesized), minimum confidence, or specific agent."
+                "Filter by status (proposed/revised/synthesized/validated), minimum confidence, or specific agent. "
+                "In health mode this tool is hard-restricted to validated claims with confidence >= 0.7."
             ),
             "parameters": {
-                "status": "Filter by claim status: proposed, revised, synthesized (optional)",
+                "status": "Filter by claim status: proposed, revised, synthesized, validated (optional)",
                 "min_confidence": "Minimum confidence threshold 0.0-1.0 (optional, default 0.0)",
                 "agent_name": "Filter by specific agent name (optional)",
                 "limit": "Max results (optional, default 20)"
@@ -1199,6 +1203,12 @@ class ReportAgent:
             工具执行结果（文本格式）
         """
         logger.info(f"执行工具: {tool_name}, 参数: {parameters}")
+        validation_error = self._validate_tool_parameters(tool_name, parameters)
+        if validation_error:
+            return (
+                f"工具调用参数无效: {validation_error}\n"
+                "请重新调用同一类 CSI 工具，并提供有效参数；不要改写为泛化查询。"
+            )
         
         try:
             if tool_name == "insight_forge":
@@ -1256,12 +1266,33 @@ class ReportAgent:
             # ========== CSI local store tools ==========
 
             elif tool_name == "query_claims":
+                if self.report_type == "health":
+                    forced_min_confidence = 0.7
+                    try:
+                        requested = float(parameters.get("min_confidence", forced_min_confidence))
+                    except (TypeError, ValueError):
+                        requested = forced_min_confidence
+                    result = self.zep_tools.query_csi_claims(
+                        simulation_id=self.simulation_id,
+                        status="validated",
+                        min_confidence=max(forced_min_confidence, requested),
+                        agent_name=parameters.get("agent_name"),
+                        limit=min(int(parameters.get("limit", 12)), 12),
+                        effective_only=True,
+                    )
+                    if "No claims matched the filters" in result or "No CSI claims found" in result:
+                        return (
+                            "Health evidence retrieval failed: no validated CSI claims met the enforced "
+                            "filters (status=validated, min_confidence>=0.7). Stop and do not write "
+                            "diagnostic, treatment, or prognosis conclusions without validated evidence."
+                        )
+                    return result
                 return self.zep_tools.query_csi_claims(
                     simulation_id=self.simulation_id,
                     status=parameters.get("status"),
                     min_confidence=float(parameters.get("min_confidence", 0.0)),
                     agent_name=parameters.get("agent_name"),
-                    limit=int(parameters.get("limit", 20)),
+                    limit=min(int(parameters.get("limit", 12)), 12),
                 )
 
             elif tool_name == "query_trials":
@@ -1269,7 +1300,7 @@ class ReportAgent:
                     simulation_id=self.simulation_id,
                     verdict=parameters.get("verdict"),
                     claim_id=parameters.get("claim_id"),
-                    limit=int(parameters.get("limit", 20)),
+                    limit=min(int(parameters.get("limit", 8)), 8),
                 )
 
             elif tool_name == "query_consensus":
@@ -1336,7 +1367,9 @@ class ReportAgent:
             logger.error(f"工具执行失败: {tool_name}, 错误: {str(e)}")
             return (
                 f"工具 {tool_name} 执行失败: {str(e)}\n"
-                "请不要再调用此工具，直接根据你已有的信息输出 Final Answer。"
+                "HEALTH EVIDENCE FAILURE: validated CSI evidence could not be retrieved.\n"
+                "Stop. Do not generate unsupported medical conclusions, diagnoses, treatment recommendations, "
+                "or prognosis claims. Return a report generation failure instead."
             )
 
     # 合法的工具名称集合，用于裸 JSON 兜底解析时校验
@@ -1355,6 +1388,68 @@ class ReportAgent:
             if normalized.startswith(prefix):
                 normalized = normalized[len(prefix):]
         return normalized
+
+    def _validate_tool_parameters(self, tool_name: str, parameters: Dict[str, Any]) -> Optional[str]:
+        if not isinstance(parameters, dict):
+            return f"{tool_name} parameters must be an object"
+
+        if tool_name in {"quick_search", "panorama_search", "insight_forge", "interview_agents"}:
+            query_value = parameters.get("query") or parameters.get("interview_topic")
+            if not str(query_value or "").strip():
+                return f"{tool_name} requires a non-empty query"
+
+        if tool_name == "query_claims":
+            status = str(parameters.get("status") or "").strip()
+            agent_name = str(parameters.get("agent_name") or "").strip()
+            min_conf = parameters.get("min_confidence")
+            limit = parameters.get("limit")
+            try:
+                if min_conf is not None:
+                    float(min_conf)
+            except (TypeError, ValueError):
+                return "query_claims min_confidence must be numeric"
+            try:
+                if limit is not None:
+                    limit_val = int(limit)
+                    if limit_val <= 0:
+                        return "query_claims limit must be > 0"
+            except (TypeError, ValueError):
+                return "query_claims limit must be an integer"
+            if self.report_type == "health":
+                return None
+            if not any([status, agent_name, min_conf is not None]):
+                return "query_claims requires at least one narrowing filter (status, agent_name, or min_confidence)"
+
+        if tool_name == "query_trials" and not (parameters.get("claim_id") or parameters.get("verdict")):
+            return "query_trials requires claim_id or verdict"
+
+        if tool_name == "query_consensus":
+            try:
+                min_trials = int(parameters.get("min_supporting_trials", 2))
+            except (TypeError, ValueError):
+                return "query_consensus min_supporting_trials must be an integer"
+            if min_trials <= 0:
+                return "query_consensus min_supporting_trials must be > 0"
+
+        if tool_name == "trace_provenance" and not parameters.get("claim_id"):
+            return "trace_provenance requires claim_id"
+
+        if tool_name == "query_contradictions":
+            allowed = set()
+            unexpected = set(parameters.keys()) - allowed
+            if unexpected:
+                return f"query_contradictions does not accept parameters: {', '.join(sorted(unexpected))}"
+
+        return None
+
+    def _compact_tool_result(self, result: str, max_chars: int = 8000) -> str:
+        text = result or ""
+        if len(text) <= max_chars:
+            return text
+        return (
+            text[:max_chars].rstrip()
+            + "\n\n[Tool result truncated. Use trace_provenance with a specific claim_id for full detail.]"
+        )
 
     def _extract_action_call_from_string(self, raw_arguments: str) -> Optional[Dict[str, Any]]:
         """Parse textual native tool-call payloads such as assistant Action/Action Input."""
@@ -1447,7 +1542,7 @@ class ReportAgent:
             # case: {"name": "tool_call", "arguments": {"name":"...","parameters":{...}}}
             if data.get("name") == "tool_call" and "name" in args:
                 data["name"] = args.get("name")
-                data["parameters"] = args.get("parameters", {})
+                data["parameters"] = args.get("parameters") or args.get("arguments") or {}
             # case: {"name": "tool_query_claims", "arguments": {"status":"...","min_confidence":...}}
             elif str(data.get("name", "")).startswith("tool_"):
                 data["name"] = data["name"].replace("tool_", "", 1)
@@ -1456,9 +1551,9 @@ class ReportAgent:
                 data["name"] = self._normalize_tool_name(data.get("name"))
                 data["parameters"] = args
             # case: {"name": "query_claims", "arguments": {"name":"query_claims","parameters":{...}}}
-            elif data.get("name") in self.VALID_TOOL_NAMES and "name" in args and "parameters" in args:
+            elif data.get("name") in self.VALID_TOOL_NAMES and "name" in args and ("parameters" in args or "arguments" in args):
                 data["name"] = args["name"]
-                data["parameters"] = args["parameters"]
+                data["parameters"] = args.get("parameters") or args.get("arguments") or {}
             # case: {"name": "query_claims", "arguments": {"status":"...", ...}}
             elif data.get("name") in self.VALID_TOOL_NAMES:
                 data["parameters"] = args
@@ -1476,6 +1571,10 @@ class ReportAgent:
             data["name"] = tool_name
             if "params" in data and "parameters" not in data:
                 data["parameters"] = data.pop("params")
+            validation_error = self._validate_tool_parameters(tool_name, data.get("parameters", {}))
+            if validation_error:
+                logger.warning("Ignoring malformed tool call %s: %s", tool_name, validation_error)
+                return False
             return True
         return False
     
@@ -1488,6 +1587,195 @@ class ReportAgent:
             if params_desc:
                 desc_parts.append(f"  参数: {params_desc}")
         return "\n".join(desc_parts)
+
+    def _get_openai_tool_schemas(self) -> List[Dict[str, Any]]:
+        schemas = []
+        for name, tool in self.tools.items():
+            properties = {}
+            for param_name, description in tool.get("parameters", {}).items():
+                properties[param_name] = {
+                    "type": "string",
+                    "description": str(description),
+                }
+            schemas.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(tool.get("description", "")),
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                        "additionalProperties": False,
+                    },
+                },
+            })
+        return schemas
+
+    def _get_csi_counts(self) -> Dict[str, int]:
+        if not self.simulation_id:
+            return {}
+        try:
+            snapshot = self._load_csi_blackboard_state()
+            if not snapshot:
+                return {}
+            counts = snapshot.get("counts", {}) or {}
+            return {
+                "claims": int(counts.get("claims", 0) or 0),
+                "trials": int(counts.get("trials", 0) or 0),
+                "sources": int(counts.get("sources", 0) or 0),
+                "agent_actions": int(counts.get("agent_actions", 0) or 0),
+            }
+        except Exception:
+            return {}
+
+    def _load_csi_blackboard_state(self) -> Dict[str, Any]:
+        if not self.simulation_id:
+            return {}
+        try:
+            from .simulation_csi_local import SimulationCSILocalStore
+
+            store = SimulationCSILocalStore()
+            return store.refresh_blackboard_state(self.simulation_id)
+        except Exception as exc:
+            logger.warning("Failed to load CSI blackboard state for %s: %s", self.simulation_id, exc)
+            return {}
+
+    def _get_health_validated_claims(self, snapshot: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        snapshot = snapshot or self._load_csi_blackboard_state()
+
+        # Use effective lifecycle snapshot for accurate validated status/confidence.
+        # Falls back to the passed-in snapshot on any failure.
+        # Deferred import avoids circular-import risk at module load time.
+        effective_claims: List[Dict[str, Any]] = []
+        if self.simulation_id:
+            try:
+                from .simulation_csi_local import SimulationCSILocalStore  # noqa: PLC0415
+                _snap = SimulationCSILocalStore().get_effective_snapshot(self.simulation_id)
+                effective_claims = list(_snap.get("claims", {}).values())
+            except Exception:
+                effective_claims = []
+
+        source_claims = effective_claims or list((snapshot.get("claims", {}) or {}).values())
+
+        validated_claims: List[Dict[str, Any]] = []
+        for claim in source_claims:
+            status = str(claim.get("status") or "").strip().lower()
+            try:
+                confidence = float(claim.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if status == "validated" and confidence >= 0.7:
+                validated_claims.append(claim)
+
+        if validated_claims:
+            return validated_claims
+
+        # Soft-fail fallback — top-confidence reviewed/verified claims so the
+        # report can still be drafted on best-available evidence. Caller should
+        # mark report as preliminary via _health_report_quality.
+        scored: List[tuple] = []
+        for claim in source_claims:
+            status = str(claim.get("status") or "").strip().lower()
+            try:
+                confidence = float(claim.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            reviews_for_claim = list(claim.get("reviews") or [])
+            if status in {"validated", "verified", "supported", "revised", "under_review"} \
+               or reviews_for_claim or confidence > 0:
+                scored.append((confidence, claim))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [c for _, c in scored[:25]]
+
+    def _get_health_usable_claims(self, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Fallback tier — best-available reviewed claims when strict gates fail."""
+        claims = snapshot.get("claims", {}) or {}
+        scored: List[tuple] = []
+        for claim in claims.values():
+            status = str(claim.get("status") or "").strip().lower()
+            try:
+                confidence = float(claim.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            reviews_for_claim = list(claim.get("reviews") or [])
+            if status in {"validated", "verified", "supported", "revised", "under_review"} \
+               or reviews_for_claim or confidence > 0:
+                scored.append((confidence, claim))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [c for _, c in scored[:25]]
+
+    def _ensure_health_evidence_ready(self, snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        snapshot = snapshot or self._load_csi_blackboard_state()
+        if self._get_health_validated_claims(snapshot):
+            return snapshot
+
+        # Soft-fail: accept best-available reviewed claims, mark report preliminary.
+        usable = self._get_health_usable_claims(snapshot)
+        if usable:
+            counts = snapshot.get("counts", {}) or {}
+            logger.warning(
+                "[%s] Health strict gates failed — falling back to %d top-confidence "
+                "reviewed claims (claims=%d, reviews=%d, trials=%d). Report will be "
+                "marked preliminary.",
+                getattr(self, "simulation_id", "?"),
+                len(usable),
+                int(counts.get("claims", 0) or 0),
+                int(counts.get("reviews", 0) or 0),
+                int(counts.get("trials", 0) or 0),
+            )
+            try:
+                self._health_report_quality = "preliminary"  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            return snapshot
+
+        counts = snapshot.get("counts", {}) or {}
+        raise ValueError(
+            "Health report generation blocked: CSI blackboard contains zero usable claims. "
+            f"Current counts: claims={int(counts.get('claims', 0) or 0)}, "
+            f"reviews={int(counts.get('reviews', 0) or 0)}, "
+            f"trials={int(counts.get('trials', 0) or 0)}."
+        )
+
+    def _validate_section_output(self, section_title: str, content: str, tool_calls_count: int) -> Optional[str]:
+        cleaned = self._strip_react_markup(content)
+        if not cleaned:
+            return "Section content was empty after cleanup."
+
+        if "**Evidence Trail**:" not in cleaned:
+            return "Section is missing the required Evidence Trail summary line."
+
+        csi_counts = self._get_csi_counts()
+        if not csi_counts or csi_counts.get("claims", 0) <= 0:
+            return None
+
+        artifact_ids = self._extract_artifact_ids(cleaned)
+        artifact_count = (
+            len(artifact_ids["claim_ids"])
+            + len(artifact_ids["trial_ids"])
+            + len(artifact_ids["source_ids"])
+        )
+        normalized_title = (section_title or "").strip().lower()
+
+        minimum_tool_calls = 2 if self.report_type == "health" else 3
+        if tool_calls_count < minimum_tool_calls:
+            return (
+                f"Section used only {tool_calls_count} tool calls but needs at least "
+                f"{minimum_tool_calls} CSI retrieval steps."
+            )
+
+        if normalized_title == "references":
+            if artifact_count == 0:
+                return "References section did not contain any CSI artifact IDs."
+            return None
+
+        if len(artifact_ids["claim_ids"]) == 0:
+            return "Section did not cite any claim IDs from the CSI run."
+
+        if artifact_count == 0:
+            return "Section did not cite any claim, trial, or source IDs from the CSI run."
+
+        return None
     
     def plan_outline(
         self, 
@@ -1508,6 +1796,9 @@ class ReportAgent:
         
         if progress_callback:
             progress_callback("planning", 0, "正在分析模拟需求...")
+
+        if self.report_type == "health":
+            self._ensure_health_evidence_ready()
         
         # 首先获取模拟上下文
         context = self.zep_tools.get_simulation_context(
@@ -1678,13 +1969,16 @@ class ReportAgent:
             {"role": "user", "content": user_prompt}
         ]
         
+        csi_counts = self._get_csi_counts()
+
         # ReACT循环
         tool_calls_count = 0
         max_iterations = 5  # 最大迭代轮数
-        # When Zep is disabled, tools only return local data which may be sparse.
-        # Lower the minimum tool call requirement so the agent can finish faster
-        # instead of looping on empty results.
-        min_tool_calls = 1 if not self.zep_tools._zep_enabled else 3
+        has_csi_claims = int(csi_counts.get("claims", 0) or 0) > 0
+        if has_csi_claims:
+            min_tool_calls = 2 if self.report_type == "health" else 3
+        else:
+            min_tool_calls = 1 if not self.zep_tools._zep_enabled else 3
         conflict_retries = 0  # 工具调用与Final Answer同时出现的连续冲突次数
         used_tools = set()  # 记录已调用过的工具名
         all_tools = set(self.tools.keys())
@@ -1700,12 +1994,28 @@ class ReportAgent:
                     f"深度检索与撰写中 ({tool_calls_count}/{self.MAX_TOOL_CALLS_PER_SECTION})"
                 )
             
-            # 调用LLM
-            response = self.llm.chat(
+            # 调用LLM；优先使用原生工具调用，失败时 LLMClient 会回退到文本协议。
+            tool_response = self.llm.chat_with_tools(
                 messages=messages,
+                tools=self._get_openai_tool_schemas(),
                 temperature=0.5,
                 max_tokens=4096
             )
+            if tool_response.get("tool_calls"):
+                native_call = tool_response["tool_calls"][0]
+                response = (
+                    "<execute_tool>\n"
+                    + json.dumps(
+                        {
+                            "name": native_call.get("name"),
+                            "parameters": native_call.get("parameters", {}),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n</execute_tool>"
+                )
+            else:
+                response = tool_response.get("content", "")
 
             # 检查 LLM 返回是否为 None（API 异常或内容为空）
             if response is None:
@@ -1794,6 +2104,17 @@ class ReportAgent:
                     response.split("Final Answer:")[-1].strip(),
                     section.title,
                 )
+                validation_error = self._validate_section_output(section.title, final_answer, tool_calls_count)
+                if validation_error:
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"【章节未通过验证】{validation_error}\n"
+                            "请继续调用 CSI 工具补足证据，重写本节，并保留精确的 Claim/Trial/Source IDs。"
+                        ),
+                    })
+                    continue
                 logger.info(f"章节 {section.title} 生成完成（工具调用: {tool_calls_count}次）")
 
                 if self.report_logger:
@@ -1838,6 +2159,7 @@ class ReportAgent:
                     call.get("parameters", {}),
                     report_context=report_context
                 )
+                result = self._compact_tool_result(result)
 
                 if self.report_logger:
                     self.report_logger.log_tool_result(
@@ -1893,6 +2215,18 @@ class ReportAgent:
             # 直接将这段内容作为最终答案，不再空转
             logger.info(f"章节 {section.title} 未检测到 'Final Answer:' 前缀，直接采纳LLM输出作为最终内容（工具调用: {tool_calls_count}次）")
             final_answer = self._finalize_section_content(response.strip(), section.title)
+            validation_error = self._validate_section_output(section.title, final_answer, tool_calls_count)
+            if validation_error:
+                unused_tools = all_tools - used_tools
+                unused_hint = f" 推荐继续使用: {', '.join(sorted(unused_tools))}。" if unused_tools else ""
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"【章节未通过验证】{validation_error}"
+                        f"{unused_hint} 请继续调用 CSI 工具并重写。"
+                    ),
+                })
+                continue
 
             if self.report_logger:
                 self.report_logger.log_section_content(
@@ -1907,11 +2241,27 @@ class ReportAgent:
         logger.warning(f"章节 {section.title} 达到最大迭代次数，强制生成")
         messages.append({"role": "user", "content": REACT_FORCE_FINAL_MSG})
         
-        response = self.llm.chat(
+        tool_response = self.llm.chat_with_tools(
             messages=messages,
+            tools=self._get_openai_tool_schemas(),
             temperature=0.5,
             max_tokens=4096
         )
+        if tool_response.get("tool_calls"):
+            native_call = tool_response["tool_calls"][0]
+            response = (
+                "<execute_tool>\n"
+                + json.dumps(
+                    {
+                        "name": native_call.get("name"),
+                        "parameters": native_call.get("parameters", {}),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n</execute_tool>"
+            )
+        else:
+            response = tool_response.get("content", "")
 
         # 检查强制收尾时 LLM 返回是否为 None
         if response is None:
@@ -1924,6 +2274,11 @@ class ReportAgent:
             )
         else:
             final_answer = self._finalize_section_content(response, section.title)
+
+        validation_error = self._validate_section_output(section.title, final_answer, tool_calls_count)
+        if validation_error:
+            logger.warning("章节 %s 强制收尾后仍未通过验证: %s", section.title, validation_error)
+            raise ValueError(f"Section '{section.title}' failed CSI evidence validation: {validation_error}")
         
         # 记录章节内容生成完成日志
         if self.report_logger:
@@ -2046,8 +2401,72 @@ class ReportAgent:
             )
             ReportManager.save_report(report)
             
+            # --- MIROFISH REWRITE: EXPLICIT CSI GATING ---
+            if self.simulation_id:
+                snapshot = self._load_csi_blackboard_state()
+                counts = snapshot.get("counts", {}) or {}
+                completion = snapshot.get("completion_criteria", {}) or {}
+
+                if self.report_type == "health":
+                    try:
+                        self._ensure_health_evidence_ready(snapshot)
+                    except ValueError as exc:
+                        error_msg = str(exc)
+                        logger.error(f"[{self.simulation_id}] {error_msg}")
+
+                        self.report_logger.log(
+                            action="csi_gate_failure",
+                            stage="pending",
+                            details={"error": error_msg, "snapshot": snapshot}
+                        )
+
+                        report.status = ReportStatus.FAILED
+                        report.error = error_msg
+                        ReportManager.save_report(report)
+                        ReportManager.update_progress(report_id, "failed", 0, error_msg)
+                        return report
+
+                    if not completion.get("success", False):
+                        error_msg = (
+                            "CSI Validation Failed after validated-claim gate: "
+                            f"{completion.get('reason', 'Evidence thresholds not met')}"
+                        )
+                        logger.error(f"[{self.simulation_id}] {error_msg}")
+
+                        self.report_logger.log(
+                            action="csi_gate_failure",
+                            stage="pending",
+                            details={"error": error_msg, "snapshot": snapshot}
+                        )
+
+                        report.status = ReportStatus.FAILED
+                        report.error = error_msg
+                        ReportManager.save_report(report)
+                        ReportManager.update_progress(report_id, "failed", 0, error_msg)
+                        return report
+
+                    logger.info(f"[{self.simulation_id}] CSI Gate Passed. Proceeding with report.")
+                else:
+                    if int(counts.get("claims", 0) or 0) == 0 or int(counts.get("agent_actions", 0) or 0) == 0:
+                        error_msg = "CSI execution produced no validated swarm artifacts; regenerate the simulation before reporting"
+                        logger.error(f"[{self.simulation_id}] {error_msg}")
+
+                        self.report_logger.log(
+                            action="csi_gate_failure",
+                            stage="pending",
+                            details={"error": error_msg, "snapshot": snapshot}
+                        )
+
+                        report.status = ReportStatus.FAILED
+                        report.error = error_msg
+                        ReportManager.save_report(report)
+                        ReportManager.update_progress(report_id, "failed", 0, error_msg)
+                        return report
+            # --- END MIROFISH REWRITE ---
+
             # 阶段1: 规划大纲
             report.status = ReportStatus.PLANNING
+            ReportManager.save_report(report)
             ReportManager.update_progress(
                 report_id, "planning", 5, "开始规划报告大纲...",
                 completed_sections=[]
@@ -2089,6 +2508,7 @@ class ReportAgent:
             
             # 阶段2: 逐章节生成（分章节保存）
             report.status = ReportStatus.GENERATING
+            ReportManager.save_report(report)
             
             total_sections = len(outline.sections)
             generated_sections = []  # 保存内容用于上下文
@@ -2230,7 +2650,7 @@ class ReportAgent:
             try:
                 ReportManager.save_report(report)
                 ReportManager.update_progress(
-                    report_id, "failed", -1, f"报告生成失败: {str(e)}",
+                    report_id, "failed", 0, f"报告生成失败: {str(e)}",
                     completed_sections=completed_section_titles
                 )
             except Exception:
@@ -2304,10 +2724,27 @@ class ReportAgent:
         max_iterations = 2  # 减少迭代轮数
         
         for iteration in range(max_iterations):
-            response = self.llm.chat(
+            tool_response = self.llm.chat_with_tools(
                 messages=messages,
-                temperature=0.5
+                tools=self._get_openai_tool_schemas(),
+                temperature=0.5,
+                max_tokens=2048,
             )
+            if tool_response.get("tool_calls"):
+                native_call = tool_response["tool_calls"][0]
+                response = (
+                    "<execute_tool>\n"
+                    + json.dumps(
+                        {
+                            "name": native_call.get("name"),
+                            "parameters": native_call.get("parameters", {}),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n</execute_tool>"
+                )
+            else:
+                response = tool_response.get("content", "")
             
             # 解析工具调用
             tool_calls = self._parse_tool_calls(response)
@@ -2344,10 +2781,27 @@ class ReportAgent:
             })
         
         # 达到最大迭代，获取最终响应
-        final_response = self.llm.chat(
+        final_tool_response = self.llm.chat_with_tools(
             messages=messages,
-            temperature=0.5
+            tools=self._get_openai_tool_schemas(),
+            temperature=0.5,
+            max_tokens=2048,
         )
+        if final_tool_response.get("tool_calls"):
+            native_call = final_tool_response["tool_calls"][0]
+            final_response = (
+                "<execute_tool>\n"
+                + json.dumps(
+                    {
+                        "name": native_call.get("name"),
+                        "parameters": native_call.get("parameters", {}),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n</execute_tool>"
+            )
+        else:
+            final_response = final_tool_response.get("content", "")
         
         # 清理响应
         clean_response = re.sub(r'<execute_tool>.*?</execute_tool>', '', final_response, flags=re.DOTALL)
@@ -3009,8 +3463,10 @@ class ReportManager:
         if not matches:
             return None
 
-        matches.sort(key=lambda report: report.created_at or "", reverse=True)
-        return matches[0]
+        usable = [report for report in matches if report.status != ReportStatus.FAILED]
+        selected = usable or matches
+        selected.sort(key=lambda report: report.created_at or "", reverse=True)
+        return selected[0]
     
     @classmethod
     def list_reports(cls, simulation_id: Optional[str] = None, limit: int = 50) -> List[Report]:
